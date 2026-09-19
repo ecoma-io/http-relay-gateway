@@ -1,0 +1,4 @@
+config.yaml
+bin/
+.claude/
+node_modules/

@@ -1,0 +1,119 @@
+// Package config validates bootstrap settings and parses runtime relays.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"time"
+)
+
+func envStr(key string, dst *string) {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		*dst = v
+	}
+}
+
+// Defaults applied when the corresponding environment variable is unset.
+const (
+	DefaultConfigFile = "config.yaml"
+	DefaultListenAddr = ":8080"
+	// DefaultShutdownGrace bounds the whole-process graceful drain. 20s fits
+	// under a 30s docker stop_grace_period.
+	DefaultShutdownGrace = 20 * time.Second
+)
+
+// BootstrapConfig contains process-level settings. They are intentionally read
+// only when the process starts because changing the listening socket or the
+// watched file in place would require a coordinated server restart. The relay
+// pool, body limits and log level are runtime settings and live in the YAML.
+type BootstrapConfig struct {
+	ConfigFile    string
+	ListenAddr    string
+	ShutdownGrace time.Duration
+}
+
+// LoadBootstrap applies bootstrap defaults and explicit environment overrides.
+func LoadBootstrap() (*BootstrapConfig, error) {
+	cfg := &BootstrapConfig{
+		ConfigFile:    DefaultConfigFile,
+		ListenAddr:    DefaultListenAddr,
+		ShutdownGrace: DefaultShutdownGrace,
+	}
+	envStr("CONFIG_FILE", &cfg.ConfigFile)
+	envStr("LISTEN_ADDR", &cfg.ListenAddr)
+	// Parsed inline rather than through a helper so a malformed value fails
+	// fast instead of silently falling back to the default.
+	if raw, ok := os.LookupEnv("SHUTDOWN_GRACE"); ok && raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("SHUTDOWN_GRACE %q must be a Go duration", raw)
+		}
+		cfg.ShutdownGrace = d
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (c *BootstrapConfig) validate() error {
+	var errs []error
+	if strings.TrimSpace(c.ConfigFile) == "" {
+		errs = append(errs, errors.New("CONFIG_FILE must not be empty"))
+	}
+	if c.ShutdownGrace <= 0 {
+		errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE must be positive, got %s", c.ShutdownGrace))
+	}
+	if err := validateListenAddr("LISTEN_ADDR", c.ListenAddr); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func validateListenAddr(name, addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s %q must be a host:port address", name, addr)
+	}
+	if err := checkPort(port); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return nil
+	}
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	if !validListenerHostname(host) {
+		return fmt.Errorf("%s %q has an invalid host", name, addr)
+	}
+	return nil
+}
+
+func validListenerHostname(host string) bool {
+	if len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func checkPort(port string) error {
+	n, err := net.LookupPort("tcp", port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("invalid port %q", port)
+	}
+	return nil
+}
