@@ -1,0 +1,8 @@
+# The runtime config is bind-mounted at runtime and must not enter builds.
+config.yaml
+
+# Local development artifacts do not belong in the build context.
+.git
+.claude
+bin
+e2e

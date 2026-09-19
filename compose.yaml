@@ -1,0 +1,44 @@
+# Local/homelab deployment for http-relay-gateway.
+# config.yaml is the Git-ignored runtime file at the repo root; copy
+# config.example.yaml to config.yaml first and fill in the real relay URLs.
+# Hot reload polls file content, so editing config.yaml in place on the host
+# applies without a restart. One caveat of the single-file bind mount:
+# replacing the file atomically (mv, editor safe-save) splices in a new inode
+# that the mount never follows — edit in place, or restart the container
+# after a replace.
+#
+# There is no authentication: the gateway is an internal-network sidecar.
+# Do not publish the port beyond the host or compose network.
+services:
+  relay-gateway:
+    build:
+      context: .
+      args:
+        VERSION: 0.1.0-dev
+    container_name: relay-gateway
+    ports:
+      - "20130:20130" # relay endpoint (HTTP): /healthz and /stats included
+    environment:
+      # Bootstrap-only settings: changes require a container restart.
+      CONFIG_FILE: /app/config.yaml
+      LISTEN_ADDR: 0.0.0.0:20130
+      # Optional. The drain budget covers in-flight relay requests and must
+      # stay below stop_grace_period so docker's SIGKILL never cuts it short.
+      # SHUTDOWN_GRACE: 20s
+    # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
+    # above the gateway's SHUTDOWN_GRACE (default 20s) plus a little margin.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/app/http-relay-gateway", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
