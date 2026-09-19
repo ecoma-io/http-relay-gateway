@@ -369,6 +369,41 @@ func TestCloudflareCredentialsError(t *testing.T) {
 	}
 }
 
+// TestVercelAndDenoVerifyRejectBadCredentials pins credential-mapping parity:
+// every platform's Verify must turn a 401/403 into ErrCredentials, so the
+// admin plane answers a typo'd token with the 422 field error, not a 502
+// platform outage.
+func TestVercelAndDenoVerifyRejectBadCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{"unauthorized", http.StatusUnauthorized},
+		{"forbidden", http.StatusForbidden},
+	} {
+		t.Run("vercel/"+tc.name, func(t *testing.T) {
+			f := newFakePlatform(t)
+			f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			})
+			c := newVercelClient(f.srv.URL, "t", "", routedClient(f.srv.URL))
+			if _, err := c.Verify(context.Background()); !errors.Is(err, ErrCredentials) {
+				t.Fatalf("Verify error = %v, want ErrCredentials", err)
+			}
+		})
+		t.Run("deno/"+tc.name, func(t *testing.T) {
+			f := newFakePlatform(t)
+			f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			})
+			c := newDenoClient(f.srv.URL, "t", "ref", routedClient(f.srv.URL))
+			if _, err := c.Verify(context.Background()); !errors.Is(err, ErrCredentials) {
+				t.Fatalf("Verify error = %v, want ErrCredentials", err)
+			}
+		})
+	}
+}
+
 func TestCloudflareDeleteToleratesMissing(t *testing.T) {
 	f := newFakePlatform(t)
 	c := newCloudflareClient(f.srv.URL, "t", "acc_123", routedClient(f.srv.URL))

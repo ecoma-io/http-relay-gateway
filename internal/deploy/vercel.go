@@ -48,6 +48,12 @@ func (c *vercelClient) Verify(ctx context.Context) (string, error) {
 	}
 	err := platformCall(ctx, c.http, http.MethodGet, c.base+"/v2/user", c.token, "", nil, &answer)
 	if err != nil {
+		// 401/403 is the platform rejecting the token — client data, not a
+		// gateway fault; the admin plane turns it into a field error instead
+		// of reporting a platform outage.
+		if strings.Contains(err.Error(), "status 401") || strings.Contains(err.Error(), "status 403") {
+			return "", fmt.Errorf("vercel verify: %w", ErrCredentials)
+		}
 		return "", fmt.Errorf("vercel verify: %w", err)
 	}
 	if answer.User.Username == "" {
