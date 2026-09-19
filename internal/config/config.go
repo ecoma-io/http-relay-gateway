@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,7 +19,6 @@ func envStr(key string, dst *string) {
 
 // Defaults applied when the corresponding environment variable is unset.
 const (
-	DefaultConfigFile = "config.yaml"
 	DefaultListenAddr = ":8080"
 	// DefaultAdminAddr binds the management plane to loopback: the admin API
 	// and its UI must never be reachable from the network the data plane
@@ -33,28 +33,29 @@ const (
 )
 
 // BootstrapConfig contains process-level settings. They are intentionally read
-// only when the process starts because changing the listening socket, the
-// watched file or the database in place would require a coordinated server
-// restart. The relay pool, body limits and log level are runtime settings and
-// live in the database.
+// only when the process starts because changing the listening sockets or the
+// database in place would require a coordinated server restart. Everything the
+// management plane can change at runtime — the relay pool, body limits, the
+// log level — lives in the database instead.
 type BootstrapConfig struct {
-	ConfigFile    string
 	ListenAddr    string
 	AdminAddr     string
 	DataFile      string
 	ShutdownGrace time.Duration
+	// AdminCookieSecure sets the Secure attribute on admin session cookies.
+	// Off by default because the admin plane is loopback HTTP; turn it on
+	// when fronting the admin listener with HTTPS.
+	AdminCookieSecure bool
 }
 
 // LoadBootstrap applies bootstrap defaults and explicit environment overrides.
 func LoadBootstrap() (*BootstrapConfig, error) {
 	cfg := &BootstrapConfig{
-		ConfigFile:    DefaultConfigFile,
 		ListenAddr:    DefaultListenAddr,
 		AdminAddr:     DefaultAdminAddr,
 		DataFile:      DefaultDataFile,
 		ShutdownGrace: DefaultShutdownGrace,
 	}
-	envStr("CONFIG_FILE", &cfg.ConfigFile)
 	envStr("LISTEN_ADDR", &cfg.ListenAddr)
 	envStr("ADMIN_ADDR", &cfg.AdminAddr)
 	envStr("DATA_FILE", &cfg.DataFile)
@@ -67,6 +68,13 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 		}
 		cfg.ShutdownGrace = d
 	}
+	if raw, ok := os.LookupEnv("ADMIN_COOKIE_SECURE"); ok && raw != "" {
+		secure, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("ADMIN_COOKIE_SECURE %q must be a boolean", raw)
+		}
+		cfg.AdminCookieSecure = secure
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -75,9 +83,6 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 
 func (c *BootstrapConfig) validate() error {
 	var errs []error
-	if strings.TrimSpace(c.ConfigFile) == "" {
-		errs = append(errs, errors.New("CONFIG_FILE must not be empty"))
-	}
 	if strings.TrimSpace(c.DataFile) == "" {
 		errs = append(errs, errors.New("DATA_FILE must not be empty"))
 	}

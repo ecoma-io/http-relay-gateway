@@ -2,7 +2,162 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 )
+
+// ErrDuplicateName reports a relay or provider name already in use.
+var ErrDuplicateName = errors.New("name already in use")
+
+// ErrNoRelay reports that no relay row carries the given id.
+var ErrNoRelay = errors.New("relay not found")
+
+// CreateRelay inserts a management-plane relay (origin managed, no
+// deployment yet) and returns its id — the pool position once it deploys.
+// A header policy of "" is stored as NULL (verbatim forwarding).
+func (s *Store) CreateRelay(name, provider, url string, active bool, accountID *int64, headerPolicy *string) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var taken int
+	if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM relays WHERE name = ?)`, name).Scan(&taken); err != nil {
+		return 0, err
+	}
+	if taken == 1 {
+		return 0, ErrDuplicateName
+	}
+	flags := 0
+	if active {
+		flags = 1
+	}
+	res, err := tx.Exec(
+		`INSERT INTO relays (name, provider, url, active, origin, account_id, header_policy, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, 'managed', ?, NULLIF(?, ''), strftime('%s', 'now'), strftime('%s', 'now'))`,
+		name, provider, url, flags, accountID, headerPolicy,
+	)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.notify()
+	return id, nil
+}
+
+// Relay returns one relay row, or ErrNoRelay. It reuses the Relays() join so
+// the active-deployment logic lives in exactly one place; the table is small
+// enough that scanning it whole costs nothing.
+func (s *Store) Relay(id int64) (RelayRow, error) {
+	rows, err := s.Relays()
+	if err != nil {
+		return RelayRow{}, err
+	}
+	for _, row := range rows {
+		if row.ID == id {
+			return row, nil
+		}
+	}
+	return RelayRow{}, ErrNoRelay
+}
+
+// RelayPatch is a partial relay update; nil fields stay untouched. A non-nil
+// empty-string HeaderPolicy clears the stored policy (verbatim forwarding).
+type RelayPatch struct {
+	Name         *string
+	Provider     *string
+	URL          *string
+	Active       *bool
+	HeaderPolicy *string
+}
+
+// UpdateRelay applies the patch to one relay. ErrNoRelay when the id does
+// not exist; ErrDuplicateName when renaming onto an existing name.
+func (s *Store) UpdateRelay(id int64, patch RelayPatch) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM relays WHERE id = ?)`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNoRelay
+	}
+	if patch.Name != nil && *patch.Name != "" {
+		var taken int
+		if err := tx.QueryRow(
+			`SELECT EXISTS (SELECT 1 FROM relays WHERE name = ? AND id != ?)`, *patch.Name, id,
+		).Scan(&taken); err != nil {
+			return err
+		}
+		if taken == 1 {
+			return ErrDuplicateName
+		}
+	}
+	if patch.Name != nil {
+		if _, err := tx.Exec(`UPDATE relays SET name = ?, updated_at = strftime('%s', 'now') WHERE id = ?`, *patch.Name, id); err != nil {
+			return err
+		}
+	}
+	if patch.Provider != nil {
+		if _, err := tx.Exec(`UPDATE relays SET provider = ?, updated_at = strftime('%s', 'now') WHERE id = ?`, *patch.Provider, id); err != nil {
+			return err
+		}
+	}
+	if patch.URL != nil {
+		if _, err := tx.Exec(`UPDATE relays SET url = ?, updated_at = strftime('%s', 'now') WHERE id = ?`, *patch.URL, id); err != nil {
+			return err
+		}
+	}
+	if patch.Active != nil {
+		flags := 0
+		if *patch.Active {
+			flags = 1
+		}
+		if _, err := tx.Exec(`UPDATE relays SET active = ?, updated_at = strftime('%s', 'now') WHERE id = ?`, flags, id); err != nil {
+			return err
+		}
+	}
+	if patch.HeaderPolicy != nil {
+		if _, err := tx.Exec(
+			`UPDATE relays SET header_policy = NULLIF(?, ''), updated_at = strftime('%s', 'now') WHERE id = ?`,
+			*patch.HeaderPolicy, id,
+		); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.notify()
+	return nil
+}
+
+// DeleteRelay removes one relay row; its deployment (if any) cascades.
+// ErrNoRelay when the id does not exist.
+func (s *Store) DeleteRelay(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM relays WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRelay
+	}
+	s.notify()
+	return nil
+}
 
 // Relays returns every relay ordered by id — insertion order, which the pool
 // uses as its round-robin order. The active deployment (if any) is joined in;

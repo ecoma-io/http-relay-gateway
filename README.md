@@ -9,7 +9,7 @@ at the gateway instead of managing a relay list itself.
 client ──(two headers)──▶ relay-gateway ──(verbatim forward)──▶ edge relay ──▶ target API
                           round-robin + failover
                           per-provider body limits
-                          passive health + hot reload
+                          passive health + database-backed pool
 ```
 
 ## Why
@@ -72,69 +72,61 @@ no accepting provider or the body exceeds every configured limit.
 
 ## Configure
 
-Copy `config.example.yaml` to `config.yaml` and replace the example relays.
-The file may contain private URLs; it is Git- and Docker-context-ignored.
+Everything dynamic — relays, providers, runtime settings — lives in the
+SQLite database and is managed through the **admin plane** (`ADMIN_ADDR`,
+REST at `/api/v1` plus a built-in UI). The data plane itself stays
+unauthenticated; the admin plane is not.
 
-```yaml
-log-level: info
-max-retries: 2
-failure-threshold: 3
-cooldown: 30s
-providers:
-  vercel:
-    max-body: 4.5mb
-  cloudflare:
-    max-body: 100mb
-relays:
-  - name: vercel-1
-    provider: vercel
-    url: https://my-relay.vercel.app
-```
+- **First run**: an empty database puts the admin API in setup mode —
+  `POST /api/v1/setup` with a password (min 8 chars, sent twice) creates the
+  one admin account and issues a session cookie. Setup is once-ever; every
+  later access logs in first (`POST /api/v1/login`). Passwords are stored as
+  bcrypt hashes; sessions are signed HS256 JWTs in an `HttpOnly` cookie
+  valid 12h.
+- **Logins are rate-limited**: 5 failed attempts per 15 minutes per source
+  address, plus a global cap, then `429` + `Retry-After` — including for the
+  correct password, by design.
+- **Relays**: `POST /api/v1/relays` with `name`, `provider`, `url`. A relay
+  serves from its URL immediately; platform deployments attach later and
+  then supply the relay's authentication token. Provider labels are free-form
+  (`vercel`, `cloudflare`, `deno`, or your own); body limits attach to the
+  label via `PUT /api/v1/providers`.
+- **Settings**: `GET`/`PATCH /api/v1/settings` — log level, retry/cooldown
+  knobs, streaming threshold, transport timeouts. Unknown keys are rejected.
 
-A "provider" is any label you choose for grouping relays (`vercel`,
-`cloudflare`, `deno`, …, or names of your own); body limits attach to the
-label. Runtime settings live only in `config.yaml`: `log-level`,
-`max-retries`, `failure-threshold`, `cooldown`, `providers`, and `relays`.
-Strict decoding rejects unknown keys; a failed reload keeps the
-last-known-good configuration serving, and first boot refuses to start.
+Bind `ADMIN_ADDR` to loopback (the default `127.0.0.1:20131`) and front it
+with an authenticating proxy if it must be reachable remotely. Never expose
+the admin plane bare.
 
-### Hot reload
+### Live reconfiguration
 
-The process polls the file each second and reloads when its content hash
-changes, so in-place edits and atomic replacements both reload under any
-mount style. Reloads swap one immutable config+pool generation atomically:
-in-flight requests finish on their original generation, and pool health
-counters restart with the new pool.
-
-Caveat on a **single-file bind mount** (`./config.yaml:/app/config.yaml:ro`):
-a rename-over-the-mount update splices in a new inode that the mount never
-follows, so the poller keeps hashing the old content. Edit in place
-(`nano`, `echo >>`, `sed -i`) or `docker compose restart` after an atomic
-replace. Do not add a SIGHUP fallback or an event-based watcher: neither can
-fix that blind spot, while the content-hash poll already covers everything
-else.
+Every accepted admin mutation writes to the database, which signals a
+coalesced change; the process rebuilds one immutable pool generation from
+the database and swaps it atomically — in-flight requests finish on their
+original generation, and pool health counters restart with the new pool
+(`configuration reloaded` in the log). A rejected mutation (validation,
+conflicts) changes nothing: the last-known-good pool keeps serving. No
+config file, no reload signal, no restart.
 
 ### Environment (bootstrap-only, restart to change)
 
-| Env              |           Default | Meaning                                           |
-| ---------------- | ----------------: | ------------------------------------------------- |
-| `CONFIG_FILE`    |     `config.yaml` | Runtime YAML path                                 |
-| `LISTEN_ADDR`    |           `:8080` | Relay endpoint (also serves `/healthz`, `/stats`) |
-| `ADMIN_ADDR`     | `127.0.0.1:20131` | Management-plane listener (admin API + UI)        |
-| `DATA_FILE`      | `data/gateway.db` | SQLite database: the source of truth for relays   |
-| `SHUTDOWN_GRACE` |             `20s` | Whole-process drain budget for graceful shutdown  |
+| Env                   |           Default | Meaning                                           |
+| --------------------- | ----------------: | ------------------------------------------------- |
+| `LISTEN_ADDR`         |           `:8080` | Relay endpoint (also serves `/healthz`, `/stats`) |
+| `ADMIN_ADDR`          | `127.0.0.1:20131` | Admin plane listener (REST API + UI)              |
+| `DATA_FILE`           | `data/gateway.db` | SQLite database — the source of truth             |
+| `SHUTDOWN_GRACE`      |             `20s` | Whole-process drain budget for graceful shutdown  |
+| `ADMIN_COOKIE_SECURE` |           `false` | Set `true` when the admin plane terminates HTTPS  |
 
 ### State
 
-Relays, settings and (soon) platform accounts live in the SQLite database at
-`DATA_FILE`, not in the YAML. On first boot an empty database adopts the
-YAML wholesale (`imported legacy config into database` in the log); on later
-boots the file resyncs its own entries, so it stays a convenient way to seed
-or edit relays — but the database is what serves. Delete the file (or rename
-it away) and the gateway keeps serving the database's pool unchanged; a
-corrupt or invalid YAML is logged and ignored rather than taken. The
-database enables WAL journaling: put `DATA_FILE` on a filesystem that
-supports it.
+Relays, providers, settings, platform accounts and deployments all live in
+the SQLite database at `DATA_FILE` — there is no other state. Delete the
+file and the gateway boots empty (setup mode, data plane returns `503`
+until a relay exists). Admin credentials are database rows too: the bcrypt
+password hash and the JWT signing secret survive restarts, so sessions stay
+valid across one. The database enables WAL journaling: put `DATA_FILE` on a
+filesystem that supports it, and back the file up — it is the whole system.
 
 ## Run
 
@@ -142,7 +134,8 @@ supports it.
 gofmt -w . && go vet ./... && go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/http-relay-gateway ./cmd/http-relay-gateway
 
-CONFIG_FILE=config.yaml LISTEN_ADDR=0.0.0.0:20130 ./bin/http-relay-gateway
+LISTEN_ADDR=0.0.0.0:20130 ADMIN_ADDR=127.0.0.1:20131 ./bin/http-relay-gateway
+# then: open http://127.0.0.1:20131/ — first visit offers the setup form
 ```
 
 Subcommands: `http-relay-gateway version` prints the build version;
@@ -173,20 +166,28 @@ the same compose network.
 ```bash
 docker build -t relay-gateway:dev --build-arg VERSION=0.1.0-dev .
 docker run --rm relay-gateway:dev version
-# Copy config.example.yaml to config.yaml and add real relays first.
 docker compose up -d --build
 curl http://127.0.0.1:20130/stats
 ```
 
-`compose.yaml` publishes host **20130**, bind-mounts `config.yaml`
-read-only, defaults to bounded `json-file` logs, keeps `stop_grace_period`
+`compose.yaml` publishes the relay endpoint on host **20130** and the admin
+plane on host loopback **127.0.0.1:20131**, keeps the database in a named
+volume, defaults to bounded `json-file` logs, keeps `stop_grace_period`
 (30s) above `SHUTDOWN_GRACE` (default 20s), and uses the binary
-`healthcheck` subcommand (no shell in the scratch image).
+`healthcheck` subcommand (no shell in the scratch image). On the volume:
+uid 65532 owns the database files — a bind mount needs a writable,
+chowned directory, which is why the named volume is the default.
 
 ## Layout
 
-- `cmd/http-relay-gateway` — lifecycle, signals, poller loop, `version` / `healthcheck`
-- `internal/config` — bootstrap environment, Viper YAML validation, body-size parsing, content-hash change poller
+- `cmd/http-relay-gateway` — lifecycle, signals, the apply loop that turns
+  database changes into pool swaps, `version` / `healthcheck`
+- `internal/config` — bootstrap environment only (`LISTEN_ADDR`,
+  `ADMIN_ADDR`, `DATA_FILE`, `SHUTDOWN_GRACE`, `ADMIN_COOKIE_SECURE`)
+- `internal/store` — SQLite persistence: embedded migrations, relays,
+  providers, settings, admin credentials, coalesced change channel
+- `internal/admin` — admin plane: cookie-session auth (bcrypt + JWT), login
+  rate limiting, setup-once flow, the `/api/v1` REST surface
 - `internal/gateway` — HTTP data plane: provider selection, bounded failover, streaming pass-through, `/healthz` + `/stats`
 - `internal/pool` — per-selector round-robin cursors, passive health (threshold → cooldown → half-open), stats snapshots
 - `internal/logging`, `internal/sanitize` — zerolog setup and redaction helpers shared by all log/error paths

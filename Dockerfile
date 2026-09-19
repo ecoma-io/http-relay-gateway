@@ -13,10 +13,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/http-relay-gateway /app/http-relay-gateway
-# scratch has no WORKDIR; pin the default config path to the image layout so a
-# bare `docker run` works (compose sets CONFIG_FILE explicitly anyway).
-ENV CONFIG_FILE=/app/config.yaml
+# scratch has no WORKDIR; pin the database path to the image layout so a
+# bare `docker run` works (compose sets DATA_FILE explicitly anyway).
+ENV DATA_FILE=/app/data/gateway.db
 USER 65532:65532
-EXPOSE 20130
+EXPOSE 20130 20131
 ENTRYPOINT ["/app/http-relay-gateway"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["/app/http-relay-gateway", "healthcheck"]

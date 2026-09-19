@@ -7,7 +7,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,15 +14,18 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"http-relay-gateway/internal/admin"
 	"http-relay-gateway/internal/config"
 	"http-relay-gateway/internal/gateway"
 	"http-relay-gateway/internal/logging"
 	"http-relay-gateway/internal/pool"
 	"http-relay-gateway/internal/sanitize"
 	"http-relay-gateway/internal/store"
+	"http-relay-gateway/internal/web"
 
 	"github.com/rs/zerolog"
 )
@@ -53,10 +55,11 @@ func main() {
 	}
 }
 
-// healthcheck probes the bootstrap-configured listener. It deliberately does
-// not read the runtime YAML or the database: a bad reload must not make a
-// healthy, already running process fail Docker's health probe. The scratch
-// image has no shell, so this subcommand is what the Docker HEALTHCHECK runs.
+// healthcheck probes the bootstrap-configured data-plane listener. It
+// deliberately does not read the database: a broken database or a pending
+// first-run setup must not fail Docker's health probe for a serving process.
+// The scratch image has no shell, so this subcommand is what the Docker
+// HEALTHCHECK runs.
 func healthcheck() int {
 	bootstrap, err := config.LoadBootstrap()
 	if err != nil {
@@ -114,44 +117,27 @@ func run() error {
 
 	log := setupDynamicLogger(initialLogLevel(db))
 
-	// Legacy config bridge (transitional): on first boot an empty database
-	// adopts the YAML wholesale; on later boots the YAML resyncs its own
-	// relays and settings. A missing file is fine — the database stands
-	// alone; a broken file never touches the database, so the last-known
-	// good state keeps serving.
-	empty, err := db.IsEmpty()
-	if err != nil {
-		return fmt.Errorf("inspect data store: %w", err)
-	}
-	if _, err := os.Stat(bootstrap.ConfigFile); err == nil {
-		imported, err := syncLegacy(bootstrap.ConfigFile, db)
-		switch {
-		case err != nil && empty:
-			// Nothing to serve from and nothing adoptable: fail fast, exactly
-			// like a bad startup config did before the database existed.
-			return fmt.Errorf("adopt legacy config: %w", err)
-		case err != nil:
-			log.Warn().Str("error", sanitize.ErrorString(err)).Msg("legacy config invalid; serving from database")
-		case imported > 0:
-			log.Info().Int("relays", imported).Msg("imported legacy config into database")
-		}
-	} else if empty {
-		return fmt.Errorf("no legacy config at %q and empty database at %q: provide either to define relays", bootstrap.ConfigFile, bootstrap.DataFile)
-	} else {
-		log.Info().Str("path", bootstrap.ConfigFile).Msg("legacy config absent; serving from database")
-	}
-
-	// The gateway publishes one immutable generation (validated config + pool
-	// snapshot). Handlers load it once per request; any change swaps the
-	// whole generation atomically and in-flight requests finish on their own.
+	// An empty database is a legal first boot: the admin plane serves the
+	// setup flow while the data plane answers 503 until the first relay
+	// exists. Only an unreadable database is fatal.
 	gen, err := buildGeneration(db)
 	if err != nil {
 		return err
 	}
 	if gen.relays == 0 {
-		return errors.New("no serving relays in the database")
+		log.Warn().Msg("no relays configured; data plane returns 503 until a relay is created")
 	}
 	g := gateway.New(gen.state, version, log)
+
+	spa, err := web.Handler()
+	if err != nil {
+		return fmt.Errorf("load management UI: %w", err)
+	}
+	var adminOpts []admin.Option
+	if bootstrap.AdminCookieSecure {
+		adminOpts = append(adminOpts, admin.WithSecureCookie())
+	}
+	adminHandler := admin.New(db, version, log, spa, adminOpts...)
 
 	ln, err := net.Listen("tcp", bootstrap.ListenAddr)
 	if err != nil {
@@ -162,8 +148,17 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	adminLn, err := net.Listen("tcp", bootstrap.AdminAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", bootstrap.AdminAddr, err)
+	}
+	adminSrv := &http.Server{
+		Handler:           adminHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		log.Info().Str("addr", ln.Addr().String()).Str("version", version).
 			Int("relays", gen.relays).Msg("relay-gateway listening")
@@ -172,17 +167,18 @@ func run() error {
 			errCh <- fmt.Errorf("listener: %w", err)
 		}
 	}()
-
-	poller := config.NewPoller(bootstrap.ConfigFile, config.DefaultPollInterval, log)
-	pollCtx, cancelPoll := context.WithCancel(context.Background())
-	defer cancelPoll()
-	go poller.Run(pollCtx, log)
+	go func() {
+		log.Info().Str("addr", adminLn.Addr().String()).Msg("admin plane listening")
+		if err := adminSrv.Serve(adminLn); err != nil {
+			errCh <- fmt.Errorf("admin listener: %w", err)
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// Every database mutation — the YAML bridge here, the admin plane later —
+	// Every database mutation — the admin API here, the reconciler later —
 	// converges on this one apply path: rebuild the generation from the
 	// database and swap it atomically.
 	apply := func(source string) {
@@ -199,18 +195,8 @@ func run() error {
 		log.Info().Str("source", source).Int("relays", next.relays).Msg("configuration reloaded")
 	}
 
-	// The poller hash-gates on applied content, so one signal means one
-	// distinct file change; the sync either lands in the database (which
-	// notifies the apply loop) or leaves the old generation untouched.
-	reload := func(source string) {
-		if _, err := syncLegacy(bootstrap.ConfigFile, db); err != nil {
-			log.Warn().Str("source", source).Str("error", sanitize.ErrorString(err)).
-				Msg("reload failed; keeping previous configuration")
-		}
-	}
-
-	// The startup sync already flowed into the initial generation; drop its
-	// pending wakeup so the loop does not rebuild redundantly.
+	// The startup generation already reflects current state; drop its pending
+	// wakeup so the loop does not rebuild redundantly.
 	select {
 	case <-db.Changes():
 	default:
@@ -219,47 +205,16 @@ func run() error {
 	for {
 		select {
 		case err := <-errCh:
-			shutdownServer(srv, bootstrap.ShutdownGrace)
+			shutdownAll([]*http.Server{srv, adminSrv}, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
-			shutdownServer(srv, bootstrap.ShutdownGrace)
+			shutdownAll([]*http.Server{srv, adminSrv}, bootstrap.ShutdownGrace)
 			return nil
-		case <-poller.Changes():
-			reload("poll")
 		case <-db.Changes():
 			apply("database")
 		}
 	}
-}
-
-// syncLegacy parses the legacy YAML and writes it into the database in one
-// transaction. Parse or validation failures return an error before the
-// database is touched, so a broken edit can never reach the pool.
-func syncLegacy(path string, db *store.Store) (int, error) {
-	cfg, err := config.LoadRuntime(path)
-	if err != nil {
-		return 0, err
-	}
-	providers := make([]store.ProviderRow, 0, len(cfg.Providers))
-	for name, spec := range cfg.Providers {
-		providers = append(providers, store.ProviderRow{Name: name, MaxBody: spec.MaxBody})
-	}
-	relays := make([]store.LegacyRelay, 0, len(cfg.Relays))
-	for _, relay := range cfg.Relays {
-		relays = append(relays, store.LegacyRelay{
-			Name:     relay.Name,
-			Provider: relay.Provider,
-			URL:      relay.URL.String(),
-			Active:   relay.Active,
-		})
-	}
-	return db.SyncLegacy(store.RuntimeValues{
-		LogLevel:         cfg.LogLevel,
-		MaxRetries:       cfg.MaxRetries,
-		FailureThreshold: cfg.FailureThreshold,
-		CooldownMs:       cfg.Cooldown.Milliseconds(),
-	}, providers, relays)
 }
 
 // buildGeneration reads the database and derives the next immutable serving
@@ -327,20 +282,21 @@ func buildGeneration(db *store.Store) (generation, error) {
 }
 
 // relayInput maps a database relay row into a resolved pool input. Legacy
-// relays always appear (an inactive one shows in /stats as inactive); a
-// managed relay joins only through its verified active deployment, whose URL
-// is the stable platform domain and whose stored token authenticates the
-// relay leg. The bool is false when the row contributes no pool entry.
+// relays always appear (an inactive one shows in /stats as inactive). A
+// managed relay serves from its own URL until a deployment exists — that is
+// what an admin-created relay is before its first deploy — and once its
+// verified active deployment joins, that deployment's stable URL and token
+// take over and the relay is unconditionally active. The bool is false when
+// the row contributes no pool entry.
 func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPolicies map[string]*pool.HeaderPolicy) (pool.RelayInput, bool, error) {
 	switch row.Origin {
 	case store.OriginLegacy:
 		// active flag passes through verbatim.
 	case store.OriginManaged:
-		if row.Deployment == nil {
-			return pool.RelayInput{}, false, nil
+		if row.Deployment != nil {
+			row.URL = row.Deployment.URL
+			row.Active = true
 		}
-		row.URL = row.Deployment.URL
-		row.Active = true
 	default:
 		return pool.RelayInput{}, false, nil
 	}
@@ -378,17 +334,25 @@ func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPol
 func initialLogLevel(db *store.Store) string {
 	settings, err := db.Settings()
 	if err != nil {
-		return config.DefaultLogLevel
+		return store.DefaultLogLevel
 	}
 	return settings.LogLevel
 }
 
-// shutdownServer drains in-flight requests against one whole-process grace
-// budget; expiry force-closes whatever is left.
-func shutdownServer(server *http.Server, grace time.Duration) {
+// shutdownAll drains both planes' in-flight requests against one
+// whole-process grace budget; expiry force-closes whatever is left.
+func shutdownAll(servers []*http.Server, grace time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	_ = server.Shutdown(ctx)
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(s *http.Server) {
+			defer wg.Done()
+			_ = s.Shutdown(ctx)
+		}(srv)
+	}
+	wg.Wait()
 }
 
 func parseZerologLevel(level string) zerolog.Level {

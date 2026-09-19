@@ -2,16 +2,17 @@ package e2e_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
 func TestE2E_ForwardsRelaySpec(t *testing.T) {
 	vercel := NewEdgeSim(t, "vercel-1")
 	cf := NewEdgeSim(t, "cloudflare-1")
-	g := NewGateway(t, defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: vercel.URL},
-		{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
-	}))
+	g := NewGatewayWithRelays(t,
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: vercel.URL},
+		RelaySeed{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
+	)
 
 	status, headers, body := relayDo(t, g.Addr, "/vercel", `{"model":"x"}`, map[string]string{
 		"Authorization": "Bearer provider-secret",
@@ -51,10 +52,10 @@ func TestE2E_ForwardsRelaySpec(t *testing.T) {
 func TestE2E_FailoverToLiveRelay(t *testing.T) {
 	dead := deadRelayURL(t)
 	live := NewEdgeSim(t, "vercel-live")
-	g := NewGateway(t, defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-dead", Provider: "vercel", URL: dead},
-		{Name: "vercel-live", Provider: "vercel", URL: live.URL},
-	}))
+	g := NewGatewayWithRelays(t,
+		RelaySeed{Name: "vercel-dead", Provider: "vercel", URL: dead},
+		RelaySeed{Name: "vercel-live", Provider: "vercel", URL: live.URL},
+	)
 
 	status, _, body := relayDo(t, g.Addr, "/vercel", `{}`, nil)
 	if status != http.StatusOK {
@@ -64,7 +65,7 @@ func TestE2E_FailoverToLiveRelay(t *testing.T) {
 		t.Fatalf("body = %q, want %q", body, live.servedBody())
 	}
 
-	st := g.WaitForCondition(reloadSettle, "dead relay recorded a failure", func(st *StatsView) bool {
+	st := g.WaitForCondition(applySettle, "dead relay recorded a failure", func(st *StatsView) bool {
 		row, ok := st.relay("vercel-dead")
 		return ok && row.Failures >= 1
 	})
@@ -77,11 +78,11 @@ func TestE2E_ProviderPinAndRoundRobin(t *testing.T) {
 	v1 := NewEdgeSim(t, "vercel-1")
 	v2 := NewEdgeSim(t, "vercel-2")
 	cf := NewEdgeSim(t, "cloudflare-1")
-	g := NewGateway(t, defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: v1.URL},
-		{Name: "vercel-2", Provider: "vercel", URL: v2.URL},
-		{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
-	}))
+	g := NewGatewayWithRelays(t,
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: v1.URL},
+		RelaySeed{Name: "vercel-2", Provider: "vercel", URL: v2.URL},
+		RelaySeed{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
+	)
 
 	// Pinned vercel traffic rotates the vercel cursor only: the round-robin
 	// is strictly deterministic, so the served sequence must alternate.
@@ -96,7 +97,7 @@ func TestE2E_ProviderPinAndRoundRobin(t *testing.T) {
 		t.Fatal("pinned vercel traffic leaked to cloudflare")
 	}
 
-	// Auto (no pin) rotates across every provider in config order.
+	// Auto (no pin) rotates across every provider in creation order.
 	for i, want := range []*edgeSim{v1, v2, cf, v1, v2, cf} {
 		status, _, body := relayDo(t, g.Addr, "/", `{}`, nil)
 		if status != http.StatusOK || body != want.servedBody() {
@@ -118,12 +119,11 @@ func TestE2E_ProviderPinAndRoundRobin(t *testing.T) {
 func TestE2E_BodyLimitSkipsToProvider(t *testing.T) {
 	v := NewEdgeSim(t, "vercel-1")
 	cf := NewEdgeSim(t, "cloudflare-1")
-	cfg := defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: v.URL},
-		{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
-	})
-	cfg.Providers = map[string]string{"vercel": "8", "cloudflare": "100"}
-	g := NewGateway(t, cfg)
+	g := NewGatewayWithProviders(t,
+		map[string]int64{"vercel": 8, "cloudflare": 100},
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: v.URL},
+		RelaySeed{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
+	)
 
 	// 12 bytes: over vercel's 8-byte limit, under cloudflare's.
 	big := "123456789012"
@@ -148,12 +148,11 @@ func TestE2E_BodyLimitSkipsToProvider(t *testing.T) {
 func TestE2E_BodyOverEveryLimitRejected(t *testing.T) {
 	v := NewEdgeSim(t, "vercel-1")
 	cf := NewEdgeSim(t, "cloudflare-1")
-	cfg := defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: v.URL},
-		{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
-	})
-	cfg.Providers = map[string]string{"vercel": "4", "cloudflare": "4"}
-	g := NewGateway(t, cfg)
+	g := NewGatewayWithProviders(t,
+		map[string]int64{"vercel": 4, "cloudflare": 4},
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: v.URL},
+		RelaySeed{Name: "cloudflare-1", Provider: "cloudflare", URL: cf.URL},
+	)
 
 	status, _, _ := relayDo(t, g.Addr, "/", "1234567890", nil)
 	if status != http.StatusRequestEntityTooLarge {
@@ -166,9 +165,9 @@ func TestE2E_BodyOverEveryLimitRejected(t *testing.T) {
 
 func TestE2E_UnknownProviderRejected(t *testing.T) {
 	v := NewEdgeSim(t, "vercel-1")
-	g := NewGateway(t, defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: v.URL},
-	}))
+	g := NewGatewayWithRelays(t,
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: v.URL},
+	)
 
 	status, _, _ := relayDo(t, g.Addr, "/", `{}`, map[string]string{
 		"X-Relay-Provider": "deno",
@@ -185,10 +184,10 @@ func TestE2E_UnknownProviderRejected(t *testing.T) {
 func TestE2E_InactiveRelaySkipped(t *testing.T) {
 	v1 := NewEdgeSim(t, "vercel-1")
 	v2 := NewEdgeSim(t, "vercel-2")
-	g := NewGateway(t, defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: v1.URL},
-		{Name: "vercel-2", Provider: "vercel", URL: v2.URL, Active: activePtr(false)},
-	}))
+	g := NewGatewayWithRelays(t,
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: v1.URL},
+		RelaySeed{Name: "vercel-2", Provider: "vercel", URL: v2.URL, Active: activePtr(false)},
+	)
 
 	for range 3 {
 		status, _, body := relayDo(t, g.Addr, "/vercel", `{}`, nil)
@@ -210,9 +209,9 @@ func TestE2E_InactiveRelaySkipped(t *testing.T) {
 
 func TestE2E_HealthAndStatsEndpoints(t *testing.T) {
 	v := NewEdgeSim(t, "vercel-1")
-	g := NewGateway(t, defaultGatewayConfig([]RelayConfig{
-		{Name: "vercel-1", Provider: "vercel", URL: v.URL},
-	}))
+	g := NewGatewayWithRelays(t,
+		RelaySeed{Name: "vercel-1", Provider: "vercel", URL: v.URL},
+	)
 
 	st, err := g.Stats()
 	if err != nil {
@@ -223,5 +222,10 @@ func TestE2E_HealthAndStatsEndpoints(t *testing.T) {
 	}
 	if row, ok := st.relay("vercel-1"); !ok || !row.Healthy || row.MaxBody != 8<<20 {
 		t.Fatalf("vercel-1 row = %+v, want healthy with default maxBody %d", row, int64(8<<20))
+	}
+	// Stats are an unauthenticated data-plane endpoint: relay URLs and
+	// anything credential-shaped must never appear in them.
+	if raw := g.RawStats(t); strings.Contains(raw, v.URL) {
+		t.Fatalf("relay URL leaked into /stats: %s", raw)
 	}
 }

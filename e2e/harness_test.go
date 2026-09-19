@@ -7,11 +7,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,37 +37,13 @@ func (b *lockedBuffer) String() string {
 	return b.b.String()
 }
 
-// RelayConfig is one relay entry in the generated gateway config. A nil
-// Active omits the key (the gateway defaults to true).
-type RelayConfig struct {
-	Name     string
-	Provider string
-	URL      string
-	Active   *bool
-}
+// adminPassword is the setup password every e2e gateway installs.
+const adminPassword = "e2e-admin-password-123"
 
-// GatewayConfig is the full runtime YAML written for one gateway instance.
-// Providers maps a provider label to its raw max-body value ("" renders a
-// bare providers entry, which applies the gateway default).
-type GatewayConfig struct {
-	LogLevel         string
-	MaxRetries       int
-	FailureThreshold int // 0 omits the key; the gateway defaults to 3
-	Cooldown         string
-	Providers        map[string]string
-	Relays           []RelayConfig
-}
-
-func defaultGatewayConfig(relays []RelayConfig) GatewayConfig {
-	return GatewayConfig{
-		LogLevel:   "info",
-		MaxRetries: 2,
-		Cooldown:   "30s",
-		Relays:     relays,
-	}
-}
-
-func activePtr(v bool) *bool { return &v }
+// applySettle bounds one database-mutation-to-pool-swap cycle: the applier
+// reacts to the store's change signal in-process, so this is pure headroom
+// for slow machines.
+const applySettle = 5 * time.Second
 
 // StatsView is the decoded /stats body.
 type StatsView struct {
@@ -79,6 +55,8 @@ type StatsView struct {
 type RelayView struct {
 	Name      string `json:"name"`
 	Provider  string `json:"provider"`
+	Origin    string `json:"origin"`
+	Managed   bool   `json:"managed"`
 	Active    bool   `json:"active"`
 	Healthy   bool   `json:"healthy"`
 	MaxBody   int64  `json:"maxBody"`
@@ -104,17 +82,18 @@ func relayNames(st *StatsView) []string {
 	return out
 }
 
-// Gateway is one real gateway subprocess with its own config file, data
-// file and port.
+// Gateway is one real gateway subprocess with its own data file and ports.
 type Gateway struct {
-	t          testing.TB
-	dir        string
-	configPath string
-	dataFile   string
-	cmd        *exec.Cmd
-	output     *lockedBuffer
+	t         testing.TB
+	dir       string
+	dataFile  string
+	cmd       *exec.Cmd
+	output    *lockedBuffer
+	admin     *adminClient
+	adminPass string
 
-	Addr string
+	Addr      string
+	AdminAddr string
 }
 
 // handedOut records every loopback address freeAddr returned in this process.
@@ -157,90 +136,95 @@ func deadRelayURL(t testing.TB) string {
 	return "http://" + addr
 }
 
-func yamlQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+// RelaySeed is one relay a test creates through the admin API.
+type RelaySeed struct {
+	Name     string
+	Provider string
+	URL      string
+	Active   *bool
 }
 
-func renderConfig(cfg GatewayConfig) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "log-level: %s\n", cfg.LogLevel)
-	fmt.Fprintf(&sb, "max-retries: %d\n", cfg.MaxRetries)
-	if cfg.FailureThreshold > 0 {
-		fmt.Fprintf(&sb, "failure-threshold: %d\n", cfg.FailureThreshold)
-	}
-	if cfg.Cooldown != "" {
-		fmt.Fprintf(&sb, "cooldown: %s\n", cfg.Cooldown)
-	}
-	if len(cfg.Providers) > 0 {
-		sb.WriteString("providers:\n")
-		names := make([]string, 0, len(cfg.Providers))
-		for name := range cfg.Providers {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			if raw := cfg.Providers[name]; raw == "" {
-				fmt.Fprintf(&sb, "  %s: {}\n", name)
-			} else {
-				fmt.Fprintf(&sb, "  %s:\n    max-body: %s\n", name, raw)
-			}
-		}
-	}
-	sb.WriteString("relays:\n")
-	for _, r := range cfg.Relays {
-		fmt.Fprintf(&sb, "  - provider: %s\n", r.Provider)
-		if r.Name != "" {
-			fmt.Fprintf(&sb, "    name: %s\n", r.Name)
-		}
-		fmt.Fprintf(&sb, "    url: %s\n", yamlQuote(r.URL))
-		if r.Active != nil {
-			fmt.Fprintf(&sb, "    active: %v\n", *r.Active)
-		}
-	}
-	return sb.String()
-}
+func activePtr(v bool) *bool { return &v }
 
-// NewGateway writes cfg to a temp config file, starts the real binary, and
-// waits for /healthz. Every instance owns its port so runs stay collision-free.
-func NewGateway(t testing.TB, cfg GatewayConfig) *Gateway {
-	return newGateway(t, cfg, nil)
+// NewGateway starts a bare gateway (no relays, no setup yet) and waits for
+// both listeners.
+func NewGateway(t testing.TB) *Gateway {
+	return newGateway(t, nil)
 }
 
 // NewGatewayWithEnv is NewGateway with extra bootstrap environment entries
 // (for example "SHUTDOWN_GRACE=1s") appended to the standard set.
-func NewGatewayWithEnv(t testing.TB, cfg GatewayConfig, extraEnv ...string) *Gateway {
-	return newGateway(t, cfg, extraEnv)
+func NewGatewayWithEnv(t testing.TB, extraEnv ...string) *Gateway {
+	return newGateway(t, extraEnv)
 }
 
-func newGateway(t testing.TB, cfg GatewayConfig, extraEnv []string) *Gateway {
+// NewGatewayWithRelays performs the whole first-run flow — setup, then relay
+// creation through the admin API — and waits for the pool to reflect it.
+// Relay order is creation order, which is the pool's round-robin order.
+func NewGatewayWithRelays(t testing.TB, seeds ...RelaySeed) *Gateway {
+	return newGatewayWith(t, nil, nil, seeds)
+}
+
+// NewGatewayWithProviders is NewGatewayWithRelays with provider rows (name ->
+// max body bytes) written first, so relay generation resolves their limits.
+func NewGatewayWithProviders(t testing.TB, providers map[string]int64, seeds ...RelaySeed) *Gateway {
+	return newGatewayWith(t, providers, nil, seeds)
+}
+
+func newGatewayWith(t testing.TB, providers map[string]int64, extraEnv []string, seeds []RelaySeed) *Gateway {
+	t.Helper()
+	g := newGateway(t, extraEnv)
+	g.Setup(t, adminPassword)
+	if len(providers) > 0 {
+		g.PutProviders(t, providers)
+	}
+	names := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		g.CreateRelay(t, seed)
+		names = append(names, seed.Name)
+	}
+	if len(names) > 0 {
+		g.WaitForRelays(names, applySettle)
+	}
+	return g
+}
+
+func newGateway(t testing.TB, extraEnv []string) *Gateway {
 	t.Helper()
 	if testBinaryPath == "" {
 		t.Skip("e2e binary not built (short mode?)")
 	}
 	dir := t.TempDir()
-	g := &Gateway{
-		t:          t,
-		dir:        dir,
-		configPath: filepath.Join(dir, "config.yaml"),
-		dataFile:   filepath.Join(dir, "gateway.db"),
-		output:     &lockedBuffer{},
-		Addr:       freeAddr(t),
+	adminAddr := freeAddr(t)
+	admin, err := newAdminClient(adminAddr)
+	if err != nil {
+		t.Fatal(err)
 	}
-	g.writeConfig(cfg)
+	g := &Gateway{
+		t:         t,
+		dir:       dir,
+		dataFile:  "gateway.db",
+		output:    &lockedBuffer{},
+		Addr:      freeAddr(t),
+		AdminAddr: adminAddr,
+		admin:     admin,
+		adminPass: adminPassword,
+	}
 	g.start(extraEnv)
 	t.Cleanup(g.stop)
 	g.waitHealthy(10 * time.Second)
+	g.waitAdminReady(10 * time.Second)
 	return g
 }
 
-// start launches the gateway subprocess with this instance's paths and port.
+// start launches the gateway subprocess with this instance's paths and ports.
 func (g *Gateway) start(extraEnv []string) {
 	g.t.Helper()
 	cmd := exec.Command(testBinaryPath)
 	cmd.Dir = g.dir
 	cmd.Env = append([]string{
-		"CONFIG_FILE=" + g.configPath,
 		"LISTEN_ADDR=" + g.Addr,
+		"ADMIN_ADDR=" + g.AdminAddr,
 		"DATA_FILE=" + g.dataFile,
 		"PATH=" + os.Getenv("PATH"),
 	}, extraEnv...)
@@ -252,46 +236,14 @@ func (g *Gateway) start(extraEnv []string) {
 	g.cmd = cmd
 }
 
-// Restart stops the process and starts a fresh one with the same config
-// file, data file and port — the harness stand-in for a container restart.
+// Restart stops the process and starts a fresh one with the same data file
+// and ports — the harness stand-in for a container restart.
 func (g *Gateway) Restart() {
 	g.t.Helper()
 	g.stop()
 	g.start(nil)
 	g.waitHealthy(10 * time.Second)
-}
-
-// RemoveConfig deletes the config file, leaving the database as the only
-// source of relay state for a subsequent Restart.
-func (g *Gateway) RemoveConfig() {
-	g.t.Helper()
-	if err := os.Remove(g.configPath); err != nil {
-		g.t.Fatalf("remove config: %v", err)
-	}
-}
-
-// writeConfig atomically replaces the config file (temp + rename) so the
-// gateway's poller never reads a partial write.
-func (g *Gateway) writeConfig(cfg GatewayConfig) {
-	g.t.Helper()
-	install(g.t, g.dir, g.configPath, renderConfig(cfg))
-}
-
-// WriteRaw replaces the config with literal content for invalid-config tests.
-func (g *Gateway) WriteRaw(content string) {
-	g.t.Helper()
-	install(g.t, g.dir, g.configPath, content)
-}
-
-func install(t testing.TB, dir, configPath, content string) {
-	t.Helper()
-	tmp := filepath.Join(dir, "config.yaml.tmp")
-	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	if err := os.Rename(tmp, configPath); err != nil {
-		t.Fatalf("install config: %v", err)
-	}
+	g.waitAdminReady(10 * time.Second)
 }
 
 func (g *Gateway) waitHealthy(timeout time.Duration) {
@@ -314,26 +266,25 @@ func (g *Gateway) waitHealthy(timeout time.Duration) {
 	g.t.Fatalf("gateway never became healthy; output:\n%s", g.output.String())
 }
 
-// reloadSettle bounds one poll cycle: the gateway's 1s content-hash poll
-// interval plus reload work, with comfortable headroom for slow machines.
-const reloadSettle = 6 * time.Second
-
-// ReloadConfig rewrites the config file (atomic tmp+rename, modeling an editor
-// or bind-mount update) and relies on the gateway's content-hash config poller
-// to apply it. It fails when /stats does not report exactly wantRelays within
-// one poll cycle.
-func (g *Gateway) ReloadConfig(cfg GatewayConfig, wantRelays []string) {
+// waitAdminReady polls the admin plane until it answers — the data listener
+// binds first, so health alone does not prove the admin API is up.
+func (g *Gateway) waitAdminReady(timeout time.Duration) {
 	g.t.Helper()
-	g.writeConfig(cfg)
-	g.WaitForRelays(wantRelays, reloadSettle)
-}
-
-// ReloadRaw installs literal content and returns without waiting: callers
-// assert either that the pool stays unchanged (invalid input) or that a warn
-// line appeared in the logs.
-func (g *Gateway) ReloadRaw(content string) {
-	g.t.Helper()
-	g.WriteRaw(content)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited() {
+			g.t.Fatalf("gateway exited during startup; output:\n%s", g.output.String())
+		}
+		resp, err := http.Get("http://" + g.AdminAddr + "/api/v1/ping")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	g.t.Fatalf("admin plane never became ready; output:\n%s", g.output.String())
 }
 
 // WaitForRelays polls /stats until the relay list reports exactly want in order.
@@ -362,14 +313,22 @@ func (g *Gateway) WaitForCondition(timeout time.Duration, what string, cond func
 
 func waitForLog(t testing.TB, g *Gateway, substr string, timeout time.Duration) {
 	t.Helper()
+	waitForLogCount(t, g, substr, 1, timeout)
+}
+
+// waitForLogCount waits until substr has appeared at least want times.
+// Substrings that repeat every apply (like "configuration reloaded") need a
+// count, not a membership check, or the wait passes on an older line.
+func waitForLogCount(t testing.TB, g *Gateway, substr string, want int, timeout time.Duration) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if strings.Contains(g.Logs(), substr) {
+		if strings.Count(g.Logs(), substr) >= want {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("logs never contained %q\nlogs:\n%s", substr, g.output.String())
+	t.Fatalf("logs never contained %q %d times\nlogs:\n%s", substr, want, g.output.String())
 }
 
 func equalStrings(a, b []string) bool {
@@ -398,6 +357,18 @@ func (g *Gateway) Stats() (*StatsView, error) {
 	return &st, nil
 }
 
+// RawStats returns the /stats body verbatim, for redaction assertions.
+func (g *Gateway) RawStats(t testing.TB) string {
+	t.Helper()
+	resp, err := http.Get("http://" + g.Addr + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	return string(raw)
+}
+
 // Logs returns captured gateway stdout/stderr.
 func (g *Gateway) Logs() string { return g.output.String() }
 
@@ -414,6 +385,162 @@ func (g *Gateway) stop() {
 		_ = g.cmd.Process.Kill()
 		<-done
 	}
+}
+
+// --- admin API client ---
+
+// adminClient talks to the admin API with a cookie jar, like a browser.
+type adminClient struct {
+	base string
+	http *http.Client
+}
+
+func newAdminClient(base string) (*adminClient, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &adminClient{base: "http://" + base, http: &http.Client{Jar: jar, Timeout: 15 * time.Second}}, nil
+}
+
+// do sends one JSON request and returns status, headers and the raw body.
+func (a *adminClient) do(t testing.TB, method, path string, body any) (int, http.Header, string) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, a.base+path, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := a.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.StatusCode, res.Header, string(raw)
+}
+
+// AdminDo is the escape hatch for tests asserting on raw API behavior.
+func (g *Gateway) AdminDo(t testing.TB, method, path string, body any) (int, http.Header, string) {
+	g.t.Helper()
+	return g.admin.do(t, method, path, body)
+}
+
+// Setup performs first-run setup and fails on any non-200.
+func (g *Gateway) Setup(t testing.TB, password string) {
+	t.Helper()
+	code, _, body := g.admin.do(t, http.MethodPost, "/api/v1/setup", map[string]string{
+		"password": password, "confirm": password,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("setup status = %d: %s\nlogs:\n%s", code, body, g.Logs())
+	}
+}
+
+// Login attempts a login and returns the status code.
+func (g *Gateway) Login(t testing.TB, password string) int {
+	t.Helper()
+	code, _, _ := g.admin.do(t, http.MethodPost, "/api/v1/login", map[string]string{"password": password})
+	return code
+}
+
+// CreateRelay creates one relay through the API and fails on non-201.
+func (g *Gateway) CreateRelay(t testing.TB, seed RelaySeed) int64 {
+	t.Helper()
+	fields := map[string]any{
+		"name": seed.Name, "provider": seed.Provider, "url": seed.URL,
+	}
+	if seed.Active != nil {
+		fields["active"] = *seed.Active
+	}
+	code, _, body := g.admin.do(t, http.MethodPost, "/api/v1/relays", fields)
+	if code != http.StatusCreated {
+		t.Fatalf("create relay %s status = %d: %s\nlogs:\n%s", seed.Name, code, body, g.Logs())
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(body), &created); err != nil {
+		t.Fatalf("decode created relay: %v (%s)", err, body)
+	}
+	return created.ID
+}
+
+// PatchRelay patches one relay and returns status plus the decoded body.
+func (g *Gateway) PatchRelay(t testing.TB, id int64, fields map[string]any) (int, map[string]any) {
+	t.Helper()
+	code, _, raw := g.admin.do(t, http.MethodPatch, "/api/v1/relays/"+strconv.FormatInt(id, 10), fields)
+	var parsed map[string]any
+	_ = json.Unmarshal([]byte(raw), &parsed)
+	return code, parsed
+}
+
+// DeleteRelay deletes one relay and fails on non-200.
+func (g *Gateway) DeleteRelay(t testing.TB, id int64) {
+	t.Helper()
+	code, _, body := g.admin.do(t, http.MethodDelete, "/api/v1/relays/"+strconv.FormatInt(id, 10), nil)
+	if code != http.StatusOK {
+		t.Fatalf("delete relay %d status = %d: %s", id, code, body)
+	}
+}
+
+// PutProviders replaces the provider set (name -> max body bytes).
+func (g *Gateway) PutProviders(t testing.TB, providers map[string]int64) {
+	t.Helper()
+	rows := make([]map[string]any, 0, len(providers))
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	// Sorted for determinism in failures.
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
+	for _, name := range names {
+		rows = append(rows, map[string]any{"name": name, "maxBody": providers[name]})
+	}
+	code, _, body := g.admin.do(t, http.MethodPut, "/api/v1/providers", rows)
+	if code != http.StatusOK {
+		t.Fatalf("put providers status = %d: %s", code, body)
+	}
+}
+
+// PatchSettings patches runtime settings and fails on non-200.
+func (g *Gateway) PatchSettings(t testing.TB, fields map[string]any) {
+	t.Helper()
+	code, _, body := g.admin.do(t, http.MethodPatch, "/api/v1/settings", fields)
+	if code != http.StatusOK {
+		t.Fatalf("patch settings status = %d: %s", code, body)
+	}
+}
+
+// AdminStatus returns setupRequired from the public status endpoint.
+func (g *Gateway) AdminStatus(t testing.TB) bool {
+	t.Helper()
+	code, _, raw := g.admin.do(t, http.MethodGet, "/api/v1/status", nil)
+	if code != http.StatusOK {
+		t.Fatalf("admin status = %d: %s", code, raw)
+	}
+	var parsed struct {
+		SetupRequired bool `json:"setupRequired"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatalf("decode admin status: %v (%s)", err, raw)
+	}
+	return parsed.SetupRequired
 }
 
 // edgeSim is one fake edge relay (the Vercel/Deno/Cloudflare deployment the

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 )
@@ -128,4 +129,80 @@ func setSetting(tx *sql.Tx, key, value string) error {
 		key, value,
 	)
 	return err
+}
+
+// ErrUnknownSetting reports a settings key the management API may not write.
+// Admin credential keys are deliberately absent from the whitelist: they are
+// never readable or writable through the runtime-setting surface.
+var ErrUnknownSetting = errors.New("unknown setting")
+
+// runtimeSettingWriters validates one runtime setting value for the
+// management API. Every key Settings() reads (except the admin credentials)
+// has an entry; anything else is ErrUnknownSetting.
+var runtimeSettingWriters = map[string]func(string) (string, error){
+	keyLogLevel: func(v string) (string, error) {
+		switch v {
+		case "debug", "info", "warn", "error":
+			return v, nil
+		}
+		return "", errors.New(`log_level must be one of debug, info, warn, error`)
+	},
+	keyMaxRetries:               nonNegativeInt,
+	keyFailureThreshold:         positiveInt,
+	keyCooldownMs:               nonNegativeInt,
+	keyStreamThresholdBytes:     nonNegativeInt,
+	keyDialTimeoutMs:            nonNegativeInt,
+	keyResponseHeaderTimeoutMs:  nonNegativeInt,
+	keyReconcileIntervalSeconds: nonNegativeInt,
+}
+
+func nonNegativeInt(v string) (string, error) {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return "", errors.New("must be a non-negative integer")
+	}
+	return v, nil
+}
+
+func positiveInt(v string) (string, error) {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 1 {
+		return "", errors.New("must be a positive integer")
+	}
+	return v, nil
+}
+
+// SetSettings validates and writes runtime settings in one transaction and
+// signals one change. An unknown key or invalid value aborts the whole batch.
+func (s *Store) SetSettings(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	prepared := make([][2]string, 0, len(values))
+	for key, value := range values {
+		write, ok := runtimeSettingWriters[key]
+		if !ok {
+			return fmt.Errorf("%w: %q", ErrUnknownSetting, key)
+		}
+		valid, err := write(value)
+		if err != nil {
+			return fmt.Errorf("setting %s: %w", key, err)
+		}
+		prepared = append(prepared, [2]string{key, valid})
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, kv := range prepared {
+		if err := setSetting(tx, kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.notify()
+	return nil
 }

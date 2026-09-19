@@ -1,6 +1,3 @@
-# The runtime config is bind-mounted at runtime and must not enter builds.
-config.yaml
-
 # Runtime state (SQLite DB, WAL files) must never enter the image.
 data
 

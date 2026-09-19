@@ -37,3 +37,33 @@ func upsertProvider(tx *sql.Tx, row ProviderRow) error {
 	)
 	return err
 }
+
+// ReplaceProviders swaps the whole provider set in one transaction — the
+// PUT semantics of the management surface, which owns both max_body and
+// header_policy. A policy of "" is stored as NULL (verbatim forwarding).
+// Providers referenced by relays may be removed freely: the pool resolves a
+// missing provider to the default body limit at build time.
+func (s *Store) ReplaceProviders(rows []ProviderRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM providers`); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if _, err := tx.Exec(
+			`INSERT INTO providers (name, max_body, header_policy, updated_at)
+			 VALUES (?, ?, NULLIF(?, ''), strftime('%s', 'now'))`,
+			row.Name, row.MaxBody, row.HeaderPolicy,
+		); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.notify()
+	return nil
+}

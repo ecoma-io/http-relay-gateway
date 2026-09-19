@@ -12,6 +12,14 @@ import (
 // KeyAll is the selector key for "every provider" (round-robin across all).
 const KeyAll = "all"
 
+// ReservedProviders cannot name a relay's provider: the first four collide
+// with selector keywords (X-Relay-Provider header / path prefix), the rest
+// with the gateway's own endpoints.
+var ReservedProviders = map[string]bool{
+	"": true, "all": true, "none": true, "auto": true,
+	"healthz": true, "stats": true,
+}
+
 // Origin classifies where a relay came from: the legacy YAML bridge or the
 // management plane.
 type Origin string
