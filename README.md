@@ -117,6 +117,18 @@ Bind `ADMIN_ADDR` to loopback (the default `127.0.0.1:20131`) and front it
 with an authenticating proxy if it must be reachable remotely. Never expose
 the admin plane bare.
 
+### Bringing an existing relay list
+
+`POST /api/v1/relays/import` takes `{items: [{name, provider, url, active?}]}`
+(500 per batch) and lands what it can: each row is validated and inserted on
+its own, and the reply reports `{imported, rejected}` so a typo never fails a
+whole migration. Imported relays serve their own URLs immediately and are
+**unmanaged** — no worker, no token, no probing. To move one behind a deployed
+worker, create a platform account and `POST /api/v1/relays/{id}/adopt` with
+the `accountId`: the embedded worker deploys, the URL is verified, and only a
+verified success flips the relay to managed. The UI carries the same flow —
+_Import_ on the Relays page, _Adopt_ on any unmanaged row.
+
 ### Live reconfiguration
 
 Every accepted admin mutation writes to the database, which signals a

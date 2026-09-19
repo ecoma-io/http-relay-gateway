@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
-import { ApiError, api, type Account, type Relay, type RelayInput } from "../api";
+import {
+  ApiError,
+  api,
+  type Account,
+  type ImportItem,
+  type ImportReply,
+  type Relay,
+  type RelayInput,
+} from "../api";
 
 interface RelayForm {
   name: string;
@@ -28,6 +36,11 @@ const adoptError = ref("");
 const deleteTarget = ref<Relay | null>(null);
 const deleteRemote = ref(false);
 const deleteError = ref("");
+
+const importOpen = ref(false);
+const importText = ref("");
+const importError = ref("");
+const importResult = ref<ImportReply | null>(null);
 
 const form = reactive<RelayForm>({
   name: "",
@@ -213,6 +226,53 @@ async function confirmDelete(): Promise<void> {
   }
 }
 
+function openImport(): void {
+  importText.value = "";
+  importError.value = "";
+  importResult.value = null;
+  importOpen.value = true;
+}
+
+// One relay per line: `name | provider | url` with an optional trailing
+// `active`. Per-row validation happens server-side — bad rows are reported
+// individually instead of failing the batch.
+function parseImportLines(raw: string): ImportItem[] {
+  const items: ImportItem[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) {
+      continue;
+    }
+    const parts = trimmed.split("|").map((part) => part.trim());
+    const flag = (parts[3] ?? "").toLowerCase();
+    items.push({
+      name: parts[0] ?? "",
+      provider: parts[1] ?? "",
+      url: parts[2] ?? "",
+      active: flag === "" ? undefined : flag === "true" || flag === "active",
+    });
+  }
+  return items;
+}
+
+async function submitImport(): Promise<void> {
+  importError.value = "";
+  const items = parseImportLines(importText.value);
+  if (items.length === 0) {
+    importError.value = "Nothing to import — put one relay per line.";
+    return;
+  }
+  busy.value = true;
+  try {
+    importResult.value = await api.importRelays(items);
+    await load();
+  } catch (err) {
+    importError.value = err instanceof ApiError ? err.message : "The request failed.";
+  } finally {
+    busy.value = false;
+  }
+}
+
 let pollTimer: number | undefined;
 
 onMounted(() => {
@@ -221,7 +281,13 @@ onMounted(() => {
   // table polls like the dashboard; paused while a modal is open so a form
   // is never re-rendered under the user.
   pollTimer = window.setInterval(() => {
-    if (!busy.value && !modalOpen.value && !deleteTarget.value && !adoptTarget.value) {
+    if (
+      !busy.value &&
+      !modalOpen.value &&
+      !deleteTarget.value &&
+      !adoptTarget.value &&
+      !importOpen.value
+    ) {
       void load();
     }
   }, 5000);
@@ -233,7 +299,10 @@ onUnmounted(() => window.clearInterval(pollTimer));
 <template>
   <div class="page-head">
     <h1>Relays</h1>
-    <button type="button" class="btn primary" @click="openCreate">New relay</button>
+    <div>
+      <button type="button" class="btn" @click="openImport">Import</button>
+      <button type="button" class="btn primary" @click="openCreate">New relay</button>
+    </div>
   </div>
   <p v-if="error" class="error">{{ error }}</p>
   <p v-if="notice" class="muted">{{ notice }}</p>
@@ -430,6 +499,47 @@ onUnmounted(() => window.clearInterval(pollTimer));
         <button type="button" class="btn" @click="deleteTarget = null">Cancel</button>
         <button type="button" class="btn danger" :disabled="busy" @click="confirmDelete">
           Delete
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="importOpen" class="modal-backdrop" @click.self="importOpen = false">
+    <div class="modal">
+      <h2>Import relays</h2>
+      <p class="muted">
+        One relay per line: <code>name | provider | url</code>, optionally followed by
+        <code>| true</code> or <code>| false</code> (default active). Blank lines and
+        <code>#</code> comments are skipped. A row that fails validation is reported and skipped,
+        never fatal to the batch. Imported relays stay unmanaged — adopt them to move a URL behind a
+        deployed worker.
+      </p>
+      <p v-if="importError" class="error">{{ importError }}</p>
+      <label class="field">
+        <span>Relay list</span>
+        <textarea
+          v-model="importText"
+          rows="8"
+          spellcheck="false"
+          class="mono"
+          placeholder="edge-1 | vercel | https://edge-1.vercel.app"
+        ></textarea>
+      </label>
+      <p v-if="importResult !== null" class="muted">
+        Imported {{ importResult.imported }}.
+        <template v-if="importResult.rejected.length > 0">
+          Rejected {{ importResult.rejected.length }}:
+          {{
+            importResult.rejected
+              .map((row) => `${row.name === "" ? "(unnamed)" : row.name} — ${row.error}`)
+              .join("; ")
+          }}
+        </template>
+      </p>
+      <div class="modal-actions">
+        <button type="button" class="btn" @click="importOpen = false">Close</button>
+        <button type="button" class="btn primary" :disabled="busy" @click="submitImport">
+          Import
         </button>
       </div>
     </div>

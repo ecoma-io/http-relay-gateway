@@ -93,6 +93,7 @@ func New(db *store.Store, version string, log zerolog.Logger, spa http.Handler, 
 
 	only("GET /api/v1/relays", s.handleListRelays)
 	only("POST /api/v1/relays", s.handleCreateRelay)
+	only("POST /api/v1/relays/import", s.handleImportRelays)
 	only("GET /api/v1/relays/{id}", s.handleGetRelay)
 	only("PATCH /api/v1/relays/{id}", s.handlePatchRelay)
 	only("DELETE /api/v1/relays/{id}", s.handleDeleteRelay)

@@ -106,7 +106,8 @@ The admin plane (`internal/admin`) is authenticated after a one-time setup:
 `POST /api/v1/setup` (once, then `409`), `POST /api/v1/login` (bcrypt,
 HS256 `HttpOnly` cookie, 12h), `POST /api/v1/logout`. Login failures are
 rate-limited 5 per 15 minutes per source address plus a global cap
-(`429` + `Retry-After`). Management resources: `relays`, `accounts`
+(`429` + `Retry-After`). Management resources: `relays` (plus `relays/import` for bulk
+migration), `accounts`
 (platform credentials, verify-before-insert), `providers`, `settings`,
 plus the fleet surface (`fleet/version`, `fleet/check`, `fleet/reconcile`)
 and per-relay actions (`redeploy`, `adopt`, `DELETE ?deleteRemote=true`)

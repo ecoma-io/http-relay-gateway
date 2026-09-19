@@ -31,10 +31,17 @@ func (s *Store) CreateRelay(name, provider, url string, active bool, accountID *
 	if active {
 		flags = 1
 	}
+	// The origin encodes who owns the lifecycle: with an account the relay
+	// is born managed (the reconciler deploys its worker); without one it is
+	// an external URL — adoptable, never probed, never redeployed.
+	origin := OriginLegacy
+	if accountID != nil {
+		origin = OriginManaged
+	}
 	res, err := tx.Exec(
 		`INSERT INTO relays (name, provider, url, active, origin, account_id, header_policy, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, 'managed', ?, NULLIF(?, ''), strftime('%s', 'now'), strftime('%s', 'now'))`,
-		name, provider, url, flags, accountID, headerPolicy,
+		 VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), strftime('%s', 'now'), strftime('%s', 'now'))`,
+		name, provider, url, flags, origin, accountID, headerPolicy,
 	)
 	if err != nil {
 		return 0, err

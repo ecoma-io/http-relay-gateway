@@ -102,6 +102,18 @@ export interface FleetVersion {
   deployments: Record<string, number>;
 }
 
+export interface ImportItem {
+  name: string;
+  provider: string;
+  url: string;
+  active?: boolean;
+}
+
+export interface ImportReply {
+  imported: number;
+  rejected: { name: string; error: string }[];
+}
+
 export interface Provider {
   name: string;
   maxBody: number;
@@ -134,6 +146,8 @@ export const api = {
   listRelays: () => request<Relay[]>("GET", "/relays"),
 
   createRelay: (input: RelayInput) => request<Relay>("POST", "/relays", input),
+
+  importRelays: (items: ImportItem[]) => request<ImportReply>("POST", "/relays/import", { items }),
 
   patchRelay: (id: number, patch: Partial<RelayInput>) =>
     request<Relay>("PATCH", `/relays/${id}`, patch),

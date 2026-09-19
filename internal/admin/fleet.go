@@ -319,7 +319,9 @@ func (s *Server) handleAdoptRelay(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, err, "read relay")
 		return
 	}
-	if relay.Origin != store.OriginLegacy {
+	// Managed with an account is already managed; a managed row whose
+	// account was force-deleted is adoptable again — that is its recovery.
+	if relay.Origin == store.OriginManaged && relay.AccountID != nil {
 		writeError(w, http.StatusConflict, "relay is already managed")
 		return
 	}

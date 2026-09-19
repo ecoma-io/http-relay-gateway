@@ -194,15 +194,16 @@ func TestRelayCRUD(t *testing.T) {
 		t.Fatalf("create status = %d: %v", code, created)
 	}
 	id := int64(created["id"].(float64))
-	if created["origin"] != "managed" {
-		t.Fatalf("origin = %v, want managed", created["origin"])
+	// No account: an external URL, born legacy (adoptable, never probed).
+	if created["origin"] != "legacy" {
+		t.Fatalf("origin = %v, want legacy", created["origin"])
 	}
 	if created["provider"] != "vercel" {
 		t.Fatalf("provider not normalized: %v", created["provider"])
 	}
 
 	raw := c.getRaw(t, "/api/v1/relays")
-	if !strings.Contains(raw, `"name":"edge-1"`) || !strings.Contains(raw, `"origin":"managed"`) {
+	if !strings.Contains(raw, `"name":"edge-1"`) || !strings.Contains(raw, `"origin":"legacy"`) {
 		t.Fatalf("relay list wrong: %s", raw)
 	}
 

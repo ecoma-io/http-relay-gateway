@@ -124,7 +124,7 @@ func accountPath(id int64) string {
 }
 
 func TestAccountLifecycle(t *testing.T) {
-	_, deployer, _, c := newFleetTestServer(t)
+	fleet, deployer, _, c := newFleetTestServer(t)
 
 	code, _, body := c.do(t, http.MethodPost, "/api/v1/accounts", map[string]string{
 		"name": "main", "platform": "vercel", "token": "vercel-platform-token-abcdef",
@@ -186,6 +186,26 @@ func TestAccountLifecycle(t *testing.T) {
 	code, _, body = c.do(t, http.MethodGet, relayPath(relayID), nil)
 	if code != http.StatusOK || body["origin"] != "managed" || body["accountId"] != nil {
 		t.Fatalf("detached relay = %d %v", code, body)
+	}
+
+	// A fresh account can re-parent the detached relay: adoption is the
+	// recovery path for a managed row whose account was force-deleted.
+	code, _, body = c.do(t, http.MethodPost, "/api/v1/accounts", map[string]string{
+		"name": "second", "platform": "vercel", "token": "vercel-platform-token-123456",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("second account = %d: %v", code, body)
+	}
+	secondID := int64(body["id"].(float64))
+	code, _, _ = c.do(t, http.MethodPost, relayPath(relayID)+"/adopt", map[string]any{"accountId": secondID})
+	if code != http.StatusAccepted {
+		t.Fatalf("adopt detached relay = %d", code)
+	}
+	if adopts := func() [][2]int64 {
+		_, _, _, a := fleet.counts()
+		return a
+	}(); len(adopts) != 1 || adopts[0] != [2]int64{relayID, secondID} {
+		t.Fatalf("adopts recorded = %v", adopts)
 	}
 
 	if deletions := deployer.deletions(); len(deletions) != 0 {

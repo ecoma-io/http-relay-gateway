@@ -407,7 +407,9 @@ func (w *Worker) adoptRelay(relayID, accountID int64) {
 		w.log.Error().Err(err).Int64("relay", relayID).Msg("adopt: read relay")
 		return
 	}
-	if relay.Origin == store.OriginManaged {
+	// Managed with an account is genuinely managed; managed without one is a
+	// relay whose account was force-deleted — adoption is how it recovers.
+	if relay.Origin == store.OriginManaged && relay.AccountID != nil {
 		w.log.Warn().Int64("relay", relayID).Msg("adopt: relay is already managed")
 		return
 	}
