@@ -1,9 +1,12 @@
 # pnpm 12 places package build-script policy here rather than in package.json.
-# lefthook's postinstall selects its platform binary; allow precisely that
-# package so `pnpm install --frozen-lockfile` works on a clean GitHub runner.
-# No other dependency gets permission to execute an install-time script.
+# An unlisted build script is a hard install error on a clean runner, so every
+# dependency that ships one must be named here. lefthook's postinstall selects
+# its platform binary; esbuild's validates the binary that already arrived as
+# an optionalDependency package (and is skipped outright in Docker via
+# --ignore-scripts). Nothing else gets to execute at install time.
 allowBuilds:
   lefthook: true
+  esbuild: true
 
 # The management SPA lives here; `make web` builds it and syncs the output
 # into internal/web/dist for go:embed.
