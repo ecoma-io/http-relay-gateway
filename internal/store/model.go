@@ -32,6 +32,10 @@ type ProviderRow struct {
 	HeaderPolicy *string
 }
 
+// DefaultProviderMaxBody applies to a relay whose provider has no providers
+// row — the resolution the generation builder performs, not a stored key.
+const DefaultProviderMaxBody = 8 << 20 // 8 MiB
+
 // AccountRow is one platform account (its credential stays readable only
 // through Tokens).
 type AccountRow struct {

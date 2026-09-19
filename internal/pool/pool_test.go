@@ -5,28 +5,28 @@ import (
 	"net/url"
 	"testing"
 	"time"
-
-	"http-relay-gateway/internal/config"
 )
 
-func testPool(t *testing.T, mutate func(*config.RuntimeConfig)) *Pool {
+// defaultMaxBody mirrors the resolved body limit for providers without an
+// explicit entry (config.DefaultMaxBody; kept literal so the pool package
+// stays independent of the config package).
+const defaultMaxBody = 8 << 20
+
+func testPool(t *testing.T, mutate func(*Input)) *Pool {
 	t.Helper()
-	cfg := &config.RuntimeConfig{
+	in := &Input{
 		FailureThreshold: 2,
 		Cooldown:         1 * time.Second,
-		Providers: map[string]config.ProviderSpec{
-			"vercel": {MaxBody: 100},
-		},
-		Relays: []config.RelaySpec{
-			{Name: "v1", Provider: "vercel", URL: mustURL(t, "https://v1.example"), Active: true},
-			{Name: "v2", Provider: "vercel", URL: mustURL(t, "https://v2.example"), Active: true},
-			{Name: "c1", Provider: "cloudflare", URL: mustURL(t, "https://c1.example"), Active: true},
+		Relays: []RelayInput{
+			{ID: 1, Name: "v1", Provider: "vercel", URL: mustURL(t, "https://v1.example"), Active: true, Origin: OriginLegacy, MaxBody: 100},
+			{ID: 2, Name: "v2", Provider: "vercel", URL: mustURL(t, "https://v2.example"), Active: true, Origin: OriginLegacy, MaxBody: 100},
+			{ID: 3, Name: "c1", Provider: "cloudflare", URL: mustURL(t, "https://c1.example"), Active: true, Origin: OriginLegacy, MaxBody: defaultMaxBody},
 		},
 	}
 	if mutate != nil {
-		mutate(cfg)
+		mutate(in)
 	}
-	p, err := New(cfg)
+	p, err := New(*in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func relayByName(t *testing.T, p *Pool, name string) *Relay {
 func TestRoundRobinFairness(t *testing.T) {
 	p := testPool(t, nil)
 	count := map[string]int{}
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		count[p.Pick(KeyAll).Name]++
 	}
 	for name, n := range count {
@@ -70,7 +70,7 @@ func TestRoundRobinFairness(t *testing.T) {
 
 func TestPinProvider(t *testing.T) {
 	p := testPool(t, nil)
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if got := p.Pick("vercel"); got.Provider != "vercel" {
 			t.Fatalf("picked provider %q, want vercel", got.Provider)
 		}
@@ -83,11 +83,11 @@ func TestPinProvider(t *testing.T) {
 func TestCursorsArePerKey(t *testing.T) {
 	p := testPool(t, nil)
 	// Drive the "vercel" cursor hard; the "all" rotation must stay even.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		p.Pick("vercel")
 	}
 	count := map[string]int{}
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		count[p.Pick(KeyAll).Name]++
 	}
 	for name, n := range count {
@@ -97,13 +97,13 @@ func TestCursorsArePerKey(t *testing.T) {
 	}
 }
 
-func TestMaxBodyResolvedFromConfig(t *testing.T) {
+func TestMaxBodyCarriesFromInput(t *testing.T) {
 	p := testPool(t, nil)
 	if got := relayByName(t, p, "v1").MaxBody; got != 100 {
-		t.Fatalf("vercel relay MaxBody = %d, want 100 (providers entry)", got)
+		t.Fatalf("vercel relay MaxBody = %d, want 100 (resolved by the caller)", got)
 	}
-	if got := relayByName(t, p, "c1").MaxBody; got != config.DefaultMaxBody {
-		t.Fatalf("cloudflare relay MaxBody = %d, want default %d", got, config.DefaultMaxBody)
+	if got := relayByName(t, p, "c1").MaxBody; got != defaultMaxBody {
+		t.Fatalf("cloudflare relay MaxBody = %d, want the default %d", got, int64(defaultMaxBody))
 	}
 }
 
@@ -123,7 +123,7 @@ func TestPassiveHealthSkipsAndRecovers(t *testing.T) {
 	if v1.healthy(time.Now()) {
 		t.Fatal("v1 should be on cooldown after 2 consecutive failures")
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if got := p.Pick("vercel"); got.Name == "v1" {
 			t.Fatalf("v1 should be skipped while unhealthy, got it on pick %d", i+1)
 		}
@@ -158,12 +158,35 @@ func TestAllDownIsBestEffort(t *testing.T) {
 }
 
 func TestInactiveRelayNeverPicked(t *testing.T) {
-	p := testPool(t, func(c *config.RuntimeConfig) {
-		c.Relays[0].Active = false
+	p := testPool(t, func(in *Input) {
+		in.Relays[0].Active = false
 	})
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		if got := p.Pick(KeyAll); got.Name == "v1" {
 			t.Fatal("inactive relay was picked")
+		}
+	}
+}
+
+func TestStatsRowsExposeOriginAndManaged(t *testing.T) {
+	p := testPool(t, func(in *Input) {
+		in.Relays[0].Origin = OriginManaged
+		in.Relays[0].Token = "relay-secret"
+	})
+	rows := p.Stats()
+	if rows[0].Origin != "managed" || !rows[0].Managed {
+		t.Fatalf("managed row = %+v, want origin managed", rows[0])
+	}
+	if rows[1].Origin != "legacy" || rows[1].Managed {
+		t.Fatalf("legacy row = %+v, want origin legacy, managed false", rows[1])
+	}
+	// The token must never surface in stats rows.
+	if rows[0].Name != "v1" {
+		t.Fatal("unexpected row order")
+	}
+	for _, row := range rows {
+		if row.LastError == "relay-secret" {
+			t.Fatal("token leaked into stats")
 		}
 	}
 }

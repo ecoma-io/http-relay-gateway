@@ -7,21 +7,53 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"http-relay-gateway/internal/config"
 )
 
 // KeyAll is the selector key for "every provider" (round-robin across all).
 const KeyAll = "all"
 
+// Origin classifies where a relay came from: the legacy YAML bridge or the
+// management plane.
+type Origin string
+
+const (
+	// OriginLegacy marks relays imported from the legacy YAML config; they
+	// carry no auth token and are synced by the config bridge.
+	OriginLegacy Origin = "legacy"
+	// OriginManaged marks relays deployed and owned by the management plane;
+	// the engine authenticates to them with their stored token.
+	OriginManaged Origin = "managed"
+)
+
+// HopByHop headers are connection-scoped and dropped on both legs; header
+// policies may never touch them.
+var HopByHop = map[string]bool{
+	"Connection":          true,
+	"Proxy-Connection":    true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
 // Relay is a runtime relay entry with health state and usage counters.
 type Relay struct {
+	ID       int64
 	Name     string
 	Provider string
 	URL      *url.URL
 	Active   bool
-	// MaxBody is the provider's request-body limit, resolved at pool
-	// construction from the runtime config's providers block.
+	Origin   Origin
+	// Token authenticates the gateway to a managed relay. It is presented on
+	// the relay leg only and must never reach logs or stats.
+	Token string
+	// Policy is the resolved header policy; nil forwards verbatim.
+	Policy *HeaderPolicy
+	// MaxBody is the provider's request-body limit, resolved by the caller
+	// before the pool is built — the hot path never re-derives it.
 	MaxBody int64
 
 	Requests atomic.Int64
@@ -67,6 +99,8 @@ func (r *Relay) RecordFailure(err error, threshold int, cooldown time.Duration) 
 type StatsRow struct {
 	Name      string `json:"name"`
 	Provider  string `json:"provider"`
+	Origin    string `json:"origin"`
+	Managed   bool   `json:"managed"`
 	Active    bool   `json:"active"`
 	Healthy   bool   `json:"healthy"`
 	MaxBody   int64  `json:"maxBody"`
@@ -81,6 +115,8 @@ func (r *Relay) snapshot(now time.Time) StatsRow {
 	return StatsRow{
 		Name:      r.Name,
 		Provider:  r.Provider,
+		Origin:    string(r.Origin),
+		Managed:   r.Origin == OriginManaged,
 		Active:    r.Active,
 		Healthy:   r.Active && (r.downUntil.IsZero() || now.After(r.downUntil)),
 		MaxBody:   r.MaxBody,
@@ -88,6 +124,28 @@ func (r *Relay) snapshot(now time.Time) StatsRow {
 		Failures:  r.Failures.Load(),
 		LastError: r.lastErr,
 	}
+}
+
+// RelayInput is one fully resolved relay handed to New: URL parsed, body
+// limit and header policy already resolved — the hot path never re-derives
+// them.
+type RelayInput struct {
+	ID       int64
+	Name     string
+	Provider string
+	URL      *url.URL
+	Active   bool
+	Origin   Origin
+	Token    string
+	Policy   *HeaderPolicy
+	MaxBody  int64
+}
+
+// Input is everything New needs to build a pool.
+type Input struct {
+	FailureThreshold int
+	Cooldown         time.Duration
+	Relays           []RelayInput
 }
 
 // Pool is the set of relays plus one round-robin cursor per selector key.
@@ -99,22 +157,26 @@ type Pool struct {
 	cooldown  time.Duration
 }
 
-// New builds a Pool from a validated runtime config. URLs are pre-parsed and
-// provider body limits resolved once so the hot path never re-derives them.
-func New(cfg *config.RuntimeConfig) (*Pool, error) {
+// New builds a Pool from resolved relay inputs, preserving input order as
+// the round-robin order.
+func New(in Input) (*Pool, error) {
 	p := &Pool{
 		rr:        map[string]int{},
-		threshold: cfg.FailureThreshold,
-		cooldown:  cfg.Cooldown,
+		threshold: in.FailureThreshold,
+		cooldown:  in.Cooldown,
 	}
-	for i := range cfg.Relays {
-		spec := cfg.Relays[i]
+	for i := range in.Relays {
+		r := in.Relays[i]
 		p.relays = append(p.relays, &Relay{
-			Name:     spec.Name,
-			Provider: spec.Provider,
-			URL:      spec.URL,
-			Active:   spec.Active,
-			MaxBody:  cfg.ProviderMaxBody(spec.Provider),
+			ID:       r.ID,
+			Name:     r.Name,
+			Provider: r.Provider,
+			URL:      r.URL,
+			Active:   r.Active,
+			Origin:   r.Origin,
+			Token:    r.Token,
+			Policy:   r.Policy,
+			MaxBody:  r.MaxBody,
 		})
 	}
 	return p, nil

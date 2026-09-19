@@ -93,10 +93,12 @@ func healthcheckURL(addr string) string {
 }
 
 // generation is one immutable serving snapshot derived from the database:
-// the runtime values the data plane reads plus the pool built from them.
+// the fully resolved gateway state (pool, client, knobs) plus the values the
+// apply loop reads outside the hot path.
 type generation struct {
-	cfg  *config.RuntimeConfig
-	pool *pool.Pool
+	state    *gateway.State
+	logLevel string
+	relays   int
 }
 
 func run() error {
@@ -146,10 +148,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if len(gen.cfg.Relays) == 0 {
+	if gen.relays == 0 {
 		return errors.New("no serving relays in the database")
 	}
-	g := gateway.New(&gateway.State{Cfg: gen.cfg, Pool: gen.pool}, version, log)
+	g := gateway.New(gen.state, version, log)
 
 	ln, err := net.Listen("tcp", bootstrap.ListenAddr)
 	if err != nil {
@@ -164,7 +166,7 @@ func run() error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info().Str("addr", ln.Addr().String()).Str("version", version).
-			Int("relays", len(gen.cfg.Relays)).Msg("relay-gateway listening")
+			Int("relays", gen.relays).Msg("relay-gateway listening")
 		// Serve returns nil once shutdown closes the listener.
 		if err := srv.Serve(ln); err != nil {
 			errCh <- fmt.Errorf("listener: %w", err)
@@ -190,11 +192,11 @@ func run() error {
 				Msg("generation build failed; keeping previous configuration")
 			return
 		}
-		g.Swap(&gateway.State{Cfg: next.cfg, Pool: next.pool})
+		g.Swap(next.state)
 		// Only this goroutine writes the global level, so the package-global
 		// atomic swap is race-free and every future event picks it up.
-		zerolog.SetGlobalLevel(parseZerologLevel(next.cfg.LogLevel))
-		log.Info().Str("source", source).Int("relays", len(next.cfg.Relays)).Msg("configuration reloaded")
+		zerolog.SetGlobalLevel(parseZerologLevel(next.logLevel))
+		log.Info().Str("source", source).Int("relays", next.relays).Msg("configuration reloaded")
 	}
 
 	// The poller hash-gates on applied content, so one signal means one
@@ -261,7 +263,9 @@ func syncLegacy(path string, db *store.Store) (int, error) {
 }
 
 // buildGeneration reads the database and derives the next immutable serving
-// generation — the single place pool state is ever built from.
+// generation — the single place pool state is ever built from. Everything
+// the hot path would otherwise re-derive is resolved here: body limits,
+// inherited header policies, tokens, transport timeouts.
 func buildGeneration(db *store.Store) (generation, error) {
 	settings, err := db.Settings()
 	if err != nil {
@@ -276,59 +280,97 @@ func buildGeneration(db *store.Store) (generation, error) {
 		return generation{}, fmt.Errorf("read relays: %w", err)
 	}
 
-	cfg := &config.RuntimeConfig{
-		LogLevel:         settings.LogLevel,
-		MaxRetries:       settings.MaxRetries,
+	providerLimits := make(map[string]int64, len(providers))
+	providerPolicies := make(map[string]*pool.HeaderPolicy, len(providers))
+	for _, provider := range providers {
+		providerLimits[provider.Name] = provider.MaxBody
+		policy, err := pool.ParseHeaderPolicy(provider.HeaderPolicy)
+		if err != nil {
+			return generation{}, fmt.Errorf("provider %s: %w", provider.Name, err)
+		}
+		providerPolicies[provider.Name] = policy
+	}
+
+	in := pool.Input{
 		FailureThreshold: settings.FailureThreshold,
 		Cooldown:         time.Duration(settings.CooldownMs) * time.Millisecond,
-		Providers:        make(map[string]config.ProviderSpec, len(providers)),
-		Relays:           make([]config.RelaySpec, 0, len(rows)),
+		Relays:           make([]pool.RelayInput, 0, len(rows)),
 	}
-	for _, provider := range providers {
-		cfg.Providers[provider.Name] = config.ProviderSpec{MaxBody: provider.MaxBody}
-	}
+	maxBuffer := int64(0)
 	for _, row := range rows {
-		if spec, ok := relaySpec(row); ok {
-			cfg.Relays = append(cfg.Relays, spec)
+		relay, ok, err := relayInput(row, providerLimits, providerPolicies)
+		if err != nil {
+			return generation{}, err
 		}
+		if !ok {
+			continue
+		}
+		if relay.MaxBody > maxBuffer {
+			maxBuffer = relay.MaxBody
+		}
+		in.Relays = append(in.Relays, relay)
 	}
-	p, err := pool.New(cfg)
+	p, err := pool.New(in)
 	if err != nil {
 		return generation{}, err
 	}
-	return generation{cfg: cfg, pool: p}, nil
+	state := &gateway.State{
+		Pool: p,
+		Client: gateway.NewClient(gateway.NewTransport(
+			time.Duration(settings.DialTimeoutMs)*time.Millisecond,
+			time.Duration(settings.ResponseHeaderTimeoutMs)*time.Millisecond)),
+		MaxRetries:           settings.MaxRetries,
+		MaxBufferBytes:       maxBuffer,
+		StreamThresholdBytes: settings.StreamThresholdBytes,
+	}
+	return generation{state: state, logLevel: settings.LogLevel, relays: len(in.Relays)}, nil
 }
 
-// relaySpec maps a database relay row into the pool's relay spec. Legacy
+// relayInput maps a database relay row into a resolved pool input. Legacy
 // relays always appear (an inactive one shows in /stats as inactive); a
 // managed relay joins only through its verified active deployment, whose URL
-// is the stable platform domain rather than the placeholder relay row.
-func relaySpec(row store.RelayRow) (config.RelaySpec, bool) {
+// is the stable platform domain and whose stored token authenticates the
+// relay leg. The bool is false when the row contributes no pool entry.
+func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPolicies map[string]*pool.HeaderPolicy) (pool.RelayInput, bool, error) {
 	switch row.Origin {
 	case store.OriginLegacy:
 		// active flag passes through verbatim.
 	case store.OriginManaged:
-		// Until Phase 5 wires auth tokens into the engine, managed relays
-		// stay out of the pool entirely: there is no admin plane to create
-		// them yet, so this branch exists to keep the mapping honest.
 		if row.Deployment == nil {
-			return config.RelaySpec{}, false
+			return pool.RelayInput{}, false, nil
 		}
 		row.URL = row.Deployment.URL
 		row.Active = true
 	default:
-		return config.RelaySpec{}, false
+		return pool.RelayInput{}, false, nil
 	}
 	u, err := url.Parse(row.URL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return config.RelaySpec{}, false
+		return pool.RelayInput{}, false, nil
 	}
-	return config.RelaySpec{
+	relayPolicy, err := pool.ParseHeaderPolicy(row.HeaderPolicy)
+	if err != nil {
+		return pool.RelayInput{}, false, fmt.Errorf("relay %s: %w", row.Name, err)
+	}
+	token := ""
+	if row.Deployment != nil {
+		token = row.Deployment.AuthToken
+	}
+	maxBody, ok := providerLimits[row.Provider]
+	if !ok {
+		maxBody = store.DefaultProviderMaxBody
+	}
+	return pool.RelayInput{
+		ID:       row.ID,
 		Name:     row.Name,
 		Provider: row.Provider,
 		URL:      u,
 		Active:   row.Active,
-	}, true
+		Origin:   pool.Origin(row.Origin),
+		Token:    token,
+		Policy:   pool.InheritHeaderPolicy(relayPolicy, providerPolicies[row.Provider]),
+		MaxBody:  maxBody,
+	}, true, nil
 }
 
 // initialLogLevel reads just the log level so startup messages before the
