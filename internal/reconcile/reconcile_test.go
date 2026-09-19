@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/logging"
@@ -124,7 +125,40 @@ func seedManaged(t *testing.T, db *store.Store, oldVersion string) (int64, int64
 	return relayID, accountID, old
 }
 
-func newTestWorker(t *testing.T, client deploy.Client) *Worker {
+// newIdleWorker builds a worker without launching the background loop: the
+// tests drive passes and redeploys synchronously, so no startup batch can
+// interleave with their assertions (a racing loop turned
+// TestStartupRedeploysDrift into a two-deploy flake in CI). The loop
+// mechanics themselves — wake, drain, orderly stop — are covered in
+// TestLoopRunsQueuedJobs and by the e2e fleet endpoints.
+func newIdleWorker(t *testing.T, client deploy.Client) *Worker {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return &Worker{
+		db:        db,
+		factory:   fakeFactory{client: client},
+		probeHTTP: &http.Client{Timeout: 10 * time.Second},
+		log:       logging.Nop(),
+		queue:     newQueue(),
+		interval:  func() int64 { return 0 },
+		platformLocks: map[string]*sync.Mutex{
+			deploy.PlatformVercel:     {},
+			deploy.PlatformCloudflare: {},
+			deploy.PlatformDeno:       {},
+		},
+		ctx:    context.Background(),
+		cancel: func() {},
+		done:   make(chan struct{}),
+	}
+}
+
+// newLoopWorker is a Start-launched worker — a live loop, stopped on
+// cleanup. Only the loop-behavior tests use it.
+func newLoopWorker(t *testing.T, client deploy.Client) *Worker {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -140,7 +174,7 @@ func TestStartupRedeploysDrift(t *testing.T) {
 	live := newVersionServer(deploy.RelayVersion)
 	t.Cleanup(live.srv.Close)
 	client := &fakeClient{platform: "vercel", url: live.srv.URL}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	relayID, accountID, old := seedManaged(t, w.db, "0")
 	old.set("0")
 
@@ -185,7 +219,7 @@ func TestStartupRedeploysDrift(t *testing.T) {
 
 func TestStartupNeverRedeploysUnreachable(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	relayID, _, old := seedManaged(t, w.db, deploy.RelayVersion)
 	old.srv.Close() // the relay stopped answering
 
@@ -204,7 +238,7 @@ func TestStartupNeverRedeploysUnreachable(t *testing.T) {
 
 func TestCheckIsPassive(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	relayID, _, _ := seedManaged(t, w.db, "0")
 
 	stale := w.probeFleet(false)
@@ -222,7 +256,7 @@ func TestCheckIsPassive(t *testing.T) {
 
 func TestRedeployFailureKeepsActiveServing(t *testing.T) {
 	client := &fakeClient{platform: "vercel", failDeploy: errors.New("platform exploded")}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	relayID, _, _ := seedManaged(t, w.db, deploy.RelayVersion)
 
 	w.redeployRelay(relayID)
@@ -245,7 +279,7 @@ func TestRedeployFailureKeepsActiveServing(t *testing.T) {
 
 func TestFirstDeployFailureRecordsError(t *testing.T) {
 	client := &fakeClient{platform: "vercel", failDeploy: errors.New("quota exhausted")}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	accountID, err := w.db.CreateAccount("main", "vercel", "platform-token", "acc-ref", 1)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
@@ -271,7 +305,7 @@ func TestAdoptHappyAndMismatch(t *testing.T) {
 	live := newVersionServer(deploy.RelayVersion)
 	t.Cleanup(live.srv.Close)
 	client := &fakeClient{platform: "vercel", url: live.srv.URL}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	if _, err := w.db.SyncLegacy(
 		store.RuntimeValues{LogLevel: "info", MaxRetries: 2, FailureThreshold: 3, CooldownMs: 30000},
 		nil,
@@ -327,7 +361,7 @@ func TestAdoptFailureLeavesRelayAdoptable(t *testing.T) {
 	live := newVersionServer(deploy.RelayVersion)
 	t.Cleanup(live.srv.Close)
 	client := &fakeClient{platform: "vercel", url: live.srv.URL, failDeploy: errors.New("quota exhausted")}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	if _, err := w.db.SyncLegacy(
 		store.RuntimeValues{LogLevel: "info", MaxRetries: 2, FailureThreshold: 3, CooldownMs: 30000},
 		nil,
@@ -372,7 +406,7 @@ func TestAdoptFailureLeavesRelayAdoptable(t *testing.T) {
 // deployments with accounts get probed.
 func TestProbeNeverTouchesLegacyRelays(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	quiet := newVersionServer(deploy.RelayVersion)
 	t.Cleanup(quiet.srv.Close)
 	if _, err := w.db.SyncLegacy(
@@ -404,7 +438,7 @@ func TestProbeNeverTouchesLegacyRelays(t *testing.T) {
 // that gets an answer returns the deployment to active with a clean error.
 func TestUnreachableRecoversOnNextProbe(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
-	w := newTestWorker(t, client)
+	w := newIdleWorker(t, client)
 	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
 
 	live.setDown(true)
@@ -421,6 +455,38 @@ func TestUnreachableRecoversOnNextProbe(t *testing.T) {
 	dep, err = w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployActive || dep.LastError != "" {
 		t.Fatalf("recovered probe = %+v, %v; want active with the error cleared", dep, err)
+	}
+}
+
+// TestLoopRunsQueuedJobs covers the background loop the direct-driving
+// tests deliberately avoid: an enqueued redeploy must be executed by the
+// loop, land active on the current version and rotate the token. The
+// seeded deployment is current, so the startup pass finds no drift and
+// the explicit redeploy is the loop's only deploy source — the count is
+// exact.
+func TestLoopRunsQueuedJobs(t *testing.T) {
+	live := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(live.srv.Close)
+	client := &fakeClient{platform: "vercel", url: live.srv.URL}
+	w := newLoopWorker(t, client)
+	relayID, _, _ := seedManaged(t, w.db, deploy.RelayVersion)
+
+	w.Redeploy(relayID)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		dep, err := w.db.Deployment(relayID)
+		if err != nil {
+			t.Fatalf("Deployment: %v", err)
+		}
+		if dep.Status == store.DeployActive && dep.Version == deploy.RelayVersion &&
+			client.deployCount() == 1 && dep.AuthToken != "old-relay-token" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("loop never completed the redeploy: %+v deploys=%d", dep, client.deployCount())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
