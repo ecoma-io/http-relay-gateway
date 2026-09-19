@@ -360,6 +360,27 @@ func TestE2E_ManagedLifecycle(t *testing.T) {
 			tokens[0][:6], last.AuthToken[:6], len(tokens))
 	}
 
+	// A restart rebuilds the serving pool from the database alone — and the
+	// deployment join must survive it: the relay serves again through the
+	// same deployment with the rotated token, no redeploy needed.
+	g.Restart()
+	g.WaitForCondition(applySettle, "managed relay active after restart", func(st *StatsView) bool {
+		row, ok := st.relay("managed-one")
+		return ok && row.Active && row.Healthy && row.Origin == "managed"
+	})
+	code, _, respBody = relayDo(t, g.Addr, "/", "{}", map[string]string{
+		"X-Relay-Target": sim.srv.URL, "X-Relay-Path": "/after-restart",
+	})
+	if code != http.StatusOK || !strings.Contains(respBody, `"served":true`) {
+		t.Fatalf("post-restart relay = %d %q", code, respBody)
+	}
+	last, _ = sim.lastRequest()
+	tokens = platform.deployedTokens()
+	if last.AuthToken != tokens[1] {
+		t.Fatalf("post-restart auth %q…, want the persisted rotated token %q…",
+			last.AuthToken[:6], tokens[1][:6])
+	}
+
 	// Remote delete removes the platform project and the relay row.
 	code, _, body = g.AdminDo(t, http.MethodDelete, relayPath(relay.ID)+"?deleteRemote=true", nil)
 	if code != http.StatusOK {

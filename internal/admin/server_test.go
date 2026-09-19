@@ -272,6 +272,57 @@ func relayPath(id int64) string {
 	return "/api/v1/relays/" + strconv.FormatInt(id, 10)
 }
 
+// TestImportBatchGuards pins the bulk-import abuse guards: an empty batch
+// and an over-cap batch are whole-batch 422s that store nothing — the cap is
+// 500 (maxImportItems) plus the one item that proves the boundary.
+func TestImportBatchGuards(t *testing.T) {
+	_, c := newTestServer(t)
+	c.setup(t, testPassword)
+
+	code, _, body := c.do(t, http.MethodPost, "/api/v1/relays/import", map[string]any{
+		"items": []map[string]any{},
+	})
+	if code != http.StatusUnprocessableEntity || body["field"] != "items" {
+		t.Fatalf("empty batch = %d %v, want 422 field items", code, body)
+	}
+
+	items := make([]map[string]any, 0, 501)
+	for i := range 501 {
+		items = append(items, map[string]any{
+			"name": fmt.Sprintf("edge-%d", i), "provider": "vercel", "url": "https://edge.example.com",
+		})
+	}
+	code, _, body = c.do(t, http.MethodPost, "/api/v1/relays/import", map[string]any{"items": items})
+	if code != http.StatusUnprocessableEntity || body["field"] != "items" {
+		t.Fatalf("over-cap batch = %d %v, want 422 field items", code, body)
+	}
+	// A refused batch must not have landed even its first row.
+	if raw := strings.TrimSpace(c.getRaw(t, "/api/v1/relays")); raw != "[]" && raw != "null" {
+		t.Fatalf("rejected batch stored relays: %s", raw)
+	}
+}
+
+// TestMissingRelayIs404 pins the store-error mapping on every relay
+// mutation: an unknown id is a 404, never a validation error or a 500.
+func TestMissingRelayIs404(t *testing.T) {
+	_, c := newTestServer(t)
+	c.setup(t, testPassword)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, relayPath(999)},
+		{http.MethodPatch, relayPath(999)},
+		{http.MethodDelete, relayPath(999)},
+	} {
+		code, _, _ := c.do(t, tc.method, tc.path, map[string]any{"active": false})
+		if code != http.StatusNotFound {
+			t.Fatalf("%s %s = %d, want 404", tc.method, tc.path, code)
+		}
+	}
+}
+
 func TestProvidersPutGet(t *testing.T) {
 	_, c := newTestServer(t)
 	c.setup(t, testPassword)

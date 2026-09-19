@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -223,6 +224,59 @@ func TestRelaysJoinsOnlyActiveDeployment(t *testing.T) {
 	}
 	if relays[1].Name != "pending" || relays[1].Deployment != nil {
 		t.Fatalf("non-active relay must have no deployment: %+v", relays[1])
+	}
+}
+
+// TestRelayOriginAndNameConflicts pins the lifecycle encoding at the store
+// seam: the origin derives from the account at create time (no account =
+// legacy, adoptable; with one = managed, reconciler-owned), and duplicate
+// names are refused on create and on rename alike.
+func TestRelayOriginAndNameConflicts(t *testing.T) {
+	s := openTestStore(t)
+
+	legacyID, err := s.CreateRelay("edge", "vercel", "https://edge.example", true, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateRelay legacy: %v", err)
+	}
+	row, err := s.Relay(legacyID)
+	if err != nil || row.Origin != OriginLegacy || row.AccountID != nil {
+		t.Fatalf("account-less create = %+v, %v; want born legacy", row, err)
+	}
+
+	accountID, err := s.CreateAccount("main", "vercel", "platform-token", "ref", 1)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	managedID, err := s.CreateRelay("managed", "vercel", "https://m.example", true, &accountID, nil)
+	if err != nil {
+		t.Fatalf("CreateRelay managed: %v", err)
+	}
+	row, err = s.Relay(managedID)
+	if err != nil || row.Origin != OriginManaged || row.AccountID == nil || *row.AccountID != accountID {
+		t.Fatalf("managed create = %+v, %v; want born managed on the account", row, err)
+	}
+
+	// Duplicate names conflict on create and on rename onto another row.
+	if _, err := s.CreateRelay("edge", "vercel", "https://x.example", true, nil, nil); !errors.Is(err, ErrDuplicateName) {
+		t.Fatalf("duplicate create = %v, want ErrDuplicateName", err)
+	}
+	taken := "edge"
+	if err := s.UpdateRelay(managedID, RelayPatch{Name: &taken}); !errors.Is(err, ErrDuplicateName) {
+		t.Fatalf("renaming onto a taken name = %v, want ErrDuplicateName", err)
+	}
+	// Renaming a row to its own name is a no-op, not a conflict.
+	same := "managed"
+	if err := s.UpdateRelay(managedID, RelayPatch{Name: &same}); err != nil {
+		t.Fatalf("self rename = %v", err)
+	}
+
+	// Unknown ids are ErrNoRelay on every mutation.
+	url := "https://moved.example"
+	if err := s.UpdateRelay(999, RelayPatch{URL: &url}); !errors.Is(err, ErrNoRelay) {
+		t.Fatalf("update missing relay = %v, want ErrNoRelay", err)
+	}
+	if err := s.DeleteRelay(999); !errors.Is(err, ErrNoRelay) {
+		t.Fatalf("delete missing relay = %v, want ErrNoRelay", err)
 	}
 }
 

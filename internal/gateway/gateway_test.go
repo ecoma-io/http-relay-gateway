@@ -31,6 +31,7 @@ func deadRelayURL(t *testing.T) string {
 // capture records the last request seen by the fake upstream edge relay.
 type capture struct {
 	mu            sync.Mutex
+	method        string
 	headers       http.Header
 	body          []byte
 	contentLength int64
@@ -62,6 +63,7 @@ func newFixture(t *testing.T, mutate func(*pool.Input, *State)) *fixture {
 	saw := &capture{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		saw.mu.Lock()
+		saw.method = r.Method
 		saw.headers = r.Header.Clone()
 		saw.body, _ = io.ReadAll(r.Body)
 		saw.contentLength = r.ContentLength

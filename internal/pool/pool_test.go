@@ -68,6 +68,23 @@ func TestRoundRobinFairness(t *testing.T) {
 	}
 }
 
+// TestPickServesExactConfigOrder pins the README contract verbatim: with all
+// relays healthy the served sequence is exactly the config order —
+// deterministic, so consumers can reason about which relay serves next.
+func TestPickServesExactConfigOrder(t *testing.T) {
+	p := testPool(t, nil)
+	for i, want := range []string{"v1", "v2", "c1", "v1", "v2", "c1"} {
+		if got := p.Pick(KeyAll).Name; got != want {
+			t.Fatalf("all-pick %d = %s, want %s (config order is the served order)", i+1, got, want)
+		}
+	}
+	for i, want := range []string{"v1", "v2", "v1", "v2"} {
+		if got := p.Pick("vercel").Name; got != want {
+			t.Fatalf("vercel-pick %d = %s, want %s", i+1, got, want)
+		}
+	}
+}
+
 func TestPinProvider(t *testing.T) {
 	p := testPool(t, nil)
 	for range 4 {

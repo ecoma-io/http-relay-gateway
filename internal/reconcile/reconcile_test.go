@@ -16,11 +16,14 @@ import (
 )
 
 // versionServer is a stand-in live relay: it answers the version endpoint
-// with whatever the test last set.
+// with whatever the test last set, can be switched off (a transport failure,
+// as far as the prober is concerned), and counts who came asking.
 type versionServer struct {
-	srv *httptest.Server
-	mu  sync.Mutex
-	ver string
+	srv  *httptest.Server
+	mu   sync.Mutex
+	ver  string
+	dn   bool
+	hits int
 }
 
 func newVersionServer(version string) *versionServer {
@@ -28,7 +31,12 @@ func newVersionServer(version string) *versionServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__relay/version", func(w http.ResponseWriter, _ *http.Request) {
 		vs.mu.Lock()
-		defer vs.mu.Unlock()
+		vs.hits++
+		down := vs.dn
+		vs.mu.Unlock()
+		if down {
+			panic(http.ErrAbortHandler) // the connection dies before any byte
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"version":%q}`, vs.ver)
 	})
@@ -40,6 +48,18 @@ func (v *versionServer) set(version string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.ver = version
+}
+
+func (v *versionServer) setDown(down bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.dn = down
+}
+
+func (v *versionServer) hitCount() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.hits
 }
 
 // fakeClient is the deploy.Client the tests hand the worker; it counts
@@ -297,6 +317,110 @@ func TestAdoptHappyAndMismatch(t *testing.T) {
 	}
 	if client.lastSpec.Project != "imported" {
 		t.Fatalf("project = %q", client.lastSpec.Project)
+	}
+}
+
+// TestAdoptFailureLeavesRelayAdoptable pins the adoption failure contract:
+// a failed deploy leaves the relay exactly as it was — legacy, own URL, no
+// deployment — and the same adoption succeeds once the platform recovers.
+func TestAdoptFailureLeavesRelayAdoptable(t *testing.T) {
+	live := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(live.srv.Close)
+	client := &fakeClient{platform: "vercel", url: live.srv.URL, failDeploy: errors.New("quota exhausted")}
+	w := newTestWorker(t, client)
+	if _, err := w.db.SyncLegacy(
+		store.RuntimeValues{LogLevel: "info", MaxRetries: 2, FailureThreshold: 3, CooldownMs: 30000},
+		nil,
+		[]store.LegacyRelay{{Name: "imported", Provider: "vercel", URL: "https://public.example", Active: true}},
+	); err != nil {
+		t.Fatalf("SyncLegacy: %v", err)
+	}
+	rows, err := w.db.Relays()
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Relays = %+v, %v", rows, err)
+	}
+	legacyID := rows[0].ID
+	accountID, err := w.db.CreateAccount("main", "vercel", "platform-token", "acc-ref", 1)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	w.adoptRelay(legacyID, accountID)
+	row, err := w.db.Relay(legacyID)
+	if err != nil {
+		t.Fatalf("Relay: %v", err)
+	}
+	if row.Origin != store.OriginLegacy || row.AccountID != nil || row.Deployment != nil {
+		t.Fatalf("failed adopt disturbed the relay: %+v", row)
+	}
+
+	// The platform recovers; the retry manages the relay.
+	client.failDeploy = nil
+	w.adoptRelay(legacyID, accountID)
+	row, err = w.db.Relay(legacyID)
+	if err != nil {
+		t.Fatalf("Relay after retry: %v", err)
+	}
+	if row.Origin != store.OriginManaged || row.AccountID == nil || row.Deployment == nil ||
+		row.Deployment.URL != live.srv.URL {
+		t.Fatalf("retried adopt left = %+v", row)
+	}
+}
+
+// TestProbeNeverTouchesLegacyRelays pins the probe boundary: legacy relays
+// own their URLs, so no fleet pass may ever contact them — only managed
+// deployments with accounts get probed.
+func TestProbeNeverTouchesLegacyRelays(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newTestWorker(t, client)
+	quiet := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(quiet.srv.Close)
+	if _, err := w.db.SyncLegacy(
+		store.RuntimeValues{LogLevel: "info", MaxRetries: 2, FailureThreshold: 3, CooldownMs: 30000},
+		nil,
+		[]store.LegacyRelay{{Name: "imported", Provider: "vercel", URL: quiet.srv.URL, Active: true}},
+	); err != nil {
+		t.Fatalf("SyncLegacy: %v", err)
+	}
+	managedID, _, managed := seedManaged(t, w.db, deploy.RelayVersion)
+
+	if stale := w.probeFleet(true); len(stale) != 0 {
+		t.Fatalf("healthy fleet queued redeploys: %v", stale)
+	}
+	if got := quiet.hitCount(); got != 0 {
+		t.Fatalf("legacy relay was probed %d times", got)
+	}
+	if got := managed.hitCount(); got != 1 {
+		t.Fatalf("managed relay probed %d times, want exactly once", got)
+	}
+	row, err := w.db.Relay(managedID)
+	if err != nil || row.Deployment == nil || row.Deployment.Status != store.DeployActive {
+		t.Fatalf("managed relay after probe = %+v, %v", row, err)
+	}
+}
+
+// TestUnreachableRecoversOnNextProbe pins the unreachable lifecycle: a probe
+// transport failure marks unreachable (and never redeploys); the next pass
+// that gets an answer returns the deployment to active with a clean error.
+func TestUnreachableRecoversOnNextProbe(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newTestWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	live.setDown(true)
+	if stale := w.probeFleet(false); len(stale) != 0 {
+		t.Fatalf("unreachable relay queued for redeploy: %v", stale)
+	}
+	dep, err := w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployUnreachable || dep.LastError == "" {
+		t.Fatalf("down probe = %+v, %v", dep, err)
+	}
+
+	live.setDown(false)
+	w.probeFleet(false)
+	dep, err = w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployActive || dep.LastError != "" {
+		t.Fatalf("recovered probe = %+v, %v; want active with the error cleared", dep, err)
 	}
 }
 

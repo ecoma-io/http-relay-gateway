@@ -91,6 +91,7 @@ type Gateway struct {
 	output    *lockedBuffer
 	admin     *adminClient
 	adminPass string
+	env       []string
 
 	Addr      string
 	AdminAddr string
@@ -220,6 +221,7 @@ func newGateway(t testing.TB, extraEnv []string) *Gateway {
 // start launches the gateway subprocess with this instance's paths and ports.
 func (g *Gateway) start(extraEnv []string) {
 	g.t.Helper()
+	g.env = extraEnv
 	cmd := exec.Command(testBinaryPath)
 	cmd.Dir = g.dir
 	cmd.Env = append([]string{
@@ -236,12 +238,13 @@ func (g *Gateway) start(extraEnv []string) {
 	g.cmd = cmd
 }
 
-// Restart stops the process and starts a fresh one with the same data file
-// and ports — the harness stand-in for a container restart.
+// Restart stops the process and starts a fresh one with the same data file,
+// ports and bootstrap environment — the harness stand-in for a container
+// restart, which re-reads its env too.
 func (g *Gateway) Restart() {
 	g.t.Helper()
 	g.stop()
-	g.start(nil)
+	g.start(g.env)
 	g.waitHealthy(10 * time.Second)
 	g.waitAdminReady(10 * time.Second)
 }
