@@ -104,11 +104,13 @@ func relayNames(st *StatsView) []string {
 	return out
 }
 
-// Gateway is one real gateway subprocess with its own config file and port.
+// Gateway is one real gateway subprocess with its own config file, data
+// file and port.
 type Gateway struct {
 	t          testing.TB
 	dir        string
 	configPath string
+	dataFile   string
 	cmd        *exec.Cmd
 	output     *lockedBuffer
 
@@ -220,26 +222,52 @@ func newGateway(t testing.TB, cfg GatewayConfig, extraEnv []string) *Gateway {
 		t:          t,
 		dir:        dir,
 		configPath: filepath.Join(dir, "config.yaml"),
+		dataFile:   filepath.Join(dir, "gateway.db"),
 		output:     &lockedBuffer{},
 		Addr:       freeAddr(t),
 	}
 	g.writeConfig(cfg)
+	g.start(extraEnv)
+	t.Cleanup(g.stop)
+	g.waitHealthy(10 * time.Second)
+	return g
+}
+
+// start launches the gateway subprocess with this instance's paths and port.
+func (g *Gateway) start(extraEnv []string) {
+	g.t.Helper()
 	cmd := exec.Command(testBinaryPath)
-	cmd.Dir = dir
+	cmd.Dir = g.dir
 	cmd.Env = append([]string{
 		"CONFIG_FILE=" + g.configPath,
 		"LISTEN_ADDR=" + g.Addr,
+		"DATA_FILE=" + g.dataFile,
 		"PATH=" + os.Getenv("PATH"),
 	}, extraEnv...)
 	cmd.Stdout = g.output
 	cmd.Stderr = g.output
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start gateway: %v", err)
+		g.t.Fatalf("start gateway: %v", err)
 	}
 	g.cmd = cmd
-	t.Cleanup(g.stop)
+}
+
+// Restart stops the process and starts a fresh one with the same config
+// file, data file and port — the harness stand-in for a container restart.
+func (g *Gateway) Restart() {
+	g.t.Helper()
+	g.stop()
+	g.start(nil)
 	g.waitHealthy(10 * time.Second)
-	return g
+}
+
+// RemoveConfig deletes the config file, leaving the database as the only
+// source of relay state for a subsequent Restart.
+func (g *Gateway) RemoveConfig() {
+	g.t.Helper()
+	if err := os.Remove(g.configPath); err != nil {
+		g.t.Fatalf("remove config: %v", err)
+	}
 }
 
 // writeConfig atomically replaces the config file (temp + rename) so the

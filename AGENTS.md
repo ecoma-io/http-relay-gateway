@@ -37,21 +37,26 @@ LISTEN_ADDR=0.0.0.0:20130 \
 
 Environment variables are bootstrap-only and require restart:
 
-| Env              |       Default | Meaning                                          |
-| ---------------- | ------------: | ------------------------------------------------ |
-| `CONFIG_FILE`    | `config.yaml` | Runtime YAML path                                |
-| `LISTEN_ADDR`    |       `:8080` | Relay endpoint; also serves `/healthz`, `/stats` |
-| `SHUTDOWN_GRACE` |         `20s` | Whole-process drain budget for shutdown          |
+| Env              |           Default | Meaning                                            |
+| ---------------- | ----------------: | -------------------------------------------------- |
+| `CONFIG_FILE`    |     `config.yaml` | Runtime YAML path                                  |
+| `LISTEN_ADDR`    |           `:8080` | Relay endpoint; also serves `/healthz`, `/stats`   |
+| `ADMIN_ADDR`     | `127.0.0.1:20131` | Management-plane listener (reserved, served in v2) |
+| `DATA_FILE`      | `data/gateway.db` | SQLite database — the source of truth for relays   |
+| `SHUTDOWN_GRACE` |             `20s` | Whole-process drain budget for shutdown            |
 
-Runtime settings live only in `config.yaml`: `log-level`, `max-retries`,
-`failure-threshold`, `cooldown`, `providers`, and `relays`. The process
-polls the file each second and reloads when its content hash changes, so
-in-place edits and atomic replacements both reload under any mount style. A
-failed parse/validation leaves the last-known-good configuration serving.
-Do not add a manual reload fallback (for example SIGHUP), and do not
-reintroduce event-based watching: neither can fix the one blind spot, a
-rename-over a single-file bind mount (the mount pins the old inode) — see
-README "Hot reload".
+Runtime state lives in the SQLite database (`internal/store`): relays,
+settings, providers, platform accounts, deployments. The legacy YAML remains
+a bridge — an empty database imports it on first boot and later boots
+resync its entries, but the database is what the pool is built from
+(`cmd/http-relay-gateway` applier loop). The process still polls the file
+each second and reloads when its content hash changes, so in-place edits and
+atomic replacements both reload under any mount style. A failed
+parse/validation leaves the last-known-good configuration serving. Do not
+add a manual reload fallback (for example SIGHUP), and do not reintroduce
+event-based watching: neither can fix the one blind spot, a rename-over a
+single-file bind mount (the mount pins the old inode) — see README "Hot
+reload".
 
 ## Behavior notes
 
@@ -114,6 +119,7 @@ uses the binary `healthcheck` subcommand (no shell in the image).
 
 - `cmd/http-relay-gateway` — lifecycle, signals, poller loop, `version` / `healthcheck`
 - `internal/config` — bootstrap environment, Viper YAML validation, body-size parsing, content-hash change poller
+- `internal/store` — SQLite persistence: embedded migrations, relays/settings/providers/accounts/deployments rows, coalesced change channel, credential-isolating `Tokens` reads
 - `internal/gateway` — HTTP data plane: pinning, bounded failover, streaming pass-through, `/healthz` + `/stats`
 - `internal/pool` — per-selector round-robin cursors, passive health, stats snapshots
 - `internal/logging`, `internal/sanitize` — zerolog setup and redaction helpers shared by all log/error paths

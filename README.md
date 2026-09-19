@@ -116,11 +116,25 @@ else.
 
 ### Environment (bootstrap-only, restart to change)
 
-| Env              |       Default | Meaning                                           |
-| ---------------- | ------------: | ------------------------------------------------- |
-| `CONFIG_FILE`    | `config.yaml` | Runtime YAML path                                 |
-| `LISTEN_ADDR`    |       `:8080` | Relay endpoint (also serves `/healthz`, `/stats`) |
-| `SHUTDOWN_GRACE` |         `20s` | Whole-process drain budget for graceful shutdown  |
+| Env              |           Default | Meaning                                           |
+| ---------------- | ----------------: | ------------------------------------------------- |
+| `CONFIG_FILE`    |     `config.yaml` | Runtime YAML path                                 |
+| `LISTEN_ADDR`    |           `:8080` | Relay endpoint (also serves `/healthz`, `/stats`) |
+| `ADMIN_ADDR`     | `127.0.0.1:20131` | Management-plane listener (admin API + UI)        |
+| `DATA_FILE`      | `data/gateway.db` | SQLite database: the source of truth for relays   |
+| `SHUTDOWN_GRACE` |             `20s` | Whole-process drain budget for graceful shutdown  |
+
+### State
+
+Relays, settings and (soon) platform accounts live in the SQLite database at
+`DATA_FILE`, not in the YAML. On first boot an empty database adopts the
+YAML wholesale (`imported legacy config into database` in the log); on later
+boots the file resyncs its own entries, so it stays a convenient way to seed
+or edit relays — but the database is what serves. Delete the file (or rename
+it away) and the gateway keeps serving the database's pool unchanged; a
+corrupt or invalid YAML is logged and ignored rather than taken. The
+database enables WAL journaling: put `DATA_FILE` on a filesystem that
+supports it.
 
 ## Run
 
