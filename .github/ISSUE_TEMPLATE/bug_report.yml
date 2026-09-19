@@ -1,0 +1,82 @@
+name: Bug report
+description: The gateway behaves differently from its documented contract.
+title: "bug: "
+labels: ["needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [`README.md`](../../blob/main/README.md) is the behavior contract —
+        please quote the passage the behavior disagrees with. The wire
+        contract, provider pinning, body limits, failover, hot reload, and
+        the logging/`/stats` contract each have their own section.
+
+        **Do not report a security vulnerability here.** Client-IP exposure,
+        a credential or relay URL reaching a log line, `/stats`, or an error
+        goes through a [private security advisory](../../security/advisories/new)
+        instead — see [SECURITY.md](../../blob/main/SECURITY.md).
+
+        Never paste relay URLs with private hostnames or provider
+        credentials into this form; use placeholders.
+  - type: checkboxes
+    id: before-filing
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: This report contains no private relay URLs and no provider credentials.
+          required: true
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens?
+      description: The observed behavior — status codes, log lines (redacted), `/stats` output.
+    validations:
+      required: true
+  - type: textarea
+    id: what-should-happen
+    attributes:
+      label: What should happen instead?
+      description: Quote the documented contract (README passage) the behavior disagrees with.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this belong to?
+      options:
+        - Gateway data plane — pinning, failover, body limits, streaming (internal/gateway)
+        - Relay pool — selection, health, stats (internal/pool)
+        - Config + hot reload (internal/config)
+        - Lifecycle, signals, subcommands (cmd)
+        - E2E suite (e2e)
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        - `./bin/http-relay-gateway version` output (or image tag)
+        - Deployment: docker compose / bare binary
+        - OS and architecture
+    validations:
+      required: true
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else?
+    validations:
+      required: false
