@@ -61,7 +61,10 @@ type State struct {
 type Gateway struct {
 	st      atomic.Pointer[State]
 	version string
-	log     zerolog.Logger
+	// relayVersion is the worker generation this binary deploys; /stats
+	// exposes it so the dashboard can compare it against the fleet.
+	relayVersion string
+	log          zerolog.Logger
 }
 
 // NewTransport builds the shared outbound transport from the timeout
@@ -94,9 +97,10 @@ func NewClient(transport *http.Transport) *http.Client {
 }
 
 // New builds the Gateway around the initial state, which must carry a
-// client.
-func New(st *State, version string, log zerolog.Logger) *Gateway {
-	g := &Gateway{log: log, version: version}
+// client. version is the gateway's own version, relayVersion the worker
+// generation its deployers ship.
+func New(st *State, version, relayVersion string, log zerolog.Logger) *Gateway {
+	g := &Gateway{log: log, version: version, relayVersion: relayVersion}
 	g.st.Store(st)
 	return g
 }
@@ -128,8 +132,9 @@ func (g *Gateway) handleStats(w http.ResponseWriter) {
 	st := g.st.Load()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"version": g.version,
-		"relays":  st.Pool.Stats(),
+		"version":      g.version,
+		"relayVersion": g.relayVersion,
+		"relays":       st.Pool.Stats(),
 	})
 }
 

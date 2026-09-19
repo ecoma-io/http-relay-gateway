@@ -17,7 +17,7 @@ func TestTokenNeverExposed(t *testing.T) {
 			Status: "active", AuthToken: "super-secret-token-abcd",
 		},
 	}
-	view := relayView(row)
+	view := renderRelay(row, row.Deployment)
 	if view.Deployment == nil || view.Deployment.TokenLast4 != "abcd" {
 		t.Fatalf("tokenLast4 wrong: %+v", view.Deployment)
 	}
@@ -32,7 +32,7 @@ func TestTokenNeverExposed(t *testing.T) {
 		t.Fatalf("raw auth token field present: %s", raw)
 	}
 	// Short tokens expose nothing at all.
-	short := relayView(store.RelayRow{Deployment: &store.DeploymentRow{AuthToken: "abc"}})
+	short := renderRelay(store.RelayRow{}, &store.DeploymentRow{AuthToken: "abc"})
 	if short.Deployment.TokenLast4 != "" {
 		t.Fatalf("short token leaked: %q", short.Deployment.TokenLast4)
 	}

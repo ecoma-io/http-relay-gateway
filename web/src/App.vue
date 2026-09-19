@@ -14,6 +14,7 @@ const chrome = computed(() => session.ready && !session.setupRequired && session
 const navItems = [
   { name: "dashboard", label: "Dashboard" },
   { name: "relays", label: "Relays" },
+  { name: "accounts", label: "Accounts" },
   { name: "settings", label: "Settings" },
 ] as const;
 

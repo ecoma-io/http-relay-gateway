@@ -20,9 +20,11 @@ import (
 
 	"http-relay-gateway/internal/admin"
 	"http-relay-gateway/internal/config"
+	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/gateway"
 	"http-relay-gateway/internal/logging"
 	"http-relay-gateway/internal/pool"
+	"http-relay-gateway/internal/reconcile"
 	"http-relay-gateway/internal/sanitize"
 	"http-relay-gateway/internal/store"
 	"http-relay-gateway/internal/web"
@@ -127,7 +129,20 @@ func run() error {
 	if gen.relays == 0 {
 		log.Warn().Msg("no relays configured; data plane returns 503 until a relay is created")
 	}
-	g := gateway.New(gen.state, version, log)
+	g := gateway.New(gen.state, version, deploy.RelayVersion, log)
+
+	// The fleet worker owns every deploy: startup probes, the periodic
+	// reconcile (interval read fresh each cycle so a settings change lands
+	// without a restart), and the admin plane's queue-and-return actions.
+	factory := deploy.NewFactory(nil)
+	rec := reconcile.Start(db, factory, log, func() int64 {
+		settings, err := db.Settings()
+		if err != nil {
+			return store.DefaultReconcileIntervalSeconds
+		}
+		return settings.ReconcileIntervalSeconds
+	})
+	defer rec.Stop()
 
 	spa, err := web.Handler()
 	if err != nil {
@@ -137,6 +152,7 @@ func run() error {
 	if bootstrap.AdminCookieSecure {
 		adminOpts = append(adminOpts, admin.WithSecureCookie())
 	}
+	adminOpts = append(adminOpts, admin.WithFleet(rec, factory))
 	adminHandler := admin.New(db, version, log, spa, adminOpts...)
 
 	ln, err := net.Listen("tcp", bootstrap.ListenAddr)
@@ -202,14 +218,22 @@ func run() error {
 	default:
 	}
 
+	// shutdown cancels fleet work first: a deploy mid-flight must not eat the
+	// whole-process drain budget, and the reconciler's database writes should
+	// be over before the final generation is whatever the DB says.
+	shutdown := func() {
+		rec.Stop()
+		shutdownAll([]*http.Server{srv, adminSrv}, bootstrap.ShutdownGrace)
+	}
+
 	for {
 		select {
 		case err := <-errCh:
-			shutdownAll([]*http.Server{srv, adminSrv}, bootstrap.ShutdownGrace)
+			shutdown()
 			return err
 		case sig := <-sigCh:
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
-			shutdownAll([]*http.Server{srv, adminSrv}, bootstrap.ShutdownGrace)
+			shutdown()
 			return nil
 		case <-db.Changes():
 			apply("database")

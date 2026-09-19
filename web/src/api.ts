@@ -76,6 +76,30 @@ export interface RelayInput {
   url: string;
   active: boolean;
   headerPolicy: string | null;
+  accountId?: number;
+}
+
+export interface Account {
+  id: number;
+  name: string;
+  platform: string;
+  accountRef: string;
+  verifiedAt: number;
+  tokenLast4: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AccountInput {
+  name: string;
+  platform: string;
+  token: string;
+  accountRef?: string;
+}
+
+export interface FleetVersion {
+  workerVersion: string;
+  deployments: Record<string, number>;
 }
 
 export interface Provider {
@@ -114,7 +138,34 @@ export const api = {
   patchRelay: (id: number, patch: Partial<RelayInput>) =>
     request<Relay>("PATCH", `/relays/${id}`, patch),
 
-  deleteRelay: (id: number) => request<Record<string, never>>("DELETE", `/relays/${id}`),
+  deleteRelay: (id: number, deleteRemote = false) =>
+    request<Record<string, never>>(
+      "DELETE",
+      `/relays/${id}${deleteRemote ? "?deleteRemote=true" : ""}`,
+    ),
+
+  redeployRelay: (id: number) => request<{ queued: string }>("POST", `/relays/${id}/redeploy`),
+
+  adoptRelay: (id: number, accountId: number) =>
+    request<{ queued: string }>("POST", `/relays/${id}/adopt`, { accountId }),
+
+  listAccounts: () => request<Account[]>("GET", "/accounts"),
+
+  createAccount: (input: AccountInput) => request<Account>("POST", "/accounts", input),
+
+  patchAccount: (id: number, patch: Partial<Omit<AccountInput, "platform">>) =>
+    request<Account>("PATCH", `/accounts/${id}`, patch),
+
+  verifyAccount: (id: number) => request<Account>("POST", `/accounts/${id}/verify`),
+
+  deleteAccount: (id: number, force = false) =>
+    request<Record<string, never>>("DELETE", `/accounts/${id}${force ? "?force=true" : ""}`),
+
+  fleetVersion: () => request<FleetVersion>("GET", "/fleet/version"),
+
+  fleetCheck: () => request<{ queued: string }>("POST", "/fleet/check"),
+
+  fleetReconcile: () => request<{ queued: string }>("POST", "/fleet/reconcile"),
 
   listProviders: () => request<Provider[]>("GET", "/providers"),
 

@@ -184,6 +184,13 @@ jobs:
       - name: Check formatting
         run: pnpm exec prettier --check .
 
+      # The embedded relay workers are plain JS concatenated per platform;
+      # their behavioral contract (token check answers 404, header
+      # filtering, the version endpoint) runs on Node's native test runner
+      # against every platform entry — no browser, no platform account.
+      - name: Worker conformance
+        run: node --test internal/deploy/workers/conformance_test.mjs
+
       # The type check is the web tree's test suite: the SPA has no runtime
       # test framework, so strict vue-tsc is what keeps refactors honest.
       - name: Type-check and build

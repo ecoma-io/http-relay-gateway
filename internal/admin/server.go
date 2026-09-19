@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"http-relay-gateway/internal/admin/auth"
+	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/pool"
 	"http-relay-gateway/internal/sanitize"
 	"http-relay-gateway/internal/store"
@@ -52,6 +53,10 @@ type Server struct {
 	limiter *auth.LoginLimiter
 	spa     http.Handler
 	mux     *http.ServeMux
+	// fleet and factory power the managed-relay endpoints; nil (no
+	// reconciler wired) means those endpoints answer 501.
+	fleet   Fleet
+	factory deploy.Factory
 	// secureCookie sets the Secure attribute on session cookies (opt-in for
 	// HTTPS-fronted deployments; loopback HTTP defaults off).
 	secureCookie bool
@@ -91,6 +96,19 @@ func New(db *store.Store, version string, log zerolog.Logger, spa http.Handler, 
 	only("GET /api/v1/relays/{id}", s.handleGetRelay)
 	only("PATCH /api/v1/relays/{id}", s.handlePatchRelay)
 	only("DELETE /api/v1/relays/{id}", s.handleDeleteRelay)
+	only("POST /api/v1/relays/{id}/redeploy", s.handleRedeployRelay)
+	only("POST /api/v1/relays/{id}/adopt", s.handleAdoptRelay)
+
+	only("GET /api/v1/accounts", s.handleListAccounts)
+	only("POST /api/v1/accounts", s.handleCreateAccount)
+	only("GET /api/v1/accounts/{id}", s.handleGetAccount)
+	only("PATCH /api/v1/accounts/{id}", s.handlePatchAccount)
+	only("DELETE /api/v1/accounts/{id}", s.handleDeleteAccount)
+	only("POST /api/v1/accounts/{id}/verify", s.handleVerifyAccount)
+
+	only("GET /api/v1/fleet/version", s.handleFleetVersion)
+	only("POST /api/v1/fleet/check", s.handleFleetCheck)
+	only("POST /api/v1/fleet/reconcile", s.handleFleetReconcile)
 
 	only("GET /api/v1/providers", s.handleListProviders)
 	only("PUT /api/v1/providers", s.handlePutProviders)
@@ -361,7 +379,21 @@ type relayJSON struct {
 	UpdatedAt    int64           `json:"updatedAt"`
 }
 
-func relayView(row store.RelayRow) relayJSON {
+// relayView renders a relay row with its deployment in whatever state the
+// deployment is in — stale, unreachable and errored deployments are exactly
+// what the fleet view must explain, so the active-only store join is not
+// enough here and the row is re-read when the join dropped it.
+func (s *Server) relayView(row store.RelayRow) relayJSON {
+	d := row.Deployment
+	if d == nil && row.Origin == store.OriginManaged {
+		if dep, err := s.db.Deployment(row.ID); err == nil {
+			d = &dep
+		}
+	}
+	return renderRelay(row, d)
+}
+
+func renderRelay(row store.RelayRow, d *store.DeploymentRow) relayJSON {
 	view := relayJSON{
 		ID:           row.ID,
 		Name:         row.Name,
@@ -374,8 +406,7 @@ func relayView(row store.RelayRow) relayJSON {
 		CreatedAt:    row.CreatedAt,
 		UpdatedAt:    row.UpdatedAt,
 	}
-	if row.Deployment != nil {
-		d := row.Deployment
+	if d != nil {
 		view.Deployment = &deploymentJSON{
 			Platform:   d.Platform,
 			Project:    d.Project,
@@ -406,7 +437,7 @@ func (s *Server) handleListRelays(w http.ResponseWriter, _ *http.Request) {
 	}
 	views := make([]relayJSON, 0, len(rows))
 	for _, row := range rows {
-		views = append(views, relayView(row))
+		views = append(views, s.relayView(row))
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -421,7 +452,7 @@ func (s *Server) handleGetRelay(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, err, "read relay")
 		return
 	}
-	writeJSON(w, http.StatusOK, relayView(row))
+	writeJSON(w, http.StatusOK, s.relayView(row))
 }
 
 type relayRequest struct {
@@ -430,6 +461,9 @@ type relayRequest struct {
 	URL          *string `json:"url"`
 	Active       *bool   `json:"active"`
 	HeaderPolicy *string `json:"headerPolicy"`
+	// AccountID births the relay as managed: the reconciler's next
+	// Redeploy turns it into a deployed worker.
+	AccountID *int64 `json:"accountId"`
 }
 
 func (s *Server) handleCreateRelay(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +501,23 @@ func (s *Server) handleCreateRelay(w http.ResponseWriter, r *http.Request) {
 	if req.Active != nil {
 		active = *req.Active
 	}
-	id, err := s.db.CreateRelay(name, provider, strings.TrimSpace(*req.URL), active, nil, req.HeaderPolicy)
+	if req.AccountID != nil {
+		if *req.AccountID < 1 {
+			writeFieldError(w, http.StatusUnprocessableEntity, "accountId", "must be a positive id")
+			return
+		}
+		account, err := s.db.Account(*req.AccountID)
+		if err != nil {
+			writeFieldError(w, http.StatusUnprocessableEntity, "accountId", err.Error())
+			return
+		}
+		if account.Platform != provider {
+			writeFieldError(w, http.StatusUnprocessableEntity, "accountId",
+				"relay provider "+provider+" does not match account platform "+account.Platform)
+			return
+		}
+	}
+	id, err := s.db.CreateRelay(name, provider, strings.TrimSpace(*req.URL), active, req.AccountID, req.HeaderPolicy)
 	if err != nil {
 		s.storeError(w, err, "create relay")
 		return
@@ -478,7 +528,7 @@ func (s *Server) handleCreateRelay(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "read relay: "+sanitize.ErrorString(err))
 		return
 	}
-	writeJSON(w, http.StatusCreated, relayView(row))
+	writeJSON(w, http.StatusCreated, s.relayView(row))
 }
 
 func (s *Server) handlePatchRelay(w http.ResponseWriter, r *http.Request) {
@@ -538,7 +588,7 @@ func (s *Server) handlePatchRelay(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "read relay: "+sanitize.ErrorString(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, relayView(row))
+	writeJSON(w, http.StatusOK, s.relayView(row))
 }
 
 func (s *Server) handleDeleteRelay(w http.ResponseWriter, r *http.Request) {
@@ -546,13 +596,13 @@ func (s *Server) handleDeleteRelay(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Remote deletion (removing the deployed worker from the platform)
-	// arrives with the deployers; until then the flag is refused rather than
-	// silently ignored, so a caller never believes an orphan was cleaned up.
+	// Remote deletion (removing the deployed worker from the platform) is
+	// synchronous and fails visibly: a platform-side error keeps the row so
+	// the deletion can be retried rather than leaving a silent orphan.
 	switch r.URL.Query().Get("deleteRemote") {
 	case "", "0", "false":
 	default:
-		writeError(w, http.StatusNotImplemented, "remote deletion is not available yet")
+		s.deleteRemote(w, r, id)
 		return
 	}
 	if err := s.db.DeleteRelay(id); err != nil {
@@ -719,8 +769,17 @@ func (s *Server) storeError(w http.ResponseWriter, err error, action string) {
 	switch {
 	case errors.Is(err, store.ErrNoRelay):
 		writeError(w, http.StatusNotFound, "relay not found")
+	case errors.Is(err, store.ErrNoAccount):
+		writeError(w, http.StatusNotFound, "account not found")
+	case errors.Is(err, store.ErrNoDeployment):
+		writeError(w, http.StatusNotFound, "deployment not found")
 	case errors.Is(err, store.ErrDuplicateName):
 		writeFieldError(w, http.StatusConflict, "name", "already in use")
+	case errors.Is(err, store.ErrAccountInUse):
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "account still referenced by managed relays or deployments",
+			"field": "force",
+		})
 	default:
 		writeError(w, http.StatusInternalServerError, action+": "+sanitize.ErrorString(err))
 	}

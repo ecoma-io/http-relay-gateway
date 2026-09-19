@@ -106,9 +106,13 @@ The admin plane (`internal/admin`) is authenticated after a one-time setup:
 `POST /api/v1/setup` (once, then `409`), `POST /api/v1/login` (bcrypt,
 HS256 `HttpOnly` cookie, 12h), `POST /api/v1/logout`. Login failures are
 rate-limited 5 per 15 minutes per source address plus a global cap
-(`429` + `Retry-After`). Management resources: `relays`, `providers`,
-`settings`. Relay tokens are write-only through the API — responses carry a
-last-4 suffix at most, and neither tokens nor passwords ever reach logs.
+(`429` + `Retry-After`). Management resources: `relays`, `accounts`
+(platform credentials, verify-before-insert), `providers`, `settings`,
+plus the fleet surface (`fleet/version`, `fleet/check`, `fleet/reconcile`)
+and per-relay actions (`redeploy`, `adopt`, `DELETE ?deleteRemote=true`)
+handled by `internal/deploy` + `internal/reconcile`. Relay and platform
+tokens are write-only through the API — responses carry a last-4 suffix at
+most, and neither tokens nor passwords ever reach logs.
 
 ## Docker
 
@@ -134,6 +138,8 @@ relay endpoint and **127.0.0.1:20131** for the admin plane, keeps
 - `internal/config` — bootstrap environment only (`LISTEN_ADDR`, `ADMIN_ADDR`, `DATA_FILE`, `SHUTDOWN_GRACE`, `ADMIN_COOKIE_SECURE`)
 - `internal/store` — SQLite persistence: embedded migrations, relays/settings/providers/accounts/deployments rows, coalesced change channel, credential-isolating `Tokens` reads
 - `internal/admin` — admin plane: setup-once + login auth (bcrypt, JWT cookie, limiter), the `/api/v1` REST surface, SPA hosting
+- `internal/deploy` — platform deployers (vercel/cloudflare/deno clients), the embedded clean-room relay workers, deploy-time token/version injection
+- `internal/reconcile` — the fleet worker: coalesced job queue, version probes, redeploys, adoptions (a probe failure never redeploys; a failed redeploy never pulls a serving relay out of rotation)
 - `internal/gateway` — HTTP data plane: pinning, bounded failover, streaming pass-through, `/healthz` + `/stats`
 - `internal/pool` — per-selector round-robin cursors, passive health, header policies, stats snapshots
 - `internal/logging`, `internal/sanitize` — zerolog setup and redaction helpers shared by all log/error paths

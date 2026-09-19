@@ -90,9 +90,28 @@ unauthenticated; the admin plane is not.
   serves from its URL immediately; platform deployments attach later and
   then supply the relay's authentication token. Provider labels are free-form
   (`vercel`, `cloudflare`, `deno`, or your own); body limits attach to the
-  label via `PUT /api/v1/providers`.
+  label via `PUT /api/v1/providers`. Creating a relay with `accountId` births
+  it as **managed**: the gateway deploys its embedded worker to that platform
+  account and serves the deployment URL with a deploy-time token. A relay
+  created without one is **legacy** — it serves its own URL tokenless, and
+  `POST /api/v1/relays/{id}/adopt` (with an `accountId`) migrates it to a
+  managed deployment.
+- **Platform accounts**: `POST /api/v1/accounts` stores a platform API token
+  (verified against the platform before it is accepted, shown last-4 only
+  ever after). `POST /api/v1/relays/{id}/redeploy` redeploys a managed
+  relay's worker with a fresh token; `DELETE /api/v1/relays/{id}
+?deleteRemote=true` also deletes the deployed worker from the platform.
+  A failed redeploy never pulls a serving relay out of rotation — the old
+  deployment keeps serving with the failure recorded on the row.
+- **Fleet**: `GET /api/v1/fleet/version` reports the embedded worker version
+  and per-platform deployment counts; `POST /api/v1/fleet/check` probes every
+  deployment and records drift; `POST /api/v1/fleet/reconcile` also redeploys
+  deployments whose reported version differs from the gateway's — how the
+  fleet upgrades (or downgrades) with the gateway. Startup probes run
+  automatically; an unreachable relay is never redeployed on a hunch.
 - **Settings**: `GET`/`PATCH /api/v1/settings` — log level, retry/cooldown
-  knobs, streaming threshold, transport timeouts. Unknown keys are rejected.
+  knobs, streaming threshold, transport timeouts, reconcile interval. Unknown
+  keys are rejected.
 
 Bind `ADMIN_ADDR` to loopback (the default `127.0.0.1:20131`) and front it
 with an authenticating proxy if it must be reachable remotely. Never expose

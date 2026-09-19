@@ -94,7 +94,7 @@ func newFixture(t *testing.T, mutate func(*pool.Input, *State)) *fixture {
 		t.Fatal(err)
 	}
 	state.Pool = p
-	g := New(state, "test", logging.Nop())
+	g := New(state, "test", "1", logging.Nop())
 	return &fixture{gateway: g, pool: p, in: in, saw: saw}
 }
 
@@ -361,7 +361,7 @@ func TestAllAttemptsExhaustedReturns502(t *testing.T) {
 		MaxRetries:     1,
 		MaxBufferBytes: 1 << 20,
 		Client:         NewClient(NewTransport(2*time.Second, 0)),
-	}, "test", logging.Nop())
+	}, "test", "1", logging.Nop())
 
 	res := relayRequest(t, g, "http://gateway/", `{}`, relaySpecHeaders())
 	if res.StatusCode != http.StatusBadGateway {
@@ -477,7 +477,7 @@ func TestResponseHeaderTimeoutFailsFast(t *testing.T) {
 		Pool:           p,
 		Client:         NewClient(NewTransport(2*time.Second, 100*time.Millisecond)),
 		MaxBufferBytes: 1 << 20,
-	}, "test", logging.Nop())
+	}, "test", "1", logging.Nop())
 
 	start := time.Now()
 	res := relayRequest(t, g, "http://gateway/", `{}`, relaySpecHeaders())
@@ -528,7 +528,7 @@ func TestSuccessResetsFailureStreak(t *testing.T) {
 		MaxRetries:     1,
 		MaxBufferBytes: 1 << 20,
 		Client:         NewClient(NewTransport(2*time.Second, 0)),
-	}, "test", logging.Nop())
+	}, "test", "1", logging.Nop())
 
 	// Round-robin alternates [flaky, live] per pick; MaxRetries 1 covers one
 	// failover. Over six requests flaky is contacted on hits 1-4 (fail, ok,

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from "vue-router";
 import { auth, session } from "./auth";
+import AccountsView from "./views/AccountsView.vue";
 import DashboardView from "./views/DashboardView.vue";
 import LoginView from "./views/LoginView.vue";
 import RelaysView from "./views/RelaysView.vue";
@@ -11,6 +12,7 @@ const router = createRouter({
   routes: [
     { path: "/", name: "dashboard", component: DashboardView },
     { path: "/relays", name: "relays", component: RelaysView },
+    { path: "/accounts", name: "accounts", component: AccountsView },
     { path: "/settings", name: "settings", component: SettingsView },
     { path: "/setup", name: "setup", component: SetupView },
     { path: "/login", name: "login", component: LoginView },
