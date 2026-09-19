@@ -2,9 +2,26 @@
 # plus the CA bundle used to verify HTTPS relay URLs. No shell — the Docker
 # HEALTHCHECK works because `http-relay-gateway healthcheck` is a binary
 # subcommand of the entrypoint itself.
+
+# Stage 1: the management SPA. The pnpm version comes from the root
+# packageManager field via corepack — no unpinned install in the chain.
+FROM node:24-alpine AS web
+WORKDIR /src
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY web/package.json web/package.json
+# --ignore-scripts skips the root prepare hook (lefthook; pointless in an
+# image, and there is no .git to install hooks into). esbuild needs no
+# install script: its platform binary ships as a package.
+RUN corepack enable && pnpm install --frozen-lockfile --ignore-scripts
+COPY web/ web/
+RUN pnpm --filter web build
+
+# Stage 2: the Go binary with the real bundle embedded (never the committed
+# stub — that placeholder only exists so host-side `go build` needs no node).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY . .
+COPY --from=web /src/web/dist /src/internal/web/dist
 ARG VERSION=0.1.0-dev
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
     -ldflags "-s -w -X main.version=${VERSION}" \
