@@ -5,14 +5,33 @@
 // on; body line length is unlimited.
 // `deps` and `ci` exist so dependency-automation pull requests (Renovate's
 // semanticCommitScope settings in .github/renovate.json5) pass the same gate
-// as human ones; `release` belongs to release-please's release PR.
+// as human ones; `release` belongs to release-please's release PR. The v2
+// management plane adds its own scopes: store (SQLite layer), admin (REST +
+// auth), deploy (platform deployers + workers), web (Vue SPA), reconcile
+// (fleet version reconciliation).
 export default {
   extends: ["@commitlint/config-conventional"],
   rules: {
     "scope-enum": [
       2,
       "always",
-      ["gateway", "pool", "config", "cmd", "e2e", "docs", "deps", "ci", "workspace", "release"],
+      [
+        "gateway",
+        "pool",
+        "config",
+        "cmd",
+        "e2e",
+        "docs",
+        "deps",
+        "ci",
+        "workspace",
+        "release",
+        "store",
+        "admin",
+        "deploy",
+        "web",
+        "reconcile",
+      ],
     ],
     "body-max-line-length": [0],
   },

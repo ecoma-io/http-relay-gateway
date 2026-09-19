@@ -39,6 +39,18 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Repository hygiene: the project is general-purpose and independent, so
+      # no file may reference the codebase it grew out of — not in docs, not
+      # in comments, nowhere. The pattern is assembled from two fragments so
+      # this step cannot match itself.
+      - name: Forbidden references
+        run: |
+          pat="9r""outer"
+          if grep -riI "$pat" --exclude-dir=.git . ; then
+            echo "::error::Forbidden reference found — see the matches above."
+            exit 1
+          fi
+
       # `gofmt -l` exits 0 over findings; only emptiness means clean, so the
       # check fails loudly on its own output rather than trusting an exit code.
       - name: Check formatting

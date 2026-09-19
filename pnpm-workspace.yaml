@@ -4,3 +4,8 @@
 # No other dependency gets permission to execute an install-time script.
 allowBuilds:
   lefthook: true
+
+# The management SPA lives here; `make web` builds it and syncs the output
+# into internal/web/dist for go:embed.
+packages:
+  - web

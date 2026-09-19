@@ -5,3 +5,9 @@
 bin/
 pnpm-lock.yaml
 node_modules/
+
+# Build output is generated (the committed stub under internal/web/dist must
+# survive untouched — it is the placeholder that lets `go build` work without
+# a node toolchain).
+web/dist/
+internal/web/dist/

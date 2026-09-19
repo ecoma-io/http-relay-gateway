@@ -10,7 +10,7 @@ pre-commit:
       run: gofmt -w {staged_files}
       stage_fixed: true
     format:
-      glob: "*.{md,yml,yaml,json,json5,mjs}"
+      glob: "*.{md,yml,yaml,json,json5,mjs,vue,ts,js}"
       run: pnpm exec prettier --write --ignore-unknown {staged_files}
       stage_fixed: true
 commit-msg:
