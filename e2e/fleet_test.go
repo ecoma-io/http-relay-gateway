@@ -185,10 +185,9 @@ func TestE2E_UnreachableRelayNeverRedeploys(t *testing.T) {
 	p := fake.addProject("vercel", "v-rel", simDown)
 
 	g := startGateway(t, fake, gwOptions{
-		config:         configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
-		key:            key,
-		extraEnv:       map[string]string{"E2E_VT": vt},
-		skipURLLogScan: true, // probe transport failures log the relay URL (reported defect)
+		config:   configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
 	})
 
 	g.waitForLifecycle(t, "vercel", "v-rel", "failed", "unreachable", 20*time.Second)

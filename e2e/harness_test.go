@@ -87,12 +87,6 @@ type gwOptions struct {
 	keyFile bool
 	// extraEnv rides on top of a scrubbed copy of the test environment.
 	extraEnv map[string]string
-	// skipURLLogScan suspends the relay-URL log scan for runs that
-	// deliberately produce probe transport failures — those surface Go
-	// *url.Error strings, which carry the relay URL, in the process log
-	// (a known defect reported separately). Secret markers are always
-	// scanned.
-	skipURLLogScan bool
 }
 
 // startGateway builds, envures and launches one gateway against fake, and
@@ -156,7 +150,7 @@ func startGateway(t *testing.T, fake *fakeEdge, o gwOptions) *gatewayProc {
 	g.awaitServing(10 * time.Second)
 	t.Cleanup(func() {
 		_ = g.stop(10 * time.Second)
-		g.scanLog(t, fake, o.skipURLLogScan)
+		g.scanLog(t, fake)
 	})
 	return g
 }
@@ -261,16 +255,15 @@ func (g *gatewayProc) exitOK(timeout time.Duration) {
 	}
 }
 
-// scanLog fails the test when a secret or (unless skipped) a relay/fake URL
-// appears anywhere in the process log.
-func (g *gatewayProc) scanLog(t *testing.T, fake *fakeEdge, skipURLs bool) {
+// scanLog fails the test when a secret or a relay/fake URL appears anywhere
+// in the process log — including the transport-failure paths, whose Go
+// *url.Error strings the sanitizer strips down to `Get "…": cause`.
+func (g *gatewayProc) scanLog(t *testing.T, fake *fakeEdge) {
 	t.Helper()
 	log := g.logDump()
 	markers := []string{g.key}
 	markers = append(markers, fake.secretMarkers()...)
-	if !skipURLs {
-		markers = append(markers, fake.urlMarkers()...)
-	}
+	markers = append(markers, fake.urlMarkers()...)
 	for _, m := range markers {
 		if m == "" {
 			continue
@@ -288,8 +281,8 @@ func (g *gatewayProc) scanLog(t *testing.T, fake *fakeEdge, skipURLs bool) {
 
 // leakLabel names a leaked marker without printing the secret itself.
 func leakLabel(marker, key string, fake *fakeEdge) string {
-	switch {
-	case marker == key:
+	switch marker {
+	case key:
 		return "relay key"
 	default:
 		return fake.markerLabel(marker)
@@ -505,8 +498,6 @@ func freePort(t *testing.T) string {
 	_ = ln.Close()
 	return strconv.Itoa(port)
 }
-
-var randPrefix = fmt.Sprintf("%04x", rand.Uint32())
 
 // randSuffix keeps per-test credentials and marker strings unique, so a
 // leak in one run can never be masked by another run's values.

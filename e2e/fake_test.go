@@ -215,17 +215,6 @@ func (f *fakeEdge) deleteCount(slug string) int {
 	return len(p.deletes)
 }
 
-// deletesOf returns when each remote delete of the project completed.
-func (f *fakeEdge) deletesOf(slug string) []time.Time {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	p := f.projects[slug]
-	if p == nil {
-		return nil
-	}
-	return append([]time.Time(nil), p.deletes...)
-}
-
 // deleteDoneAt reports when the project's last remote delete fully
 // completed (its answer on the wire), which is the earliest instant a
 // replacement deploy is allowed to exist.
@@ -689,12 +678,6 @@ func (s *simState) setMode(mode string) {
 	s.mode = mode
 }
 
-func (s *simState) setHoldToken(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.holdToken = token
-}
-
 // blockMarker makes the next ingress carrying X-Marker hang inside the sim
 // until release — an in-flight request the gateway must drain before a
 // replacement deploys.
@@ -727,15 +710,6 @@ func (s *simState) markerSeen(marker string) bool {
 		}
 	}
 	return false
-}
-
-func (s *simState) lastIngress() (ingressRecord, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.ingress) == 0 {
-		return ingressRecord{}, false
-	}
-	return s.ingress[len(s.ingress)-1], true
 }
 
 // serveHTTP runs the sim. The request path is /<slug>/... on the shared

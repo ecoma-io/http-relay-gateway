@@ -249,9 +249,10 @@ in-flight requests, then deletes the remote deployment from the platform
 (a `404` counts as success — the desired end state is "the remote does not
 exist"), then forgets the relay. A failed delete retries under backoff
 (`delete_failed`). Re-adding the entry mid-delete is safe: every relay has
-an incarnation counter (its `generation` on `/stats`) that bumps on removal
-and re-add, so the stale delete's completion is discarded and the new
-incarnation cannot deploy until the old project has actually been deleted.
+an incarnation counter (its `generation` on `/stats`) that keeps stale
+delete completions from touching a newer incarnation — the re-added
+identity (or, if the delete finished first, its fresh incarnation) cannot
+deploy until the old project has actually been deleted.
 Provider credentials for deletes are remembered in memory; if the process
 restarts while an entry is absent from the file, the remote is left behind
 with a warning — the gateway never guesses a deletion.
