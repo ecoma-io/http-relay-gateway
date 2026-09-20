@@ -139,6 +139,52 @@ func TestFailingDemotesOnlyAfterThreshold(t *testing.T) {
 	}
 }
 
+func TestDemoteRevokesAdmissionImmediately(t *testing.T) {
+	r, _ := newTestRegistry()
+	r.Sync([]Key{keyA})
+	r.Ready(keyA, time.Millisecond)
+	drain(r.Changes()) // consume the admission notification
+
+	// A failing replacement drops admission NOW — one Demote, no streak
+	// wait: the previous verified deployment no longer exists.
+	r.Demote(keyA, ReasonProbeFailed)
+	if r.IsReady(keyA) || r.ReadyCount() != 0 {
+		t.Fatalf("demoted relay must not serve: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
+	}
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StateUnready || rec.Reason != ReasonProbeFailed {
+		t.Fatalf("record = %+v, want unready with %q", rec, ReasonProbeFailed)
+	}
+	if !drain(r.Changes()) {
+		t.Fatal("demotion must notify the applier")
+	}
+	if r.Allow(keyA) {
+		t.Fatal("a demotion must close the backoff gate")
+	}
+
+	// Re-admission happens only through a successful Ready.
+	r.Ready(keyA, time.Millisecond)
+	if !r.IsReady(keyA) || r.ReadyCount() != 1 {
+		t.Fatalf("ready after demote not admitted: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
+	}
+}
+
+func TestDemoteNeverServedGoesFailed(t *testing.T) {
+	r, _ := newTestRegistry()
+	r.Enter(keyA, StateDiscovered, "")
+
+	// A relay that never verified ends up failed, not unready — same
+	// semantics as a Failing streak's never-serving branch.
+	r.Demote(keyA, ReasonAuthFailed)
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StateFailed || rec.Reason != ReasonAuthFailed {
+		t.Fatalf("record = %+v, want failed with %q", rec, ReasonAuthFailed)
+	}
+	if r.IsReady(keyA) || r.ReadyCount() != 0 {
+		t.Fatalf("never-served relay must stay out: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
+	}
+}
+
 func TestEnterVerifyingDoesNotResetStreak(t *testing.T) {
 	// Routine scans interleave Enter(verifying) with every attempt. If that
 	// reset the streak, a serving relay failing every scan tick would sit at

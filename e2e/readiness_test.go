@@ -419,6 +419,72 @@ func TestE2E_FailedRedeployKeepsCurrentWorkerServing(t *testing.T) {
 	relayMustServe(t, g, "")
 }
 
+// TestE2E_ReplacementFailsVerificationLeavesPool pins the Demote contract:
+// a verified relay redeployed onto a worker that fails end-to-end
+// verification must not keep serving the replacement — it drops out of the
+// pool (readyz 503, data plane 503) with a probe_failed lifecycle reason,
+// and healing the origin re-admits it on the same deployment.
+func TestE2E_ReplacementFailsVerificationLeavesPool(t *testing.T) {
+	sim := newWorkerSim(t, "", "uninitialized")
+	platform := newFakePlatform(t, sim)
+	certFile, _ := trustMaterial(t, sim)
+	g := NewGatewayWithEnv(t,
+		deploy.VercelAPIBaseEnv+"="+platform.srv.URL,
+		"SSL_CERT_FILE="+certFile,
+	)
+	g.Setup(t, adminPassword)
+	g.Login(t, adminPassword)
+	acc := createMainAccount(t, g)
+
+	id := g.CreateRelay(t, RelaySeed{Name: "repl-f", Provider: "vercel", URL: sim.srv.URL, AccountID: &acc})
+	waitForDeployment(t, g, id, "active", 30*time.Second)
+	g.WaitForReady(1, applySettle)
+	relayMustServe(t, g, "")
+
+	// Break the origin's forward walk before firing the redeploy: every
+	// deploy-time config lands on a worker whose probes fail, so the
+	// replacement must never gain admission.
+	sim.setForwardBroken(true)
+	deploysBefore := len(platform.deployedTokens())
+	code, _, body := g.AdminDo(t, http.MethodPost, relayPath(id)+"/redeploy", nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("redeploy = %d: %s", code, body)
+	}
+
+	// The platform deployed a new worker (token rotated), but it is broken:
+	// the relay leaves the pool, readyz 503s, traffic 503s, and the row
+	// says probe_failed — not a serving worker.
+	g.WaitForCondition(applySettle, "broken replacement out of pool", func(st *StatsView) bool {
+		if st.Readiness.ReadyRelays != 0 || st.Readiness.Ready {
+			t.Logf("not drained: %+v", st.Readiness)
+			return false
+		}
+		if _, served := st.relay("repl-f"); served {
+			return false
+		}
+		row, ok := st.lifecycle("repl-f")
+		t.Logf("lifecycle: %+v ok=%v", row, ok)
+		return ok && row.State == "unready" && row.Reason == "probe_failed"
+	})
+	if len(platform.deployedTokens()) <= deploysBefore {
+		t.Fatalf("expected the platform to land a replacement deployment")
+	}
+	readyzAssert(t, g, false)
+	status, _, _ := relayDo(t, g.Addr, "/vercel", `{}`, nil)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("data plane = %d, want 503 with broken replacement", status)
+	}
+
+	// The origin heals: the same replacement verifies end to end and
+	// re-enters the pool — no second deploy fires.
+	sim.setForwardBroken(false)
+	g.WaitForReady(1, applySettle)
+	if got := len(platform.deployedTokens()); got != deploysBefore+1 {
+		t.Fatalf("deploys = %d, want %d (healing must not redeploy)", got, deploysBefore+1)
+	}
+	relayMustServe(t, g, "")
+}
+
 // TestE2E_AdoptFailureKeepsLegacyServing pins the adoption safety contract:
 // a failed adopt leaves the legacy relay untouched and serving; healing
 // adopts it onto the managed worker.

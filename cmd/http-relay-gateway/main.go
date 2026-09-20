@@ -277,8 +277,9 @@ func buildGeneration(db *store.Store, reg *readiness.Registry) (generation, erro
 
 	// Announce the current relay set to the registry: rows that appear here
 	// (fresh database, deleted relay re-added, first boot) enter the mirror
-	// as configured-but-unverified; rows that disappeared are dropped. This
-	// never notifies — rebuilds only happen on real state transitions.
+	// as configured-but-unverified; a serving row that disappeared is
+	// dropped, which revokes its admission and does notify — that removal is
+	// a real transition. Rebuilds only happen on state transitions.
 	present := make([]readiness.Key, 0, len(rows))
 	for _, row := range rows {
 		present = append(present, readiness.Key{Provider: row.Provider, Name: row.Name})

@@ -721,10 +721,13 @@ func (w *Worker) redeployRelay(relayID int64) {
 	if verdict != verifiedOK {
 		// The platform succeeded and the new worker is live, but it cannot
 		// be trusted to serve: record the new URL as the current truth —
-		// with a status that carries why — and keep it out of the pool.
+		// with a status that carries why — and keep it out of the pool. The
+		// previously verified worker no longer exists, so admission drops
+		// immediately (Demote, not a Failing streak): the relay must not
+		// serve its unverified replacement until it verifies.
 		// Registry first, row second: any pool rebuild triggered by the row
 		// change already sees the admission revoked.
-		w.reg.Failing(key, reasonFor(verdict), dur)
+		w.reg.Demote(key, reasonFor(verdict))
 		if err := w.db.UpsertDeployment(store.DeploymentRow{
 			RelayID: relayID, AccountID: account.ID, Platform: account.Platform,
 			Project: result.Project, ExternalID: result.ExternalID, URL: result.URL,

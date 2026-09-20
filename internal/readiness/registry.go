@@ -332,14 +332,7 @@ func (r *Registry) Failing(key Key, reason string, duration time.Duration) {
 	e.record.LastResult = duration
 	e.record.FailStreak++
 	e.record.Reason = reason
-	wait := r.cfg.BackoffBase << min(e.record.FailStreak-1, 30)
-	if wait > r.cfg.BackoffMax || wait <= 0 {
-		wait = r.cfg.BackoffMax
-	}
-	if r.readyCount == 0 && wait > r.cfg.RecoverMax {
-		wait = r.cfg.RecoverMax
-	}
-	e.nextTry = now.Add(wait)
+	r.backoffLocked(e, now)
 	if !e.serving {
 		if e.record.State != StateUnready && e.record.State != StateFailed {
 			e.record.State = StateFailed
@@ -362,6 +355,51 @@ func (r *Registry) Failing(key Key, reason string, duration time.Duration) {
 	e.record.State = StateUnready
 	e.record.Since = now
 	r.notifyLocked()
+}
+
+// Demote revokes key's admission immediately, bypassing the DemoteAfter blip
+// tolerance. Used when a replacement deployment replaced a verified worker
+// on the platform but failed verification: the previous deployment is gone,
+// nothing verified remains to serve, so the relay must not serve its new
+// worker until the replacement verifies. A relay that never served goes
+// straight to failed; the backoff gate is armed like a failing streak so the
+// scan does not hot-loop it.
+func (r *Registry) Demote(key Key, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.entry(key)
+	now := r.cfg.Now()
+	e.record.LastAttempt = now
+	e.record.Reason = reason
+	e.record.FailStreak = r.cfg.DemoteAfter
+	r.backoffLocked(e, now)
+	if !e.serving {
+		if e.record.State != StateUnready && e.record.State != StateFailed {
+			e.record.State = StateFailed
+			e.record.Since = now
+			r.notifyLocked()
+		}
+		return
+	}
+	e.serving = false
+	r.readyCount--
+	e.record.State = StateUnready
+	e.record.Since = now
+	r.notifyLocked()
+}
+
+// backoffLocked arms key's retry gate after a failure: exponential base,
+// capped at BackoffMax, and capped harder at RecoverMax while nothing at
+// all is serving so a total outage heals quickly.
+func (r *Registry) backoffLocked(e *entry, now time.Time) {
+	wait := r.cfg.BackoffBase << min(e.record.FailStreak-1, 30)
+	if wait > r.cfg.BackoffMax || wait <= 0 {
+		wait = r.cfg.BackoffMax
+	}
+	if r.readyCount == 0 && wait > r.cfg.RecoverMax {
+		wait = r.cfg.RecoverMax
+	}
+	e.nextTry = now.Add(wait)
 }
 
 func (r *Registry) entry(key Key) *entry {
