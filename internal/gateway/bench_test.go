@@ -64,7 +64,7 @@ func BenchmarkRelayForward(b *testing.B) {
 			b.Fatal(err)
 		}
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `{"ok":true}`) {
 			b.Fatalf("status %d body %s", resp.StatusCode, body)
 		}
@@ -98,6 +98,6 @@ func BenchmarkHandleReadyz(b *testing.B) {
 			b.Fatalf("status %d, want 503", resp.StatusCode)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }

@@ -46,13 +46,13 @@ ADMIN_ADDR=127.0.0.1:20131 \
 
 Environment variables are bootstrap-only and require restart:
 
-| Env                   |           Default | Meaning                                            |
-| --------------------- | ----------------: | -------------------------------------------------- |
+| Env                   |           Default | Meaning                                                     |
+| --------------------- | ----------------: | ----------------------------------------------------------- |
 | `LISTEN_ADDR`         |           `:8080` | Relay endpoint; also serves `/healthz`, `/readyz`, `/stats` |
-| `ADMIN_ADDR`          | `127.0.0.1:20131` | Admin plane listener (REST + UI); keep it loopback |
-| `DATA_FILE`           | `data/gateway.db` | SQLite database — the source of truth              |
-| `SHUTDOWN_GRACE`      |             `20s` | Whole-process drain budget for shutdown            |
-| `ADMIN_COOKIE_SECURE` |           `false` | `Secure` cookie attribute, for HTTPS termination   |
+| `ADMIN_ADDR`          | `127.0.0.1:20131` | Admin plane listener (REST + UI); keep it loopback          |
+| `DATA_FILE`           | `data/gateway.db` | SQLite database — the source of truth                       |
+| `SHUTDOWN_GRACE`      |             `20s` | Whole-process drain budget for shutdown                     |
+| `ADMIN_COOKIE_SECURE` |           `false` | `Secure` cookie attribute, for HTTPS termination            |
 
 Readiness knobs (also bootstrap-only): `RELAY_VERIFY_INTERVAL` (`60s`),
 `RELAY_REVIVE_SCAN_INTERVAL` (`10m`), `RELAY_VERIFY_BACKOFF_BASE` (`5s`),

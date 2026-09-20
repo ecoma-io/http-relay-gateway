@@ -18,7 +18,7 @@ func BenchmarkBuildGeneration(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer s.Close()
+	b.Cleanup(func() { _ = s.Close() })
 
 	providers := make([]store.ProviderRow, 4)
 	for i := range providers {

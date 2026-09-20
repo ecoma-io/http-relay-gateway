@@ -69,28 +69,28 @@ Authorization: Bearer $TARGET_TOKEN
 
 ### Readiness gate
 
-A relay serves traffic only after it *proves* it can: its deployment answers
+A relay serves traffic only after it _proves_ it can: its deployment answers
 on its origin, carries the expected worker version, and completes a forwarded
 request through its own relay URL end to end (relay key included). Every
 relay's lifecycle is tracked in memory and surfaced on `/stats`:
 
-| State | Meaning |
-| --- | --- |
-| `configured` | Row exists; first verification pending |
-| `discovered` | Legacy relay (no platform account); probing |
-| `deploying` | A deploy/redeploy is in flight (single-flight per relay) |
-| `verifying` | Version + forward probe in progress |
-| `ready` | Gate passed; admitted to the pool; round-robins traffic |
-| `unready` | Was serving, then failed verification `DemoteAfter` times consecutively |
-| `failed` | Never served; verification keeps failing (backoff-gated retries) |
-| `removing` | Deleted; held 30s before the registry purges it |
+| State        | Meaning                                                                 |
+| ------------ | ----------------------------------------------------------------------- |
+| `configured` | Row exists; first verification pending                                  |
+| `discovered` | Legacy relay (no platform account); probing                             |
+| `deploying`  | A deploy/redeploy is in flight (single-flight per relay)                |
+| `verifying`  | Version + forward probe in progress                                     |
+| `ready`      | Gate passed; admitted to the pool; round-robins traffic                 |
+| `unready`    | Was serving, then failed verification `DemoteAfter` times consecutively |
+| `failed`     | Never served; verification keeps failing (backoff-gated retries)        |
+| `removing`   | Deleted; held 30s before the registry purges it                         |
 
 Verification runs on its own cadence and after every reconcile pass.
 Failures are exponential-backoff gated and never crash the process; while
-*nothing* is ready the retry delay is capped harder so a total outage heals
+_nothing_ is ready the retry delay is capped harder so a total outage heals
 quickly, and a relay that recovers re-enters the pool on the next pass — no
 restart, no manual intervention. Transient probe failures demote (`unready`)
-and never trigger a redeploy; a version mismatch or a wrong relay key *does*
+and never trigger a redeploy; a version mismatch or a wrong relay key _does_
 queue a redeploy, so a stale worker replaces itself with fresh configuration.
 Legacy relays are readiness-probed only — never version-probed, never
 redeployed.
@@ -105,7 +105,7 @@ failure reason instead of in the serving pool.
 Zero-ready behavior: `/readyz` answers `503`, `/healthz` still answers `ok`
 (the process is alive — no relay is), the data plane answers `503` for every
 request including pinned ones, and `/stats` reports readiness `false` with an
-empty relay list. Round-robin requests alternate only over the *ready* set,
+empty relay list. Round-robin requests alternate only over the _ready_ set,
 in configuration order.
 
 ### Body limits
@@ -218,19 +218,19 @@ config file, no reload signal, no restart.
 
 ### Environment (bootstrap-only, restart to change)
 
-| Env                           |           Default | Meaning                                                   |
-| ----------------------------- | ----------------: | --------------------------------------------------------- |
-| `LISTEN_ADDR`                 |           `:8080` | Relay endpoint (also serves `/healthz`, `/readyz`, `/stats`) |
-| `ADMIN_ADDR`                  | `127.0.0.1:20131` | Admin plane listener (REST API + UI)                      |
-| `DATA_FILE`                   | `data/gateway.db` | SQLite database — the source of truth                     |
-| `SHUTDOWN_GRACE`              |             `20s` | Whole-process drain budget for graceful shutdown          |
-| `ADMIN_COOKIE_SECURE`         |           `false` | Set `true` when the admin plane terminates HTTPS          |
-| `RELAY_VERIFY_INTERVAL`       |             `60s` | Readiness verification scan cadence                       |
-| `RELAY_REVIVE_SCAN_INTERVAL`  |             `10m` | Paused-deployment revival scan cadence                    |
-| `RELAY_VERIFY_BACKOFF_BASE`   |              `5s` | First verification-failure retry delay                    |
-| `RELAY_VERIFY_BACKOFF_MAX`    |              `5m` | Exponential retry ceiling                                 |
-| `RELAY_VERIFY_RECOVER_MAX`    |             `15s` | Retry ceiling while no relay is ready                     |
-| `RELAY_VERIFY_DEMOTE_AFTER`   |               `3` | Consecutive failures before a serving relay demotes       |
+| Env                          |           Default | Meaning                                                      |
+| ---------------------------- | ----------------: | ------------------------------------------------------------ |
+| `LISTEN_ADDR`                |           `:8080` | Relay endpoint (also serves `/healthz`, `/readyz`, `/stats`) |
+| `ADMIN_ADDR`                 | `127.0.0.1:20131` | Admin plane listener (REST API + UI)                         |
+| `DATA_FILE`                  | `data/gateway.db` | SQLite database — the source of truth                        |
+| `SHUTDOWN_GRACE`             |             `20s` | Whole-process drain budget for graceful shutdown             |
+| `ADMIN_COOKIE_SECURE`        |           `false` | Set `true` when the admin plane terminates HTTPS             |
+| `RELAY_VERIFY_INTERVAL`      |             `60s` | Readiness verification scan cadence                          |
+| `RELAY_REVIVE_SCAN_INTERVAL` |             `10m` | Paused-deployment revival scan cadence                       |
+| `RELAY_VERIFY_BACKOFF_BASE`  |              `5s` | First verification-failure retry delay                       |
+| `RELAY_VERIFY_BACKOFF_MAX`   |              `5m` | Exponential retry ceiling                                    |
+| `RELAY_VERIFY_RECOVER_MAX`   |             `15s` | Retry ceiling while no relay is ready                        |
+| `RELAY_VERIFY_DEMOTE_AFTER`  |               `3` | Consecutive failures before a serving relay demotes          |
 
 ### State
 

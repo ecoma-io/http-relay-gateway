@@ -681,12 +681,6 @@ func (s *edgeSim) hitCount() int {
 	return s.hits
 }
 
-func (s *edgeSim) forwardProbeCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.forwardProbes
-}
-
 func (s *edgeSim) servedBody() string { return s.name + "\n" }
 
 // setForwardBroken flips the origin path of the end-to-end forward probe to

@@ -626,7 +626,7 @@ func TestReadyzDistinctFromHealthz(t *testing.T) {
 		t.Fatal(err)
 	}
 	hzBody, _ := io.ReadAll(hz.Body)
-	hz.Body.Close()
+	_ = hz.Body.Close()
 	if hz.StatusCode != http.StatusOK || string(hzBody) != "ok\n" {
 		t.Fatalf("/healthz = %d %q, want 200 ok\\n under zero readiness", hz.StatusCode, hzBody)
 	}
@@ -635,8 +635,8 @@ func TestReadyzDistinctFromHealthz(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rz.Body.Close()
 	rzBody, _ := io.ReadAll(rz.Body)
+	_ = rz.Body.Close()
 	if rz.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz = %d, want 503 with zero ready relays", rz.StatusCode)
 	}
@@ -658,8 +658,8 @@ func TestReadyzFlipsWithAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rz.Body.Close()
 	body, _ := io.ReadAll(rz.Body)
+	_ = rz.Body.Close()
 	if rz.StatusCode != http.StatusOK {
 		t.Fatalf("/readyz = %d, want 200 with one ready relay", rz.StatusCode)
 	}
