@@ -58,6 +58,7 @@ body:
       options:
         - Gateway data plane — pinning, failover, body limits, streaming (internal/gateway)
         - Relay pool — selection, health, stats (internal/pool)
+        - Fleet reconciliation — readiness gate, deploys, deletes (internal/readiness, internal/reconcile, internal/deploy)
         - Config + hot reload (internal/config)
         - Lifecycle, signals, subcommands (cmd)
         - E2E suite (e2e)

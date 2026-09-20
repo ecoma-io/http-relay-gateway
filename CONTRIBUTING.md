@@ -30,15 +30,15 @@ pull request. A document that lags the code is a defect, not a follow-up.
 
 ## The commands
 
-| Command                                                                                            | What it does                                                                                                            |
-| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `gofmt -w .`                                                                                       | Format; the first half of every change                                                                                  |
-| `go vet ./...`                                                                                     | Vet; CI runs golangci-lint's default roster, whose superset includes it                                                 |
-| `go test -race ./...`                                                                              | The full suite, including the black-box E2E tests                                                                       |
-| `go test -short -race ./...`                                                                       | Unit only — the E2E suite skips itself under `-short`                                                                   |
-| `go test ./e2e/`                                                                                   | Just the black-box suite: the real binary as a subprocess against in-process fake edge-relay servers (no Docker needed) |
-| `go build -ldflags "-X main.version=0.1.0-dev" -o bin/http-relay-gateway ./cmd/http-relay-gateway` | Build the binary                                                                                                        |
-| `pnpm format` / `pnpm format:check`                                                                | Prettier over the docs, workflows, and config files                                                                     |
+| Command                                                                                            | What it does                                                                                                                            |
+| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `gofmt -w .`                                                                                       | Format; the first half of every change                                                                                                  |
+| `go vet ./...`                                                                                     | Vet; CI runs golangci-lint's default roster, whose superset includes it                                                                 |
+| `go test -race ./...`                                                                              | The full suite, including the black-box E2E tests                                                                                       |
+| `go test -short -race ./...`                                                                       | Unit only — the E2E suite skips itself under `-short`                                                                                   |
+| `go test ./e2e/`                                                                                   | Just the black-box suite: the real binary as a subprocess against in-process fake edge relays and fake platform APIs (no Docker needed) |
+| `go build -ldflags "-X main.version=0.1.0-dev" -o bin/http-relay-gateway ./cmd/http-relay-gateway` | Build the binary                                                                                                                        |
+| `pnpm format` / `pnpm format:check`                                                                | Prettier over the docs, workflows, and config files                                                                                     |
 
 ## What the hooks do
 
@@ -79,15 +79,17 @@ duplicate.
 
 - Unit tests live beside the code under `internal/`. E2E tests live under
   `e2e/` and drive the real binary as a subprocess, with in-process fake
-  edge relays answering on loopback. They need nothing but Go; skip them
-  with `-short` when iterating.
+  edge relays and fake platform APIs answering on loopback. They need
+  nothing but Go; skip them with `-short` when iterating.
 - A test that only pins the loud direction is not a test. This is an
   unauthenticated network hop whose whole job is hiding the caller: prefer
   the case where a change fails _quietly_ — a pin header that reaches the
-  edge relay, a failed reload that swaps configuration anyway, a body that
-  slips past a provider limit, a request retried after the response started.
-- E2E round-robin is deterministic: with all relays healthy, the served
-  sequence is exactly the config order, so tests can pin exact sequences.
+  edge relay, an unverified relay admitted to the pool, a failed reload
+  that swaps configuration anyway, a body that slips past a provider
+  limit, a request retried after the response started.
+- Round-robin is deterministic: with all relays healthy, the served
+  sequence is exactly pool order — sorted by `(provider, name)` — so tests
+  can pin exact sequences.
 
 ## Opening a pull request
 
@@ -108,7 +110,10 @@ commitlint on it before anything else matters.
 `feat`/`fix` commit updates an open release pull request; merging that pull
 request tags `v<version>` and publishes the Docker image to
 `ghcr.io/ecoma-io/http-relay-gateway` — both the version tag and `latest`,
-except that a prerelease never moves `latest`. A `Release-As: <version>`
+except that a prerelease never moves `latest`. The same release also
+rewrites the embedded worker version artifact
+(`internal/relayversion/version.json`), so a released gateway and the
+worker generation it deploys always move together. A `Release-As: <version>`
 footer on a commit forces a version once.
 
 ## Reporting problems

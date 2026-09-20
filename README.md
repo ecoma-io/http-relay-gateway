@@ -22,13 +22,27 @@ the target. But a bare list of relay URLs puts rotation, failover, health
 tracking, and per-platform body limits on every consumer.
 
 This gateway centralizes all of it: consumers point at **one** internal
-address, and the gateway owns the relay list, the rotation, the failover,
-the body limits, and admission. Everything is internal-network only —
-**there is no authentication**; the process is a sidecar and must never be
-exposed beyond its compose network.
+address, and the gateway owns the relay fleet — it deploys the relay workers
+onto your platform accounts, verifies them end to end before admitting them,
+rotates, fails over, and enforces the body limits. Everything is
+internal-network only — **the data plane has no authentication**; the
+process is a sidecar and must never be exposed beyond its compose network.
 
 Any HTTP client works: a curl one-liner, an app-side fetch wrapper, an AI
 gateway, a scraper.
+
+## The shape in one paragraph
+
+You declare **desired state** in one YAML file: which relays should exist
+(identity = provider + name) and which provider credential manages each.
+The gateway reconciles reality to that file: it discovers (or deploys) each
+relay's worker on the platform, verifies it end to end, and admits only
+verified relays to the serving pool. The file is re-read every second — edit
+it and the fleet follows; delete an entry and the gateway drains the relay
+and deletes the remote deployment. Nothing else holds state: no database, no
+admin UI, no API to manage. The file plus the environment it references
+_is_ the whole system; the process can be killed at any moment and rebuilds
+everything from scratch on boot.
 
 ## Wire contract
 
@@ -49,72 +63,209 @@ Authorization: Bearer $TARGET_TOKEN
 
 - The gateway picks the next **ready** relay and forwards method, body, and
   all end-to-end headers **verbatim** — the target's auth flows through
-  untouched.
-- `X-Relay-Provider` and hop-by-hop headers are stripped; `X-Forwarded-For`
-  is never added (hiding the client IP is the whole point).
-- `X-Relay-Provider` pins a provider (`vercel`, `cloudflare`, `deno`, …);
+  untouched. The relay key the gateway itself presents on the relay leg is
+  injected by the gateway and cannot be forged by a caller (below).
+- `X-Relay-Provider`, any client-supplied `X-Relay-Token`, and hop-by-hop
+  headers are stripped; `X-Forwarded-For` is never added — hiding the
+  client IP is the whole point.
+- `X-Relay-Provider` pins a provider (`vercel`, `cloudflare`, `deno`);
   empty, `none`, `auto`, or `all` round-robins across **every** provider.
-  The header beats the `/{provider}` path prefix. Unknown pins get `404` —
-  except while no relay is ready at all: an empty ready set answers `503`
-  for any pin, because configured-but-unverified and never-configured are
-  indistinguishable there and `503` is the retryable answer.
+  The header beats the `/{provider}` path prefix. An unknown pin answers
+  `404` — except while no relay is ready at all, where any pin answers the
+  retryable `503`, because configured-but-unverified and never-configured
+  are indistinguishable there.
+- Round-robin is deterministic: one cursor per selector key (pinned
+  `vercel` traffic never skews the all-providers rotation), and with all
+  relays healthy the served sequence is exactly pool order — sorted by
+  `(provider, name)` — so tests can pin exact sequences.
 - Responses stream straight through with a flush per write, so SSE chunks
   reach the client immediately.
-- Failover happens only while the failure is still a transport error (before
-  any response byte). Once the relay answered, the response is never retried.
-- `GET /healthz` → `ok` (process liveness); `GET /readyz` → `200` once at
-  least one relay has passed its readiness gate, `503` before that;
-  `GET /stats` → JSON pool snapshot (version, per-relay health, requests,
-  failures, max-body, readiness + lifecycle).
+- Failover happens only while the failure is still a transport error
+  (before any response byte). Once the relay answered, the response is
+  never retried.
 
-### Readiness gate
+### The relay key
 
-A relay serves traffic only after it _proves_ it can: its deployment answers
-on its origin, carries the expected worker version, and completes a forwarded
-request through its own relay URL end to end (relay key included). Every
-relay's lifecycle is tracked in memory and surfaced on `/stats`:
+The gateway authenticates to **its own** relay workers with one global
+relay key (`RELAY_AUTH_TOKEN` or `RELAY_AUTH_TOKEN_FILE`; the process
+refuses to boot without exactly one). It is injected into every worker at
+deploy time; a worker answers `404` to any request that does not carry it
+on `X-Relay-Token`. The key is therefore not a caller credential — callers
+stay unauthenticated — it is what keeps a stranger who discovers a relay
+URL from using your deployment as their proxy. Rotating it means changing
+the environment and restarting; every relay then redeploys (the old key is
+rejected, which classifies as drift a deploy fixes).
 
-| State        | Meaning                                                                 |
-| ------------ | ----------------------------------------------------------------------- |
-| `configured` | Row exists; first verification pending                                  |
-| `discovered` | Legacy relay (no platform account); probing                             |
-| `deploying`  | A deploy/redeploy is in flight (single-flight per relay)                |
-| `verifying`  | Version + forward probe in progress                                     |
-| `ready`      | Gate passed; admitted to the pool; round-robins traffic                 |
-| `unready`    | Was serving, then failed verification `DemoteAfter` times consecutively |
-| `failed`     | Never served; verification keeps failing (backoff-gated retries)        |
-| `removing`   | Deleted; held 30s before the registry purges it                         |
+### Endpoints
 
-Verification runs on its own cadence and after every reconcile pass.
-Failures are exponential-backoff gated and never crash the process; while
-_nothing_ is ready the retry delay is capped harder so a total outage heals
-quickly, and a relay that recovers re-enters the pool on the next pass — no
-restart, no manual intervention. Transient probe failures demote (`unready`)
-and never trigger a redeploy; a version mismatch or a wrong relay key _does_
-queue a redeploy, so a stale worker replaces itself with fresh configuration.
-Legacy relays are readiness-probed only — never version-probed, never
-redeployed.
+| Endpoint             | Meaning                                                                                |
+| -------------------- | -------------------------------------------------------------------------------------- |
+| `/healthz`           | `200` + `ok` — process liveness; answers even with zero ready relays                   |
+| `/readyz`            | `200` once at least one relay has passed the readiness gate, else `503`                |
+| `/stats`             | JSON snapshot: versions, per-relay health + counters, lifecycle — never URLs or tokens |
+| `/{provider}` or `/` | the relay spec (above); `/{provider}` pins, `/` round-robins all                       |
 
-Two layers of truth. The database `active` flag records deployment currency:
-it stays `Active` through auth/probe failures so an operator can see what is
-deployed and why it is not serving. The in-memory readiness gate decides
-admission. A relay that fails its forward probe stays `Active` in the
-database but is not `ready`, and appears in `/stats` lifecycle with its
-failure reason instead of in the serving pool.
+`/stats` example:
 
-Zero-ready behavior: `/readyz` answers `503`, `/healthz` still answers `ok`
-(the process is alive — no relay is), the data plane answers `503` for every
-request including pinned ones, and `/stats` reports readiness `false` with an
-empty relay list. Round-robin requests alternate only over the _ready_ set,
-in configuration order.
+```json
+{
+  "version": "0.1.0-dev",
+  "relayVersion": "1.0.0",
+  "relays": [
+    {
+      "name": "relay-a",
+      "provider": "vercel",
+      "healthy": true,
+      "maxBody": 4500000,
+      "requests": 12,
+      "failures": 0
+    }
+  ],
+  "readiness": { "ready": true, "readyRelays": 1 },
+  "lifecycle": [{ "name": "relay-a", "provider": "vercel", "state": "ready", "generation": 1 }]
+}
+```
+
+## Readiness gate
+
+A relay serves traffic only after it _proves_ it can. The proof, in order:
+
+1. the deployment exists and answers on its origin (discovered from the
+   provider, never configured);
+2. it answers `/__relay/version` with the worker generation this binary
+   deploys (`relayVersion` on `/stats`);
+3. it accepts the relay key; and
+4. a relay-spec request forwarded **through the relay's own URL** round
+   trips end to end.
+
+Every probe rides the same no-proxy transport the data plane uses — a probe
+that could succeed via `HTTP_PROXY` while production fails direct would
+make readiness lie. The self-origin probe is honest precisely because the
+relay's upstream is controlled (the worker this binary ships); documented
+limitation: it proves the relay forwards, not that any particular caller
+target is reachable.
+
+Lifecycle is tracked in memory and rendered on `/stats`:
+
+| State         | Meaning                                                      |
+| ------------- | ------------------------------------------------------------ |
+| `configured`  | Desired; discovery pending                                   |
+| `discovering` | Resolving the deployment from the provider                   |
+| `discovered`  | Deployment located; verification pending                     |
+| `deploying`   | A deploy/redeploy is in flight (single-flight per relay)     |
+| `verifying`   | Version + forwarded probe in progress                        |
+| `ready`       | Gate passed; admitted to the pool; round-robins traffic      |
+| `unready`     | Was serving; verification failed `verify_demote_after` times |
+| `failed`      | Never verified; retries under backoff                        |
+| `paused`      | The platform answers instead of the worker (suspension)      |
+| `removing`    | Left the desired config; remote delete in flight             |
+
+Why a relay is not ready (`reason` on `/stats`):
+
+| Reason              | Meaning                                                      |
+| ------------------- | ------------------------------------------------------------ |
+| `unreachable`       | No HTTP answer at all (cold start, network blip)             |
+| `version_failed`    | Answers a different worker version                           |
+| `auth_failed`       | Rejected the relay key                                       |
+| `probe_failed`      | The forwarding round trip did not complete                   |
+| `missing`           | No deployment exists for this identity (deploy queued)       |
+| `deploy_failed`     | The platform deploy errored                                  |
+| `credential_failed` | Provider credential rejected, ambiguous scope, or unreadable |
+| `paused`            | The platform suspended the deployment                        |
+| `replacing`         | Admission revoked on purpose: a replacement is in flight     |
+| `delete_failed`     | The remote delete errored; retried under backoff             |
+
+Verification runs on `verify_interval` and after every configuration
+change. Failures are exponential-backoff gated (`verify_backoff_base`
+doubling to `verify_backoff_max`) and never crash the process; while
+_nothing_ is ready the retry delay is capped harder (`verify_recover_max`)
+so a total outage heals quickly. A relay that recovers re-enters the pool
+on the next pass — no restart, no manual intervention.
+
+Zero-ready behavior: `/readyz` answers `503`, `/healthz` still answers
+`ok` (the process is alive — no relay is), the data plane answers `503`
+for every request including pinned ones, and `/stats` reports
+`readiness.ready: false` with an empty relay list.
+
+### What each probe answer does
+
+| Probe observation                                               | Verdict        | Action                                           |
+| --------------------------------------------------------------- | -------------- | ------------------------------------------------ |
+| No HTTP answer                                                  | unreachable    | retry under backoff — **never redeploy**         |
+| Platform suspension page (Vercel `402` / `DEPLOYMENT_DISABLED`) | paused         | out of the pool; re-probe on the revival cadence |
+| Answers, but is not our worker (no version)                     | missing worker | redeploy                                         |
+| Worker answers with a stale version                             | drift          | redeploy                                         |
+| Worker rejects the relay key                                    | key drift      | redeploy with the current key                    |
+| Worker ok, but the round trip fails on its side                 | probe failure  | retry under backoff                              |
+
+The split is deliberate: transport failures and broken round trips may be
+transient, so they demote and back off — a redeploy is never fired on a
+hunch. Version drift, a missing worker, and a rejected key are exact, known
+fixes, so they queue a replacement. A platform suspension cannot be lifted
+by any deploy, so the relay pauses instead: no client is ever served the
+platform's page, and the revival scan (`revive_scan_interval`) re-probes
+until the worker answers again — the relay rejoins automatically, or queues
+a catch-up redeploy first if the fleet version moved on while it was dark.
+
+### Two layers of health
+
+The readiness gate above is the **verified** layer: slow, control-plane
+work that decides membership. Beneath it, the pool keeps a **passive**
+layer: `failure_threshold` consecutive transport failures put a relay on
+`cooldown` and it is skipped until the cooldown expires (half-open
+recovery); interleaved successes reset the streak. Passive failures skip a
+relay — they never change membership; the verified layer owns that. When
+every candidate is down, the pool still returns one (best effort beats a
+`503` when the whole fleet is having a bad minute).
+
+### Replacements (Strategy A)
+
+When a serving relay must be redeployed — version drift, key rotation, a
+missing worker — the rollout runs in this exact order:
+
+1. **Demote**: the relay's admission is revoked (`replacing`), so the next
+   pool rebuild excludes it.
+2. **Settle**: the gateway waits for that pool swap to be applied.
+3. **Drain**: it waits for the old incarnation's in-flight requests to
+   finish (bounded by a per-attempt quiesce window; a request that outlives
+   it defers the replacement to the next pass).
+4. **Deploy**: only then is the new worker pushed, because the platform
+   switches what answers on the project's one production URL mid-deploy —
+   an old admission left standing would serve whatever lands on that URL
+   next, verified or not.
+5. **Verify**: the new worker must pass the full gate before admission
+   returns. A replacement that fails verification stays out — a failing
+   verification may never keep serving.
+
+A single-relay fleet therefore has a brief zero-ready window during its own
+replacement (`503`, retryable). That is accepted by design: the alternative
+is serving unverified content from the URL a deploy just switched.
+
+### Removal
+
+Delete an entry from the desired-state file and the relay's admission is
+revoked immediately; the gateway waits for the pool swap and the drain of
+in-flight requests, then deletes the remote deployment from the platform
+(a `404` counts as success — the desired end state is "the remote does not
+exist"), then forgets the relay. A failed delete retries under backoff
+(`delete_failed`). Re-adding the entry mid-delete is safe: every relay has
+an incarnation counter (its `generation` on `/stats`) that bumps on removal
+and re-add, so the stale delete's completion is discarded and the new
+incarnation cannot deploy until the old project has actually been deleted.
+Provider credentials for deletes are remembered in memory; if the process
+restarts while an entry is absent from the file, the remote is left behind
+with a warning — the gateway never guesses a deletion.
 
 ### Body limits
 
 Edge platforms cap request bodies themselves (Vercel ~4.5 MB, Cloudflare
-~100 MB). The gateway buffers a body up to the largest configured provider
-limit, then enforces the picked relay's per-provider limit by _skipping_ to
-a provider that accepts the body. `413` is returned only when the pin leaves
-no accepting provider or the body exceeds every configured limit.
+~100 MB, Deno Deploy matched at 100 MB). The gateway buffers a body up to
+the largest provider limit, then enforces the picked relay's per-provider
+limit by _skipping_ to a provider that accepts the body. `413` is returned
+only when the pin leaves no accepting provider or the body exceeds every
+provider limit. Above `stream_threshold_bytes` a body is relayed live
+instead — one attempt, no failover (the body is consumed), and no
+gateway-side `413`.
 
 ### Proxy inbound
 
@@ -123,128 +274,108 @@ through the gateway (`--proxy`, `HTTP_PROXY`, any library's proxy setting)
 hits the same pool. Routing intent is read from the absolute-form request
 target itself — the gateway derives `X-Relay-Target` (scheme + host) and
 `X-Relay-Path` (path + query) from the URL — so client-supplied values of
-those two headers are **overwritten**, never trusted. The provider pin is
-header-only in proxy mode (`X-Relay-Provider`); the `/{provider}` prefix is a
-relay-spec feature and has no meaning here — the target's path belongs to the
-target. `CONNECT` tunneling is not supported (edge relays carry HTTP, not raw
-TCP) and is answered `501`; an absolute-form `https://` target works as an
-ordinary request because the relay itself fetches the target:
+those two headers are **overwritten**, never trusted (no smuggling). The
+provider pin is header-only in proxy mode (`X-Relay-Provider`); the
+`/{provider}` prefix is a relay-spec feature and has no meaning here — the
+target's path belongs to the target. `CONNECT` tunneling is not supported
+(edge relays carry HTTP, not raw TCP) and is answered `501`; an
+absolute-form `https://` target works as an ordinary request because the
+relay itself fetches the target:
 
 ```bash
 curl --proxy http://relay-gateway:20130 http://api.example.com/v1/chat \
   -H 'Authorization: Bearer $TARGET_TOKEN'
 ```
 
-## Configure
+Control endpoints answer origin-form only — a proxy-form `/healthz` targets
+some other host and relays, it does not shadow.
 
-Everything dynamic — relays, providers, runtime settings — lives in the
-SQLite database and is managed through the **admin plane** (`ADMIN_ADDR`,
-REST at `/api/v1` plus a built-in UI). The data plane itself stays
-unauthenticated; the admin plane is not.
+## Desired state
 
-- **First run**: an empty database puts the admin API in setup mode —
-  `POST /api/v1/setup` with a password (min 8 chars, sent twice) creates the
-  one admin account and issues a session cookie. Setup is once-ever; every
-  later access logs in first (`POST /api/v1/login`). Passwords are stored as
-  bcrypt hashes; sessions are signed HS256 JWTs in an `HttpOnly` cookie
-  valid 12h.
-- **Logins are rate-limited**: 5 failed attempts per 15 minutes per source
-  address, plus a global cap, then `429` + `Retry-After` — including for the
-  correct password, by design.
-- **Relays**: `POST /api/v1/relays` with `name`, `provider`, `url`. A relay
-  serves from its URL immediately; platform deployments attach later and
-  then supply the relay's authentication token. Provider labels are free-form
-  (`vercel`, `cloudflare`, `deno`, or your own); body limits attach to the
-  label via `PUT /api/v1/providers`. Creating a relay with `accountId` births
-  it as **managed**: the gateway deploys its embedded worker to that platform
-  account and serves the deployment URL with a deploy-time token. A relay
-  created without one is **legacy** — it serves its own URL tokenless, and
-  `POST /api/v1/relays/{id}/adopt` (with an `accountId`) migrates it to a
-  managed deployment.
-- **Platform accounts**: `POST /api/v1/accounts` stores a platform API token
-  (verified against the platform before it is accepted, shown last-4 only
-  ever after). `POST /api/v1/relays/{id}/redeploy` redeploys a managed
-  relay's worker with a fresh token; `DELETE /api/v1/relays/{id}
-?deleteRemote=true` also deletes the deployed worker from the platform.
-  A failed redeploy never pulls a serving relay out of rotation — the old
-  deployment keeps serving with the failure recorded on the row.
-- **Fleet**: `GET /api/v1/fleet/version` reports the embedded worker version
-  and per-platform deployment counts; `POST /api/v1/fleet/check` probes every
-  deployment and records drift; `POST /api/v1/fleet/reconcile` also redeploys
-  deployments whose reported version differs from the gateway's — how the
-  fleet upgrades (or downgrades) with the gateway. Startup probes run
-  automatically; an unreachable relay is never redeployed on a hunch.
-- **Platform pauses**: when a platform answers a probe but the relay worker
-  does not — the suspension page free tiers serve after quota exhaustion
-  (Vercel: HTTP 402, `x-vercel-error: DEPLOYMENT_DISABLED`) — the deployment
-  is marked `paused` and the relay leaves the pool: no deploy could lift a
-  platform suspension, and no client is ever served the platform's page.
-  This verdict is relay-side by construction: the probe only ever contacts
-  the relay's own `/__relay/version` endpoint, so it can never mistake an
-  upstream error for a pause. An always-on revival scan re-probes paused
-  deployments roughly every 10 minutes, independent of the reconcile
-  interval; when the worker answers again the relay rejoins automatically
-  (or queues a catch-up redeploy if the fleet version moved on while it was
-  dark). While paused, the relay's row shows the platform's marker.
-- **Settings**: `GET`/`PATCH /api/v1/settings` — log level, retry/cooldown
-  knobs, streaming threshold, transport timeouts, reconcile interval. Unknown
-  keys are rejected.
+One YAML file (default `./config.yaml`, `CONFIG_FILE` to move it) is the
+only source of intent:
 
-Bind `ADMIN_ADDR` to loopback (the default `127.0.0.1:20131`) and front it
-with an authenticating proxy if it must be reachable remotely. Never expose
-the admin plane bare.
+```yaml
+settings:
+  log_level: info # debug | info | warn | error
+  max_retries: 2 # failover attempts beyond the first
+  stream_threshold_bytes: 0 # bodies above this stream; 0 = always buffer
 
-### Bringing an existing relay list
+relays:
+  - name: relay-a
+    provider: vercel
+    token: ${VERCEL_TOKEN} # ${VAR} resolved from the environment at load
+    team: my-team # optional vercel scope pin
+  - name: relay-b
+    provider: cloudflare
+    token_file: /run/secrets/cf-token
+    account: "023e105f4ecef8ad9ca31a8372d0c353" # optional cloudflare account pin
+  - name: relay-c
+    provider: deno
+    token: ${DENO_TOKEN}
+```
 
-`POST /api/v1/relays/import` takes `{items: [{name, provider, url, active?}]}`
-(500 per batch) and lands what it can: each row is validated and inserted on
-its own, and the reply reports `{imported, rejected}` so a typo never fails a
-whole migration. Imported relays serve their own URLs immediately and are
-**unmanaged** — no worker, no token. To move one behind a deployed
-worker, create a platform account and `POST /api/v1/relays/{id}/adopt` with
-the `accountId`: the embedded worker deploys, the URL is verified, and only a
-verified success flips the relay to managed. The UI carries the same flow —
-_Import_ on the Relays page, _Adopt_ on any unmanaged row.
+A relay is exactly four things: its **name** (identity, ≤ 128 chars), its
+**provider** (`vercel` | `cloudflare` | `deno` — hard-coded), the provider
+credential that manages its deployment, and an optional scope pin.
+Everything else is derived: the platform project slug comes from the name
+(lowercase letters, digits, dashes; ≤ 40 chars; two names that would slug
+to the same project on one provider are rejected at load), and the serving
+URL is discovered from the provider — never configured. Unknown YAML keys
+are rejected (a typo must be loud); duplicate names are rejected.
 
-### Live reconfiguration
+Credentials: `token` and `token_file` are mutually exclusive; use at least
+one. A `token` may embed `${VAR}` references — an unset or empty variable
+rejects the load, so a credential never silently resolves to nothing. A
+`token_file` names a file whose trimmed content is the credential; both
+token files and the relay key file are **re-read every reconcile pass**, so
+rotating a secret is dropping a new file in place — no restart, no config
+touch. Scope pins: `team` (vercel only) names the team scope when the token
+can reach more than one; `account` (cloudflare only) pins the account id —
+a cloudflare token that sees exactly one account resolves it automatically,
+anything more ambiguous requires the explicit pin (deno is user-scoped and
+needs none).
 
-Every accepted admin mutation writes to the database, which signals a
-coalesced change; the process rebuilds one immutable pool generation from
-the database and swaps it atomically — in-flight requests finish on their
-original generation, and pool health counters restart with the new pool
-(`configuration reloaded` in the log). A rejected mutation (validation,
-conflicts) changes nothing: the last-known-good pool keeps serving. No
-config file, no reload signal, no restart.
+The poller re-reads the file every second and compares content hashes — a
+design, not a gap: no inotify, and unlike a watcher it cannot miss events
+on bind mounts. A valid new file becomes the desired state; an invalid one
+is logged and ignored, so the last-known-good fleet keeps serving. The file
+being absent at boot is fine: the gateway starts with an empty fleet
+(`/readyz` answers `503`) and reconciles the moment the file appears.
+Delete the file mid-run and the fleet treats every relay as removed (see
+[Removal](#removal)) — back the file up; it plus the referenced
+environment is the whole system.
 
-### Environment (bootstrap-only, restart to change)
+### Settings
 
-| Env                          |           Default | Meaning                                                      |
-| ---------------------------- | ----------------: | ------------------------------------------------------------ |
-| `LISTEN_ADDR`                |           `:8080` | Relay endpoint (also serves `/healthz`, `/readyz`, `/stats`) |
-| `ADMIN_ADDR`                 | `127.0.0.1:20131` | Admin plane listener (REST API + UI)                         |
-| `DATA_FILE`                  | `data/gateway.db` | SQLite database — the source of truth                        |
-| `SHUTDOWN_GRACE`             |             `20s` | Whole-process drain budget for graceful shutdown             |
-| `ADMIN_COOKIE_SECURE`        |           `false` | Set `true` when the admin plane terminates HTTPS             |
-| `RELAY_VERIFY_INTERVAL`      |             `60s` | Readiness verification scan cadence                          |
-| `RELAY_REVIVE_SCAN_INTERVAL` |             `10m` | Paused-deployment revival scan cadence                       |
-| `RELAY_VERIFY_BACKOFF_BASE`  |              `5s` | First verification-failure retry delay                       |
-| `RELAY_VERIFY_BACKOFF_MAX`   |              `5m` | Exponential retry ceiling                                    |
-| `RELAY_VERIFY_RECOVER_MAX`   |             `15s` | Retry ceiling while no relay is ready                        |
-| `RELAY_VERIFY_DEMOTE_AFTER`  |               `3` | Consecutive failures before a serving relay demotes          |
+Every key is optional; absent keys take the default. Malformed values are
+load errors, never silent defaults.
 
-### State
+| Key                       | Default | Meaning                                                          |
+| ------------------------- | ------- | ---------------------------------------------------------------- |
+| `log_level`               | `info`  | `debug` \| `info` \| `warn` \| `error`                           |
+| `max_retries`             | `2`     | Failover attempts beyond the first (0–16)                        |
+| `failure_threshold`       | `3`     | Consecutive passive failures before cooldown                     |
+| `cooldown`                | `30s`   | Passive-health cooldown after the failure threshold              |
+| `stream_threshold_bytes`  | `0`     | Bodies above this stream through; `0` = always buffer            |
+| `dial_timeout`            | `5s`    | Outbound dial timeout (relay legs and probes)                    |
+| `response_header_timeout` | `0`     | Response-header timeout; `0` = off                               |
+| `verify_interval`         | `60s`   | Readiness re-verification cadence                                |
+| `revive_scan_interval`    | `10m`   | Paused-relay revival probe cadence                               |
+| `verify_backoff_base`     | `5s`    | First verification-failure retry delay                           |
+| `verify_backoff_max`      | `5m`    | Exponential retry ceiling                                        |
+| `verify_recover_max`      | `15s`   | Retry ceiling while no relay is ready                            |
+| `verify_demote_after`     | `3`     | Consecutive verification failures before a serving relay demotes |
 
-Relays, providers, settings, platform accounts and deployments all live in
-the SQLite database at `DATA_FILE` — the database is the only durable state.
-Readiness is in-memory: the registry mirrors the database relay set on every
-rebuild, re-announcing rows as configured-but-unverified, so after a restart
-every relay re-proves itself before serving. That is the correct posture for
-a sidecar whose pool must always be verified. Delete the file and the gateway
-boots empty (setup mode, `/readyz` answers `503` until a relay verifies).
-Admin credentials are database rows too: the bcrypt password hash and the JWT
-signing secret survive restarts, so sessions stay valid across one. The
-database enables WAL journaling: put `DATA_FILE` on a filesystem that supports
-it, and back the file up — it is the whole system.
+## Environment (bootstrap-only, restart to change)
+
+| Env                     |       Default | Meaning                                                                       |
+| ----------------------- | ------------: | ----------------------------------------------------------------------------- |
+| `LISTEN_ADDR`           |       `:8080` | Relay endpoint; also serves `/healthz`, `/readyz`, `/stats`                   |
+| `CONFIG_FILE`           | `config.yaml` | Desired-state file the poller watches                                         |
+| `RELAY_AUTH_TOKEN`      |             — | The relay key workers authenticate with; exactly one of these two is required |
+| `RELAY_AUTH_TOKEN_FILE` |             — | File whose trimmed content is the relay key                                   |
+| `SHUTDOWN_GRACE`        |         `20s` | Whole-process drain budget for graceful shutdown                              |
 
 ## Run
 
@@ -252,21 +383,22 @@ it, and back the file up — it is the whole system.
 gofmt -w . && go vet ./... && go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/http-relay-gateway ./cmd/http-relay-gateway
 
-LISTEN_ADDR=0.0.0.0:20130 ADMIN_ADDR=127.0.0.1:20131 ./bin/http-relay-gateway
-# then: open http://127.0.0.1:20131/ — first visit offers the setup form
+LISTEN_ADDR=0.0.0.0:20130 RELAY_AUTH_TOKEN_FILE=./relay.key ./bin/http-relay-gateway
 ```
 
 Subcommands: `http-relay-gateway version` prints the build version;
 `http-relay-gateway healthcheck` probes `LISTEN_ADDR` and asserts the
 `/healthz` body — this is what the Docker HEALTHCHECK runs, since the
-scratch image has no shell.
+scratch image has no shell; `http-relay-gateway readinesscheck` asserts
+`/readyz` answers `200` — for orchestrators that gate traffic on a
+verified fleet rather than a live process.
 
 ## Pointing a client at it
 
 Any HTTP client speaks the contract with two headers:
 
 ```bash
-curl -x '' http://relay-gateway:20130/vercel \
+curl http://relay-gateway:20130/vercel \
   -H 'X-Relay-Target: https://api.example.com' \
   -H 'X-Relay-Path: /v1/chat' \
   -H "Authorization: Bearer $TARGET_TOKEN" \
@@ -279,6 +411,26 @@ nothing. Anything with a configurable relay/base URL points at
 `http://relay-gateway:20130/vercel` pinned to one. Both sides should join
 the same compose network.
 
+## Security posture
+
+- The data plane authenticates **no one** — it is an internal-network
+  sidecar, and its security boundary is network placement. Never publish it
+  beyond the compose network.
+- The relay key guards the workers, not the gateway: a stranger who finds a
+  relay URL still cannot use it without the key, and the key is injected at
+  deploy time and presented only on the relay leg — a caller-supplied
+  `X-Relay-Token` is stripped.
+- `X-Forwarded-For` is never added and the pin header never reaches the
+  relay: the edge platform sees the gateway's egress, never yours.
+- Relay URLs and provider tokens never appear in logs, `/stats`, or error
+  text (error text is sanitized and bounded); secrets live in the
+  environment or secret files, referenced from the desired-state file —
+  never committed.
+- Provider credentials travel to the platform management APIs only; relay
+  legs and probes ride a no-proxy transport.
+- Anything security-shaped goes through [SECURITY.md](SECURITY.md) — a
+  private advisory, never a public issue.
+
 ## Docker
 
 ```bash
@@ -288,30 +440,35 @@ docker compose up -d --build
 curl http://127.0.0.1:20130/stats
 ```
 
-`compose.yaml` publishes the relay endpoint on host **20130** and the admin
-plane on host loopback **127.0.0.1:20131**, keeps the database in a named
-volume, defaults to bounded `json-file` logs, keeps `stop_grace_period`
-(30s) above `SHUTDOWN_GRACE` (default 20s), and uses the binary
-`healthcheck` subcommand (no shell in the scratch image). On the volume:
-uid 65532 owns the database files — a bind mount needs a writable,
-chowned directory, which is why the named volume is the default.
+The image is `scratch`: one static binary plus the CA bundle, running as
+uid 65532. `ENV CONFIG_FILE=/app/config.yaml` is set in-image because
+scratch has no WORKDIR. `compose.yaml` publishes host **20130** only,
+bind-mounts `./config.yaml` read-only into the container, requires
+`RELAY_AUTH_TOKEN` from the environment, keeps `stop_grace_period` (30s)
+above `SHUTDOWN_GRACE` (default 20s), bounds `json-file` logs, and uses the
+binary `healthcheck` subcommand (no shell in the image).
 
 ## Layout
 
-- `cmd/http-relay-gateway` — lifecycle, signals, the apply loop that turns
-  database changes into pool swaps, `version` / `healthcheck`
-- `internal/config` — bootstrap environment only (`LISTEN_ADDR`,
-  `ADMIN_ADDR`, `DATA_FILE`, `SHUTDOWN_GRACE`, `ADMIN_COOKIE_SECURE`)
-- `internal/store` — SQLite persistence: embedded migrations, relays,
-  providers, settings, admin credentials, coalesced change channel
-- `internal/admin` — admin plane: cookie-session auth (bcrypt + JWT), login
-  rate limiting, setup-once flow, the `/api/v1` REST surface
-- `internal/readiness` — in-memory relay lifecycle registry: states,
-  single-flight deploys, backoff-gated verification, pool admission
-- `internal/reconcile` — fleet worker: verification passes, redeploys,
-  adoptions, the paused-deployment revival scan
-- `internal/gateway` — HTTP data plane: provider selection, bounded failover, streaming pass-through, `/healthz` + `/readyz` + `/stats`
-- `internal/pool` — per-selector round-robin cursors, passive health (threshold → cooldown → half-open), stats snapshots
-- `internal/logging`, `internal/sanitize` — zerolog setup and redaction helpers shared by all log/error paths
-- `e2e` — black-box tests driving the real binary as a subprocess with fake
-  edge-relay servers; `go test ./e2e/` (skip with `-short`)
+- `cmd/http-relay-gateway` — lifecycle, signals, the config poller, the
+  apply loop that turns registry notifications into atomic pool swaps, and
+  `version` / `healthcheck` / `readinesscheck`
+- `internal/config` — the desired-state file (strict YAML, `${VAR}`
+  interpolation, validation) and the bootstrap environment
+- `internal/deploy` — the platform deployers (vercel/cloudflare/deno):
+  discovery, deploy, delete, scope pins, probes; `deploy/workers` holds the
+  embedded relay workers shipped to every platform
+- `internal/readiness` — the in-memory admission gate: lifecycle states,
+  incarnations, single-flight, backoff, the verified serving snapshot
+- `internal/reconcile` — the desired-state worker: sync, deletes,
+  probe classification, redeploys, Strategy A replacements, the revival scan
+- `internal/gateway` — HTTP data plane: pinning, bounded failover,
+  streaming pass-through, in-flight drain, `/healthz` + `/readyz` + `/stats`
+- `internal/pool` — the serving set: per-selector round-robin cursors,
+  passive health, stats snapshots
+- `internal/relayversion` — the release-managed worker version artifact
+- `internal/logging`, `internal/sanitize` — zerolog setup and redaction
+  helpers shared by all log/error paths
+- `e2e` — black-box tests and sims driving the real binary as a subprocess
+  with in-process fake edge relays and fake platform APIs; `go test ./e2e/`
+  (skip with `-short`)

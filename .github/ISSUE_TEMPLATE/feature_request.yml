@@ -21,8 +21,11 @@ body:
           only (origin in `X-Relay-Target`, path in `X-Relay-Path`);
           no path rewriting, no TLS termination, no static routing.
         - Manual reload triggers (SIGHUP, filesystem events) — the 1s
-          content-hash poller is a design, not a gap; see README "Hot
-          reload" for the bind-mount blind spot no watcher fixes.
+          content-hash poller is a design, not a gap; see README "Desired
+          state" for the bind-mount blind spot no watcher fixes.
+        - A database or admin API — the desired-state file is the only
+          source of intent; runtime state is in-memory and rebuilt from
+          scratch on every boot.
   - type: checkboxes
     id: before-filing
     attributes:
