@@ -456,13 +456,18 @@ func (r *Registry) Failing(key Key, generation uint64, reason string, duration t
 	e.record.LastResult = duration
 	e.record.FailStreak++
 	e.record.Reason = reason
-	r.backoffLocked(e, now)
 	if !e.serving {
+		if e.record.State == StatePaused {
+			// A non-suspension answer during a pause (a generic 5xx, a
+			// transport blip) must not erode the revival cadence into the
+			// ordinary backoff: keep the pause gate at PauseRetry until a
+			// marked suspension answer or revival re-arms it.
+			e.nextTry = now.Add(r.cfg.PauseRetry)
+			return
+		}
 		switch e.record.State {
 		case StateUnready, StateFailed:
 			// already labeled; keep the phase stable across retries
-		case StatePaused:
-			// the revival scan owns paused relays; refresh the reason only
 		default:
 			e.record.State = StateFailed
 			e.record.Since = now
@@ -472,16 +477,24 @@ func (r *Registry) Failing(key Key, generation uint64, reason string, duration t
 			// at one pending rebuild per burst anyway.
 			r.notifyLocked()
 		}
+		r.backoffLocked(e, now)
 		return
 	}
 	if e.record.FailStreak < r.cfg.DemoteAfter {
-		// One or two blips do not pull a verified relay out of rotation.
+		// One or two blips do not pull a verified relay out of rotation,
+		// but the failed attempt still arms the retry gate.
+		r.backoffLocked(e, now)
 		return
 	}
+	// The streak is spent: revoke admission first, THEN arm the gate — the
+	// demotion itself must see readyCount drop before the gate is computed,
+	// or the last relay to fail in a total outage arms its first retry
+	// outside the RecoverMax ceiling and the outage heals slowly.
 	e.serving = false
 	r.readyCount--
 	e.record.State = StateUnready
 	e.record.Since = now
+	r.backoffLocked(e, now)
 	r.notifyLocked()
 }
 
@@ -503,19 +516,23 @@ func (r *Registry) Demote(key Key, generation uint64, reason string) {
 	e.record.LastAttempt = now
 	e.record.Reason = reason
 	e.record.FailStreak = r.cfg.DemoteAfter
-	r.backoffLocked(e, now)
 	if !e.serving {
 		if e.record.State != StateUnready && e.record.State != StateFailed {
 			e.record.State = StateFailed
 			e.record.Since = now
 			r.notifyLocked()
 		}
+		r.backoffLocked(e, now)
 		return
 	}
+	// Revoke admission before arming the gate: the demotion must count in
+	// readyCount when the gate is computed, so a demotion that empties the
+	// serving set gets the RecoverMax ceiling on its very first retry.
 	e.serving = false
 	r.readyCount--
 	e.record.State = StateUnready
 	e.record.Since = now
+	r.backoffLocked(e, now)
 	r.notifyLocked()
 }
 

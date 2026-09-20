@@ -593,16 +593,17 @@ func TestDefaultsTakeTheDocumentedValues(t *testing.T) {
 		t.Fatal("relay still serving after three failures at the default threshold")
 	}
 
-	// After the demote the gate is armed at 3 failures × 5s default base =
-	// 20s. The gate was computed while the relay still counted as ready, so
-	// the 15s RecoverMax did not apply to this final failure.
-	c.Advance(19 * time.Second)
+	// After the demote the fleet sits at zero-ready: the relay dropped out
+	// of readyCount before the gate was computed, so the very first gate is
+	// capped at the default 15s RecoverMax — a total outage heals fast, not
+	// at the uncapped 3 × 5s = 20s.
+	c.Advance(14 * time.Second)
 	if r.Allow(keyA) {
-		t.Fatal("default backoff after three failures is not 3 × 5s")
+		t.Fatal("zero-ready demotion gate must be capped at the 15s RecoverMax")
 	}
 	c.Advance(1 * time.Second)
 	if !r.Allow(keyA) {
-		t.Fatal("relay still blocked after the full default backoff")
+		t.Fatal("relay still blocked after the RecoverMax ceiling")
 	}
 }
 
@@ -665,5 +666,59 @@ func TestConcurrencyKeepsCountersConsistent(t *testing.T) {
 		if ready[rec.Key] != r.IsReady(rec.Key) {
 			t.Fatalf("snapshot/serving disagreement for %v", rec.Key)
 		}
+	}
+}
+
+func TestDemoteIntoTotalOutageCapsTheFirstGateAtRecoverMax(t *testing.T) {
+	c := newClock()
+	// A base far above RecoverMax: if the demotion counted itself as ready
+	// when the gate was computed, the first gate would be 30s << 2 uncapped;
+	// the contract caps a total outage at RecoverMax from the very first
+	// retry.
+	r := New(Config{
+		BackoffBase: 30 * time.Second,
+		BackoffMax:  5 * time.Minute,
+		RecoverMax:  15 * time.Second,
+		PauseRetry:  10 * time.Minute,
+		DemoteAfter: 3,
+		Now:         c.Now,
+	})
+	r.Sync([]Key{keyA})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Demote(keyA, gen, ReasonReplacing)
+	c.Advance(14 * time.Second)
+	if r.Allow(keyA) {
+		t.Fatal("first gate after a total-outage demote exceeded RecoverMax")
+	}
+	c.Advance(1 * time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("RecoverMax ceiling did not release the retry gate")
+	}
+}
+
+func TestPausedRelayKeepsItsRevivalGateThroughOrdinaryFailures(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Pause(keyA, gen, ReasonPaused)
+
+	// A generic probe failure while paused must not erode the PauseRetry
+	// gate into ordinary backoff: the revival cadence holds until a marked
+	// suspension answer or the revival itself re-arms it.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if rec, _ := r.StateOf(keyA); rec.State != StatePaused {
+		t.Fatalf("state = %q, want paused", rec.State)
+	}
+	if r.Allow(keyA) {
+		t.Fatal("paused relay retry gate did not hold at PauseRetry after an ordinary failure")
+	}
+	c.Advance(8 * time.Second) // far beyond any ordinary backoff step
+	if r.Allow(keyA) {
+		t.Fatal("ordinary failure eroded the pause gate below PauseRetry")
+	}
+	c.Advance(10 * time.Minute) // past the PauseRetry cadence
+	if !r.Allow(keyA) {
+		t.Fatal("pause gate did not release at the PauseRetry cadence")
 	}
 }
