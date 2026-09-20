@@ -1,12 +1,20 @@
 // Command http-relay-gateway is a general-purpose HTTP relay manager: one
 // internal-network endpoint that forwards relay-spec requests
 // (X-Relay-Target / X-Relay-Path) through a health-aware, round-robin pool
-// of edge relays (Vercel / Deno Deploy / Cloudflare Worker apps), so any
-// client can hide its egress IP without managing a relay list itself.
+// of edge relays (Vercel / Deno Deploy / Cloudflare Workers), so any client
+// can hide its egress IP without managing a relay list itself.
+//
+// Desired state is one YAML file; everything dynamic is derived from it. The
+// watcher re-reads the file, the reconciler drives the remote fleet toward
+// it, the readiness registry gates admission, and the applier rebuilds the
+// serving pool from the registry's verified snapshot alone. There is no
+// database, no admin plane, no second source of truth.
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -14,12 +22,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"http-relay-gateway/internal/admin"
 	"http-relay-gateway/internal/config"
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/gateway"
@@ -28,8 +35,6 @@ import (
 	"http-relay-gateway/internal/readiness"
 	"http-relay-gateway/internal/reconcile"
 	"http-relay-gateway/internal/sanitize"
-	"http-relay-gateway/internal/store"
-	"http-relay-gateway/internal/web"
 
 	"github.com/rs/zerolog"
 )
@@ -50,45 +55,52 @@ func main() {
 			fmt.Println(version)
 			return
 		case "healthcheck":
-			os.Exit(healthcheck())
+			os.Exit(healthcheck("/healthz", "ok\n"))
+		case "readinesscheck":
+			os.Exit(healthcheck("/readyz", ""))
 		}
 	}
 	if err := run(); err != nil {
-		fatalLog.Error().Str("err", sanitize.ErrorString(err)).Msg("fatal")
+		fatalLog.Error().Str("error", sanitize.ErrorString(err)).Msg("fatal")
 		os.Exit(1)
 	}
 }
 
-// healthcheck probes the bootstrap-configured data-plane listener. It
-// deliberately does not read the database: a broken database or a pending
-// first-run setup must not fail Docker's health probe for a serving process.
-// The scratch image has no shell, so this subcommand is what the Docker
-// HEALTHCHECK runs.
-func healthcheck() int {
-	bootstrap, err := config.LoadBootstrap()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "bootstrap config:", sanitize.ErrorString(err))
-		return 1
+// healthcheck probes the data-plane listener. path selects the probe:
+// /healthz answers once the process serves (Docker's HEALTHCHECK — it must
+// not fail for an unverified fleet), /readyz only when at least one relay is
+// verified (orchestrators that gate traffic on it). Both are deliberately
+// lenient about bootstrap configuration: a probe reports what the process is
+// doing, it does not re-run config validation. The scratch image has no
+// shell, so these subcommands are what the container runs. wantBody pins the
+// expected body when non-empty (/healthz answers "ok\n"); /readyz matches on
+// status alone.
+func healthcheck(path, wantBody string) int {
+	addr := os.Getenv("LISTEN_ADDR")
+	if addr == "" {
+		addr = config.DefaultListenAddr
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(healthcheckURL(bootstrap.ListenAddr))
+	resp, err := client.Get(probeURL(addr, path))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck:", sanitize.ErrorString(err))
 		return 1
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
-	if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
+	if resp.StatusCode != http.StatusOK || (wantBody != "" && string(body) != wantBody) {
 		fmt.Fprintf(os.Stderr, "healthcheck: status %d, body %q\n", resp.StatusCode, body)
 		return 1
 	}
 	return 0
 }
 
-func healthcheckURL(addr string) string {
+// probeURL turns a listen address into the loopback URL a same-container
+// probe reaches it on.
+func probeURL(addr, path string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		panic(fmt.Sprintf("healthcheckURL requires a validated host:port address: %q", addr))
+		panic(fmt.Sprintf("probeURL requires a host:port address: %q", addr))
 	}
 	switch host {
 	case "", "0.0.0.0":
@@ -96,17 +108,7 @@ func healthcheckURL(addr string) string {
 	case "::":
 		host = "::1"
 	}
-	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: "/healthz"}).String()
-}
-
-// generation is one immutable serving snapshot derived from the database:
-// the fully resolved gateway state (pool, client, knobs) plus the values the
-// apply loop reads outside the hot path.
-type generation struct {
-	state      *gateway.State
-	logLevel   string
-	relays     int
-	configured int // database relay rows, ready or not — drives the startup warning
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: path}).String()
 }
 
 func run() error {
@@ -114,60 +116,104 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	db, err := store.Open(bootstrap.DataFile)
-	if err != nil {
-		return fmt.Errorf("open data store: %w", err)
+	log := logging.New(os.Stdout)
+
+	// The desired-state store holds the last successfully loaded
+	// configuration. A missing file at boot is a legal start (an empty fleet
+	// that self-heals when the file appears); an invalid reload keeps the
+	// last-known-good state serving and only logs.
+	store := newDesiredStore()
+	store.poll(bootstrap.ConfigFile, log)
+
+	// Boot-time tuning comes from the file when it loaded, from the defaults
+	// otherwise. The registry's backoff knobs are read here once (they shape
+	// in-flight retry state; changing them mid-run is a restart); cadences
+	// stay live through the store.
+	settings := config.DefaultSettings()
+	if cfg := store.get(); cfg != nil {
+		settings = cfg.Settings
 	}
-	defer func() { _ = db.Close() }()
-
-	log := setupDynamicLogger(initialLogLevel(db))
-
-	// The readiness registry is the admissions gate for the data plane: a
-	// relay joins the serving pool only after the reconciler has verified it
-	// end to end. Seeded from the rows already in the database, then fed by
-	// the reconciler's verify pass.
+	zerolog.SetGlobalLevel(parseZerologLevel(settings.LogLevel))
 	reg := readiness.New(readiness.Config{
-		BackoffBase: envDuration("RELAY_VERIFY_BACKOFF_BASE", 5*time.Second),
-		BackoffMax:  envDuration("RELAY_VERIFY_BACKOFF_MAX", 5*time.Minute),
-		RecoverMax:  envDuration("RELAY_VERIFY_RECOVER_MAX", 15*time.Second),
-		DemoteAfter: envInt("RELAY_VERIFY_DEMOTE_AFTER", 3),
+		BackoffBase: settings.VerifyBackoffBase,
+		BackoffMax:  settings.VerifyBackoffMax,
+		RecoverMax:  settings.VerifyRecoverMax,
+		DemoteAfter: settings.VerifyDemoteAfter,
+		PauseRetry:  settings.ReviveScanInterval,
 	})
-	// An empty database is a legal first boot: the admin plane serves the
-	// setup flow while the data plane answers 503 until the first relay
-	// exists. Only an unreadable database is fatal.
-	gen, err := buildGeneration(db, reg)
-	if err != nil {
-		return err
-	}
-	if gen.configured == 0 {
-		log.Warn().Msg("no relays configured; data plane returns 503 until a relay is created")
-	} else if gen.relays == 0 {
-		log.Warn().Msg("no relays ready; data plane returns 503 until a relay verifies end to end")
-	}
-	g := gateway.New(gen.state, version, deploy.RelayVersion, log)
 
-	// The fleet worker owns every deploy: startup probes, the periodic
-	// reconcile (interval read fresh each cycle so a settings change lands
-	// without a restart), and the admin plane's queue-and-return actions.
-	factory := deploy.NewFactory(nil)
-	rec := reconcile.Start(db, factory, log, func() int64 {
-		settings, err := db.Settings()
-		if err != nil {
-			return store.DefaultReconcileIntervalSeconds
+	g := gateway.New(buildState(reg, settings, log), version, deploy.RelayVersion, log)
+
+	// The apply loop is the only writer of the serving generation: registry
+	// notification (admission changed) or desired-state reload (settings
+	// changed) rebuild one immutable State from the registry's verified
+	// snapshot and swap it atomically. A rejected reload simply never fires
+	// this path — the last-known-good pool keeps serving.
+	//
+	// applied/cond implement the settle barrier the reconciler's Strategy A
+	// rollout waits on: after a demote it must know the pool swap that
+	// revokes the relay has actually landed before draining in-flight
+	// requests. applied only ever records a seq whose changes the snapshot
+	// already included, so the barrier errs toward waiting — never toward
+	// deploying under traffic that has not been drained.
+	var (
+		applyMu  sync.Mutex
+		applied  uint64
+		cond     = sync.NewCond(&applyMu)
+		shutting bool
+	)
+	apply := func(source string) {
+		seq := reg.NotifySeq() // captured BEFORE the snapshot: any later notify stays pending
+		cfg := store.get()
+		s := config.DefaultSettings()
+		if cfg != nil {
+			s = cfg.Settings
 		}
-		return settings.ReconcileIntervalSeconds
-	}, reg)
+		g.Swap(buildState(reg, s, log))
+		zerolog.SetGlobalLevel(parseZerologLevel(s.LogLevel))
+		applyMu.Lock()
+		if seq > applied {
+			applied = seq
+		}
+		cond.Broadcast()
+		applyMu.Unlock()
+		log.Debug().Str("source", source).Int("relays", reg.ReadyCount()).
+			Msg("serving generation rebuilt")
+	}
+	settle := func() bool {
+		target := reg.NotifySeq()
+		applyMu.Lock()
+		for applied < target && !shutting {
+			cond.Wait()
+		}
+		settled := applied >= target
+		applyMu.Unlock()
+		return settled
+	}
+
+	// The fleet worker turns desired state into verified deployments; the
+	// watcher turns file changes into desired state. The reconciler wakes on
+	// every reload; the apply loop rebuilds on every registry change and
+	// every (successful) reload.
+	rec := reconcile.Start(reconcile.Config{
+		Desired:  store.get,
+		RelayKey: bootstrap.ResolveRelayKey,
+		Factory:  deploy.NewFactory(nil),
+		Registry: reg,
+		Drainer:  g,
+		Settle:   settle,
+		Log:      log,
+	})
 	defer rec.Stop()
-	spa, err := web.Handler()
-	if err != nil {
-		return fmt.Errorf("load management UI: %w", err)
-	}
-	var adminOpts []admin.Option
-	if bootstrap.AdminCookieSecure {
-		adminOpts = append(adminOpts, admin.WithSecureCookie())
-	}
-	adminOpts = append(adminOpts, admin.WithFleet(rec, factory), admin.WithReadiness(reg))
-	adminHandler := admin.New(db, version, log, spa, adminOpts...)
+
+	reloaded := make(chan struct{}, 1)
+	go store.watch(bootstrap.ConfigFile, log, func() {
+		rec.Wake()
+		select {
+		case reloaded <- struct{}{}:
+		default:
+		}
+	})
 
 	ln, err := net.Listen("tcp", bootstrap.ListenAddr)
 	if err != nil {
@@ -178,29 +224,13 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	adminLn, err := net.Listen("tcp", bootstrap.AdminAddr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", bootstrap.AdminAddr, err)
-	}
-	adminSrv := &http.Server{
-		Handler:           adminHandler,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-	}
-
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1)
 	go func() {
 		log.Info().Str("addr", ln.Addr().String()).Str("version", version).
-			Int("relays", gen.relays).Msg("relay-gateway listening")
+			Int("readyRelays", reg.ReadyCount()).Msg("relay-gateway listening")
 		// Serve returns nil once shutdown closes the listener.
 		if err := srv.Serve(ln); err != nil {
 			errCh <- fmt.Errorf("listener: %w", err)
-		}
-	}()
-	go func() {
-		log.Info().Str("addr", adminLn.Addr().String()).Msg("admin plane listening")
-		if err := adminSrv.Serve(adminLn); err != nil {
-			errCh <- fmt.Errorf("admin listener: %w", err)
 		}
 	}()
 
@@ -208,36 +238,21 @@ func run() error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// Every database mutation — the admin API here, the reconciler later —
-	// converges on this one apply path: rebuild the generation from the
-	// database and swap it atomically.
-	apply := func(source string) {
-		next, err := buildGeneration(db, reg)
-		if err != nil {
-			log.Warn().Str("source", source).Str("error", sanitize.ErrorString(err)).
-				Msg("generation build failed; keeping previous configuration")
-			return
-		}
-		g.Swap(next.state)
-		// Only this goroutine writes the global level, so the package-global
-		// atomic swap is race-free and every future event picks it up.
-		zerolog.SetGlobalLevel(parseZerologLevel(next.logLevel))
-		log.Info().Str("source", source).Int("relays", next.relays).Msg("configuration reloaded")
-	}
-
-	// The startup generation already reflects current state; drop its pending
-	// wakeup so the loop does not rebuild redundantly.
-	select {
-	case <-db.Changes():
-	default:
-	}
-
-	// shutdown cancels fleet work first: a deploy mid-flight must not eat the
-	// whole-process drain budget, and the reconciler's database writes should
-	// be over before the final generation is whatever the DB says.
+	// Shutdown releases a rollout parked on the settle barrier first — the
+	// applier loop is about to leave its select, so without this broadcast
+	// a mid-replacement Stop() would wait for a barrier nobody will ever
+	// satisfy. Then it cancels fleet work: a deploy mid-flight must not eat
+	// the whole-process drain budget. Then the data plane drains its
+	// in-flight requests against one whole-process grace budget.
 	shutdown := func() {
+		applyMu.Lock()
+		shutting = true
+		cond.Broadcast()
+		applyMu.Unlock()
 		rec.Stop()
-		shutdownAll([]*http.Server{srv, adminSrv}, bootstrap.ShutdownGrace)
+		ctx, cancel := context.WithTimeout(context.Background(), bootstrap.ShutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
 	}
 
 	for {
@@ -249,192 +264,135 @@ func run() error {
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
 			shutdown()
 			return nil
-		case <-db.Changes():
-			apply("database")
 		case <-reg.Changes():
 			apply("readiness")
+		case <-reloaded:
+			apply("config")
 		}
 	}
 }
 
-// buildGeneration reads the database and derives the next immutable serving
-// generation — the single place pool state is ever built from. Everything
-// the hot path would otherwise re-derive is resolved here: body limits,
-// inherited header policies, tokens, transport timeouts.
-func buildGeneration(db *store.Store, reg *readiness.Registry) (generation, error) {
-	settings, err := db.Settings()
-	if err != nil {
-		return generation{}, fmt.Errorf("read settings: %w", err)
-	}
-	providers, err := db.Providers()
-	if err != nil {
-		return generation{}, fmt.Errorf("read providers: %w", err)
-	}
-	rows, err := db.Relays()
-	if err != nil {
-		return generation{}, fmt.Errorf("read relays: %w", err)
-	}
-
-	// Announce the current relay set to the registry: rows that appear here
-	// (fresh database, deleted relay re-added, first boot) enter the mirror
-	// as configured-but-unverified; a serving row that disappeared is
-	// dropped, which revokes its admission and does notify — that removal is
-	// a real transition. Rebuilds only happen on state transitions.
-	present := make([]readiness.Key, 0, len(rows))
-	for _, row := range rows {
-		present = append(present, readiness.Key{Provider: row.Provider, Name: row.Name})
-	}
-	reg.Sync(present)
-
-	providerLimits := make(map[string]int64, len(providers))
-	providerPolicies := make(map[string]*pool.HeaderPolicy, len(providers))
-	for _, provider := range providers {
-		providerLimits[provider.Name] = provider.MaxBody
-		policy, err := pool.ParseHeaderPolicy(provider.HeaderPolicy)
-		if err != nil {
-			return generation{}, fmt.Errorf("provider %s: %w", provider.Name, err)
-		}
-		providerPolicies[provider.Name] = policy
-	}
-
+// buildState derives one immutable serving snapshot: the pool is built
+// exclusively from the registry's verified serving snapshot — membership
+// here means verified for the current incarnation, and the URL+key pair is
+// the exact one that passed verification. Everything the hot path would
+// otherwise re-derive is resolved here: body limits, transport timeouts.
+func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.Logger) *gateway.State {
+	serving := reg.Serving()
 	in := pool.Input{
 		FailureThreshold: settings.FailureThreshold,
-		Cooldown:         time.Duration(settings.CooldownMs) * time.Millisecond,
-		Relays:           make([]pool.RelayInput, 0, len(rows)),
+		Cooldown:         settings.Cooldown,
+		Relays:           make([]pool.RelayInput, 0, len(serving)),
 	}
 	maxBuffer := int64(0)
-	for _, row := range rows {
-		ready := reg.IsReady(readiness.Key{Provider: row.Provider, Name: row.Name})
-		relay, ok, err := relayInput(row, providerLimits, providerPolicies, ready)
-		if err != nil {
-			return generation{}, err
-		}
-		if !ok {
+	for _, s := range serving {
+		u, err := url.Parse(s.URL)
+		if err != nil || u.Host == "" {
+			// A verified snapshot URL is always absolute; this cannot fire
+			// today. Never serve a broken entry — but never fail the whole
+			// swap for one either: skip it loudly (name and provider only —
+			// never the URL) so a latent registry bug shows up in the log.
+			log.Warn().Str("provider", s.Key.Provider).Str("relay", s.Key.Name).
+				Str("error", sanitize.ErrorString(err)).
+				Msg("verified relay has a malformed URL; excluded from the serving pool")
 			continue
 		}
-		if relay.MaxBody > maxBuffer {
-			maxBuffer = relay.MaxBody
+		maxBody := pool.ProviderMaxBody(s.Key.Provider)
+		in.Relays = append(in.Relays, pool.RelayInput{
+			Name:     s.Key.Name,
+			Provider: s.Key.Provider,
+			URL:      u,
+			Token:    s.Token,
+			MaxBody:  maxBody,
+		})
+		if maxBody > maxBuffer {
+			maxBuffer = maxBody
 		}
-		in.Relays = append(in.Relays, relay)
 	}
 	p, err := pool.New(in)
 	if err != nil {
-		return generation{}, err
+		// pool.New is infallible today; an empty pool keeps the process
+		// alive (zero-ready answers 503) instead of panicking the data plane.
+		p, _ = pool.New(pool.Input{})
 	}
 
-	// The lifecycle snapshot rides every generation so /stats renders the
-	// readiness state machine without reading the registry on the hot path.
 	snapshot := reg.Snapshot()
 	lifecycle := make([]gateway.LifecycleRow, 0, len(snapshot))
 	for _, record := range snapshot {
 		lifecycle = append(lifecycle, gateway.LifecycleRow{
-			Name:     record.Key.Name,
-			Provider: record.Key.Provider,
-			State:    string(record.State),
-			Reason:   record.Reason,
+			Name:       record.Key.Name,
+			Provider:   record.Key.Provider,
+			State:      string(record.State),
+			Reason:     record.Reason,
+			Generation: record.Generation,
 		})
 	}
-	state := &gateway.State{
+	return &gateway.State{
 		Pool: p,
 		Client: gateway.NewClient(gateway.NewTransport(
-			time.Duration(settings.DialTimeoutMs)*time.Millisecond,
-			time.Duration(settings.ResponseHeaderTimeoutMs)*time.Millisecond)),
+			settings.DialTimeout, settings.ResponseHeaderTimeout)),
 		MaxRetries:           settings.MaxRetries,
 		MaxBufferBytes:       maxBuffer,
 		StreamThresholdBytes: settings.StreamThresholdBytes,
 		Lifecycle:            lifecycle,
 	}
-	return generation{state: state, logLevel: settings.LogLevel, relays: len(in.Relays), configured: len(rows)}, nil
 }
 
-// relayInput maps a database relay row into a resolved pool input. Legacy
-// relays always appear (an inactive one shows in /stats as inactive). A
-// managed relay serves from its own URL until a deployment exists — that is
-// what an admin-created relay is before its first deploy — and once its
-// verified active deployment joins, that deployment's stable URL and token
-// take over and the relay is unconditionally active. Once a deployment
-// exists but is not active — stale, unreachable, paused by its platform,
-// failed — the deployment owns the relay's serving and it is not serving, so
-// the row contributes nothing: neither an unverified deployment URL nor the
-// tokenless relay-row placeholder may answer clients. The bool is false when
-// the row contributes no pool entry.
-func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPolicies map[string]*pool.HeaderPolicy, ready bool) (pool.RelayInput, bool, error) {
-	// The readiness gate is the admission authority: a relay serves only
-	// after the reconciler verified it end to end. Everything below assumes
-	// an admitted relay, so an unverified one contributes no pool entry —
-	// neither a stale deployment URL nor the tokenless relay-row placeholder
-	// may answer clients.
-	if !ready {
-		return pool.RelayInput{}, false, nil
-	}
-	switch row.Origin {
-	case store.OriginLegacy:
-		// active flag passes through verbatim; the registry only marks a
-		// legacy relay ready after a forward probe proved it serves.
-	case store.OriginManaged:
-		if row.InactiveDeployment {
-			return pool.RelayInput{}, false, nil
-		}
-		if row.Deployment != nil {
-			row.URL = row.Deployment.URL
-			row.Active = true
-		}
-	default:
-		return pool.RelayInput{}, false, nil
-	}
-	u, err := url.Parse(row.URL)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return pool.RelayInput{}, false, nil
-	}
-	relayPolicy, err := pool.ParseHeaderPolicy(row.HeaderPolicy)
+// desiredStore holds the last successfully loaded configuration behind an
+// atomic pointer, re-reading the file on a short poll. Only a successful
+// load ever replaces the stored state: a missing or invalid file logs once
+// per distinct condition and leaves the last-known-good serving.
+type desiredStore struct {
+	p atomic.Pointer[config.Config]
+	// lastKey deduplicates poll observations so a persistent problem logs
+	// once, not once per tick: the file's content hash when valid, a
+	// sanitized description of the problem otherwise.
+	lastKey string
+}
+
+func newDesiredStore() *desiredStore { return &desiredStore{} }
+
+func (s *desiredStore) get() *config.Config { return s.p.Load() }
+
+// poll reads the file once; watch calls it on the reload interval and fires
+// onChange whenever a new valid configuration replaced the stored one.
+func (s *desiredStore) poll(path string, log zerolog.Logger) bool {
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return pool.RelayInput{}, false, fmt.Errorf("relay %s: %w", row.Name, err)
+		key := "unreadable: " + sanitize.ErrorString(err)
+		if key != s.lastKey {
+			s.lastKey = key
+			log.Warn().Str("path", path).Str("error", sanitize.ErrorString(err)).
+				Msg("desired state file unreadable; serving the last known configuration")
+		}
+		return false
 	}
-	token := ""
-	if row.Deployment != nil {
-		token = row.Deployment.AuthToken
+	sum := sha256.Sum256(raw)
+	cfg, parseErr := config.Load(path)
+	if parseErr != nil {
+		key := "invalid: " + sanitize.ErrorString(parseErr)
+		if key != s.lastKey {
+			s.lastKey = key
+			log.Error().Str("path", path).Str("error", sanitize.ErrorString(parseErr)).
+				Msg("desired state file invalid; keeping the last known configuration")
+		}
+		return false
 	}
-	maxBody, ok := providerLimits[row.Provider]
-	if !ok {
-		maxBody = store.DefaultProviderMaxBody
-	}
-	return pool.RelayInput{
-		ID:       row.ID,
-		Name:     row.Name,
-		Provider: row.Provider,
-		URL:      u,
-		Active:   row.Active,
-		Origin:   pool.Origin(row.Origin),
-		Token:    token,
-		Policy:   pool.InheritHeaderPolicy(relayPolicy, providerPolicies[row.Provider]),
-		MaxBody:  maxBody,
-	}, true, nil
+	s.lastKey = "hash: " + hex.EncodeToString(sum[:])
+	s.p.Store(cfg)
+	return true
 }
 
-// initialLogLevel reads just the log level so startup messages before the
-// first generation honor the persisted setting.
-func initialLogLevel(db *store.Store) string {
-	settings, err := db.Settings()
-	if err != nil {
-		return store.DefaultLogLevel
+// watch polls the file until the context ends, invoking onChange for every
+// newly applied configuration.
+func (s *desiredStore) watch(path string, log zerolog.Logger, onChange func()) {
+	ticker := time.NewTicker(config.ReloadPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if s.poll(path, log) {
+			onChange()
+		}
 	}
-	return settings.LogLevel
-}
-
-// shutdownAll drains both planes' in-flight requests against one
-// whole-process grace budget; expiry force-closes whatever is left.
-func shutdownAll(servers []*http.Server, grace time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
-	var wg sync.WaitGroup
-	for _, srv := range servers {
-		wg.Add(1)
-		go func(s *http.Server) {
-			defer wg.Done()
-			_ = s.Shutdown(ctx)
-		}(srv)
-	}
-	wg.Wait()
 }
 
 func parseZerologLevel(level string) zerolog.Level {
@@ -448,32 +406,4 @@ func parseZerologLevel(level string) zerolog.Level {
 	default:
 		return zerolog.InfoLevel
 	}
-}
-
-// setupDynamicLogger installs the initial global level (the apply loop is
-// the only other writer) and returns the process logger.
-func setupDynamicLogger(level string) zerolog.Logger {
-	zerolog.SetGlobalLevel(parseZerologLevel(level))
-	return logging.New(os.Stdout)
-}
-
-// envDuration and envInt are test-only knobs for the readiness registry:
-// env vars that tune verification cadence without touching the database or
-// the API. Invalid values silently fall back to the default.
-func envDuration(name string, def time.Duration) time.Duration {
-	if v := os.Getenv(name); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
-			return d
-		}
-	}
-	return def
-}
-
-func envInt(name string, def int) int {
-	if v := os.Getenv(name); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
 }

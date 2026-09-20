@@ -2,8 +2,9 @@ name: CI
 
 # Four jobs: verify (format + vet + lint + race + build), pr-title (the
 # commitlint gate the squash merge turns into the commit subject), e2e
-# (the black-box suite against the real binary), and web (the management
-# SPA: format, type-check, build, embed proof). ci-gate is the single
+# (the black-box suite against the real binary), and workers (repo format
+# plus the embedded relay workers' behavioral conformance on Node's native
+# test runner). ci-gate is the single
 # required-check name a branch ruleset can pin while the roster underneath it
 # evolves — add a job to `needs` and the gate tightens without touching
 # repository settings.
@@ -143,28 +144,16 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The suite asserts on the real management UI (deep links, asset
-      # caching), so the black-box binary embeds the real bundle, not the
-      # committed stub. The build is the same `make web` Docker runs.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-      - name: Build the management UI
-        run: |
-          corepack enable
-          pnpm install --frozen-lockfile
-          make web
-
       # The suite's TestMain builds the real binary itself; the fake edge
-      # relays it forwards into are in-process HTTP servers, so no Docker is
-      # involved on the runner.
+      # relays it forwards into and the fake platform APIs it deploys to are
+      # in-process HTTP servers, so no Docker is involved on the runner.
       - name: Black-box suite
         run: go test ./e2e/ -count=1 -timeout 25m
 
-  web:
-    name: web
+  workers:
+    name: workers
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -191,29 +180,13 @@ jobs:
       - name: Worker conformance
         run: node --test internal/deploy/workers/conformance_test.mjs
 
-      # The type check is the web tree's test suite: the SPA has no runtime
-      # test framework, so strict vue-tsc is what keeps refactors honest.
-      - name: Type-check and build
-        run: pnpm --filter web build
-
-      # Sync the fresh bundle into the embed directory and prove the Go tree
-      # still compiles with the real assets embedded — the exact sequence
-      # Docker's build stage runs.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Prove the embed compiles
-        run: |
-          make web
-          go build ./...
-
   ci-gate:
     name: ci-gate
     # The single check name a branch ruleset requires. `needs` names job IDs,
     # so a future matrix job is still one entry; add a job here and the gate
     # tightens without editing repository settings — forgetting to add it is
     # the only way to widen what green means.
-    needs: [verify, pr-title, e2e, web]
+    needs: [verify, pr-title, e2e, workers]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

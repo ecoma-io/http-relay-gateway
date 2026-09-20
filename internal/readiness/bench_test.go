@@ -3,61 +3,57 @@ package readiness
 import (
 	"fmt"
 	"testing"
-	"time"
 )
 
-// benchRegistry builds a registry mirroring 128 relays in mixed lifecycle
-// states, the shape a warmed-up gateway operates on.
-func benchRegistry(b *testing.B, ready, unready, failed int) *Registry {
+// benchRegistry builds a mid-size fleet: every key configured, half of them
+// admitted with parseable URLs, mirroring the steady state the pool builder
+// and /stats read from.
+func benchRegistry(b *testing.B) (*Registry, []Key) {
 	b.Helper()
-	r := New(Config{BackoffBase: time.Millisecond, BackoffMax: time.Second, RecoverMax: 100 * time.Millisecond, DemoteAfter: 3})
-	n := ready + unready + failed
-	present := make([]Key, 0, n)
-	for i := range n {
-		present = append(present, Key{Provider: "vercel", Name: fmt.Sprintf("relay-%d", i)})
+	keys := make([]Key, 10)
+	for i := range keys {
+		keys[i] = key("cloudflare", fmt.Sprintf("relay-%02d", i))
 	}
-	r.Sync(present)
-	i := 0
-	for range ready {
-		r.Ready(present[i], time.Millisecond)
-		i++
+	r := New(Config{Now: newClock().Now})
+	r.Sync(keys)
+	for i, k := range keys {
+		if i%2 == 0 {
+			admitBench(b, r, k)
+		}
 	}
-	for range unready {
-		r.Failing(present[i], ReasonProbeFailed, time.Millisecond)
-		r.Failing(present[i], ReasonProbeFailed, time.Millisecond)
-		r.Failing(present[i], ReasonProbeFailed, time.Millisecond)
-		i++
-	}
-	for range failed {
-		r.Failing(present[i], ReasonUnreachable, time.Millisecond)
-		i++
-	}
-	return r
+	return r, keys
 }
 
-// BenchmarkIsReady is the admission decision per relay per generation build.
-func BenchmarkIsReady(b *testing.B) {
-	r := benchRegistry(b, 64, 32, 32)
-	keys := r.Snapshot()
-	b.ReportAllocs()
+func admitBench(b *testing.B, r *Registry, k Key) {
+	b.Helper()
+	release, gen, ok := r.Begin(k)
+	if !ok {
+		b.Fatalf("Begin failed on idle relay %v", k)
+	}
+	r.Ready(k, gen, "https://"+k.Name+".example", "bench-relay-key", 0)
+	release()
+}
+
+func BenchmarkRegistryIsReady(b *testing.B) {
+	r, keys := benchRegistry(b)
 	b.ResetTimer()
-	for b.Loop() {
-		for _, k := range keys {
-			if !r.IsReady(k.Key) && k.State == StateReady {
-				b.Fatal("ready relay reported not ready")
-			}
-		}
+	for range b.N {
+		_ = r.IsReady(keys[0])
 	}
 }
 
-// BenchmarkSnapshot is the full lifecycle snapshot rendered by /stats.
-func BenchmarkSnapshot(b *testing.B) {
-	r := benchRegistry(b, 64, 32, 32)
-	b.ReportAllocs()
+func BenchmarkRegistrySnapshot(b *testing.B) {
+	r, _ := benchRegistry(b)
 	b.ResetTimer()
-	for b.Loop() {
-		if got := r.Snapshot(); len(got) != 128 {
-			b.Fatalf("snapshot length = %d, want 128", len(got))
-		}
+	for range b.N {
+		_ = r.Snapshot()
+	}
+}
+
+func BenchmarkRegistryServing(b *testing.B) {
+	r, _ := benchRegistry(b)
+	b.ResetTimer()
+	for range b.N {
+		_ = r.Serving()
 	}
 }

@@ -39,7 +39,7 @@ Closes #
 
 - [ ] Self-reviewed the diff
 - [ ] Docs updated in the same pass (README when behavior moves)
-- [ ] No private relay URLs, provider credentials, platform tokens, or database files anywhere in the diff
+- [ ] No private relay URLs, provider credentials, platform tokens, relay keys, or real desired-state files anywhere in the diff
 - [ ] I have the right to contribute this work under the Apache License 2.0
 
 ## AI-assisted development

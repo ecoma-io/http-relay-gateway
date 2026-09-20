@@ -7,31 +7,45 @@ import (
 	"time"
 )
 
-// BenchmarkReadyCount measures the readiness gate's counter on a
-// realistic-sized pool — the /readyz admission answer, called per request
-// on an empty pool and per build elsewhere.
-func BenchmarkReadyCount(b *testing.B) {
-	const n = 128
-	in := Input{FailureThreshold: 3, Cooldown: 30 * time.Second}
+// BenchmarkPoolPick measures the hot-path selection: the per-key cursor walk
+// over healthy candidates, the shape every forwarded request pays for.
+func BenchmarkPoolPick(b *testing.B) {
+	const n = 10
+	providers := []string{"vercel", "cloudflare", "deno"}
+	relays := make([]RelayInput, 0, n)
 	for i := range n {
-		u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", 10000+i))
+		provider := providers[i%len(providers)]
+		u, err := url.Parse(fmt.Sprintf("http://relay-%02d.example.internal", i))
 		if err != nil {
-			b.Fatal(err)
+			b.Fatalf("parse relay url: %v", err)
 		}
-		in.Relays = append(in.Relays, RelayInput{
-			ID: int64(i), Name: fmt.Sprintf("relay-%d", i),
-			Provider: "vercel", URL: u, Active: i%2 == 0, Origin: OriginLegacy,
+		relays = append(relays, RelayInput{
+			Name:     fmt.Sprintf("relay-%02d", i),
+			Provider: provider,
+			URL:      u,
+			Token:    "bench-token",
+			MaxBody:  ProviderMaxBody(provider),
 		})
 	}
-	p, err := New(in)
+	p, err := New(Input{FailureThreshold: 3, Cooldown: time.Second, Relays: relays})
 	if err != nil {
-		b.Fatal(err)
+		b.Fatalf("pool.New: %v", err)
 	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		if p.ReadyCount() != n/2 {
-			b.Fatal("unexpected ready count")
+
+	b.Run("all", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if r := p.Pick(KeyAll); r == nil {
+				b.Fatal("Pick returned nil")
+			}
 		}
-	}
+	})
+	b.Run("provider", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if r := p.Pick("vercel"); r == nil {
+				b.Fatal("Pick returned nil")
+			}
+		}
+	})
 }

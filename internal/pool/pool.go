@@ -1,5 +1,16 @@
-// Package pool holds the relay registry: round-robin selection per pool key
-// and passive health state per relay.
+// Package pool holds the serving set: the relays a client's request may be
+// forwarded through right now. Membership is earned, never configured — the
+// generation builder admits only relays whose verified readiness still holds
+// (deployment reachable, expected worker version, accepted relay key, a
+// forwarding round trip) — so everything here is, by construction, safe to
+// receive production traffic.
+//
+// Two layers live side by side, deliberately separate: the verified
+// readiness that decides membership is slow, control-plane work owned by
+// internal/readiness; the passive health below is the fast, data-plane
+// layer — consecutive transport failures put a relay on cooldown and
+// half-open recovery lets it back in. Passive failures never change
+// membership: a failing relay is skipped, not evicted.
 package pool
 
 import (
@@ -7,34 +18,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"http-relay-gateway/internal/sanitize"
 )
 
 // KeyAll is the selector key for "every provider" (round-robin across all).
 const KeyAll = "all"
 
-// ReservedProviders cannot name a relay's provider: the first four collide
-// with selector keywords (X-Relay-Provider header / path prefix), the rest
-// with the gateway's own endpoints.
-var ReservedProviders = map[string]bool{
-	"": true, "all": true, "none": true, "auto": true,
-	"healthz": true, "stats": true,
-}
-
-// Origin classifies where a relay came from: the legacy YAML bridge or the
-// management plane.
-type Origin string
-
-const (
-	// OriginLegacy marks relays imported from the legacy YAML config; they
-	// carry no auth token and are synced by the config bridge.
-	OriginLegacy Origin = "legacy"
-	// OriginManaged marks relays deployed and owned by the management plane;
-	// the engine authenticates to them with their stored token.
-	OriginManaged Origin = "managed"
-)
-
-// HopByHop headers are connection-scoped and dropped on both legs; header
-// policies may never touch them.
+// HopByHop headers are connection-scoped and dropped on both legs.
 var HopByHop = map[string]bool{
 	"Connection":          true,
 	"Proxy-Connection":    true,
@@ -47,22 +38,45 @@ var HopByHop = map[string]bool{
 	"Upgrade":             true,
 }
 
-// Relay is a runtime relay entry with health state and usage counters.
+// Platform request-body limits: the hard-coded provider set the gateway
+// deploys to, with each platform's documented cap. The generation builder
+// resolves them before the pool is built — the hot path never re-derives
+// them.
+const (
+	// Vercel caps request bodies for edge functions at ~4.5 MB.
+	VercelMaxBody = int64(4_500_000)
+	// Cloudflare Workers accept up to ~100 MB.
+	CloudflareMaxBody = int64(100 << 20)
+	// Deno Deploy publishes no per-request body limit; 100 MB matches the
+	// largest documented cap in the provider set so a deno relay rejects
+	// only what the gateway would have rejected elsewhere.
+	DenoMaxBody = int64(100 << 20)
+)
+
+// ProviderMaxBody resolves the body limit for one hard-coded provider.
+func ProviderMaxBody(provider string) int64 {
+	switch provider {
+	case "vercel":
+		return VercelMaxBody
+	case "cloudflare":
+		return CloudflareMaxBody
+	case "deno":
+		return DenoMaxBody
+	default:
+		return VercelMaxBody
+	}
+}
+
+// Relay is one serving relay: verified readiness plus passive health state
+// and usage counters. The Token authenticates the gateway to the relay's
+// worker; it is presented on the relay leg only and must never reach logs
+// or stats.
 type Relay struct {
-	ID       int64
 	Name     string
 	Provider string
 	URL      *url.URL
-	Active   bool
-	Origin   Origin
-	// Token authenticates the gateway to a managed relay. It is presented on
-	// the relay leg only and must never reach logs or stats.
-	Token string
-	// Policy is the resolved header policy; nil forwards verbatim.
-	Policy *HeaderPolicy
-	// MaxBody is the provider's request-body limit, resolved by the caller
-	// before the pool is built — the hot path never re-derives it.
-	MaxBody int64
+	Token    string
+	MaxBody  int64
 
 	Requests atomic.Int64
 	Failures atomic.Int64
@@ -90,26 +104,25 @@ func (r *Relay) RecordSuccess() {
 
 // RecordFailure bumps the failure streak; after `threshold` consecutive
 // failures the relay goes on cooldown (passive health) and is skipped until
-// it expires (half-open recovery).
+// it expires (half-open recovery). The stored label is sanitized: transport
+// errors embed the relay URL, which never reaches /stats.
 func (r *Relay) RecordFailure(err error, threshold int, cooldown time.Duration) {
 	r.Failures.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.consecFails++
-	r.lastErr = err.Error()
+	r.lastErr = sanitize.ErrorString(err)
 	if r.consecFails >= threshold {
 		r.downUntil = time.Now().Add(cooldown)
 		r.consecFails = 0
 	}
 }
 
-// StatsRow is a point-in-time snapshot for /stats.
+// StatsRow is a point-in-time snapshot for /stats. It carries no URL and no
+// token: relay origins are private and never leave the process.
 type StatsRow struct {
 	Name      string `json:"name"`
 	Provider  string `json:"provider"`
-	Origin    string `json:"origin"`
-	Managed   bool   `json:"managed"`
-	Active    bool   `json:"active"`
 	Healthy   bool   `json:"healthy"`
 	MaxBody   int64  `json:"maxBody"`
 	Requests  int64  `json:"requests"`
@@ -123,10 +136,7 @@ func (r *Relay) snapshot(now time.Time) StatsRow {
 	return StatsRow{
 		Name:      r.Name,
 		Provider:  r.Provider,
-		Origin:    string(r.Origin),
-		Managed:   r.Origin == OriginManaged,
-		Active:    r.Active,
-		Healthy:   r.Active && (r.downUntil.IsZero() || now.After(r.downUntil)),
+		Healthy:   r.downUntil.IsZero() || now.After(r.downUntil),
 		MaxBody:   r.MaxBody,
 		Requests:  r.Requests.Load(),
 		Failures:  r.Failures.Load(),
@@ -134,18 +144,13 @@ func (r *Relay) snapshot(now time.Time) StatsRow {
 	}
 }
 
-// RelayInput is one fully resolved relay handed to New: URL parsed, body
-// limit and header policy already resolved — the hot path never re-derives
-// them.
+// RelayInput is one fully resolved serving relay handed to New: URL parsed,
+// body limit resolved — the hot path never re-derives them.
 type RelayInput struct {
-	ID       int64
 	Name     string
 	Provider string
 	URL      *url.URL
-	Active   bool
-	Origin   Origin
 	Token    string
-	Policy   *HeaderPolicy
 	MaxBody  int64
 }
 
@@ -156,7 +161,10 @@ type Input struct {
 	Relays           []RelayInput
 }
 
-// Pool is the set of relays plus one round-robin cursor per selector key.
+// Pool is the set of serving relays plus one round-robin cursor per
+// selector key. A Pool is immutable once built — membership changes build a
+// new one and swap it in atomically — but per-relay health state and
+// counters are live.
 type Pool struct {
 	mu        sync.Mutex
 	relays    []*Relay
@@ -176,21 +184,17 @@ func New(in Input) (*Pool, error) {
 	for i := range in.Relays {
 		r := in.Relays[i]
 		p.relays = append(p.relays, &Relay{
-			ID:       r.ID,
 			Name:     r.Name,
 			Provider: r.Provider,
 			URL:      r.URL,
-			Active:   r.Active,
-			Origin:   r.Origin,
 			Token:    r.Token,
-			Policy:   r.Policy,
 			MaxBody:  r.MaxBody,
 		})
 	}
 	return p, nil
 }
 
-// HasProvider reports whether provider matches at least one configured relay.
+// HasProvider reports whether provider matches at least one serving relay.
 func (p *Pool) HasProvider(provider string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -204,8 +208,8 @@ func (p *Pool) HasProvider(provider string) bool {
 
 // Pick returns the next relay for key (KeyAll or a provider name), rotating
 // round-robin among healthy relays. The cursor is kept per key so pinned
-// traffic cannot skew the "all" rotation and vice versa. Unhealthy relays are
-// skipped; when every candidate is unhealthy it still returns one (best
+// traffic cannot skew the "all" rotation and vice versa. Unhealthy relays
+// are skipped; when every candidate is unhealthy it still returns one (best
 // effort beats a 503 when the whole pool is down).
 func (p *Pool) Pick(key string) *Relay {
 	p.mu.Lock()
@@ -213,9 +217,6 @@ func (p *Pool) Pick(key string) *Relay {
 	now := time.Now()
 	var candidates, healthy []*Relay
 	for _, r := range p.relays {
-		if !r.Active {
-			continue
-		}
 		if key != KeyAll && r.Provider != key {
 			continue
 		}
@@ -255,18 +256,12 @@ func (p *Pool) Stats() []StatsRow {
 	return rows
 }
 
-// ReadyCount reports how many relays are in the serving set — the readiness
-// gate's own counter, so /readyz and /stats never re-derive it. The serving
-// set only ever contains verified relays: the generation builder already
-// filtered by the registry before New.
+// ReadyCount reports how many relays are in the serving set. The pool only
+// ever contains verified relays — the generation builder filtered by the
+// readiness registry before New — so this is the pool's own size, the
+// number /readyz and the zero-ready short-circuit answer from.
 func (p *Pool) ReadyCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	n := 0
-	for _, r := range p.relays {
-		if r.Active {
-			n++
-		}
-	}
-	return n
+	return len(p.relays)
 }

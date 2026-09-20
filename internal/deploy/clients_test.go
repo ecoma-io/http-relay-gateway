@@ -1,499 +1,1026 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// routeAll sends every outgoing request — whatever host a constructed URL
-// names — to the fake platform, keeping the original Host so handlers can
-// assert on the URL the client built.
-type routeAll struct{ base string }
+// --- fake platform API ---
 
-func (r routeAll) RoundTrip(req *http.Request) (*http.Response, error) {
-	clone := req.Clone(req.Context())
-	u := *req.URL
-	u.Scheme = "http"
-	u.Host = strings.TrimPrefix(r.base, "http://")
-	clone.URL = &u
-	return http.DefaultTransport.RoundTrip(clone)
+// fakeCall is one recorded platform API request.
+type fakeCall struct {
+	Method        string
+	Path          string
+	RawQuery      string
+	Authorization string
+	ContentType   string
+	Body          []byte
 }
 
-func routedClient(base string) *http.Client {
-	return &http.Client{Transport: routeAll{base}}
+// fakeAPI records every request before routing it, so assertions see the
+// wire exactly as the platform would have. gate lets a test resume control
+// at the call that precedes the (unroutable) stable-URL live check.
+type fakeAPI struct {
+	mu    sync.Mutex
+	calls []fakeCall
+	route func(f *fakeAPI, w http.ResponseWriter, r *http.Request)
+	gate  chan struct{}
+	URL   string
+	// active counts handlers mid-flight, so a test that cancels the deploy
+	// context can first wait until every in-flight request has completed —
+	// otherwise the cancellation races the poll response and the client
+	// reports "context canceled" instead of reaching awaitLive.
+	active sync.WaitGroup
 }
 
-// fakePlatform implements the tiny slice of each platform API the clients
-// call, plus the worker version endpoint awaitLive probes.
-type fakePlatform struct {
-	t   *testing.T
-	mu  sync.Mutex
-	srv *httptest.Server
-
-	// version is what the live worker reports from /__relay/version.
-	version string
-	// readyState / deployStatus answer the platform pollers.
-	readyState   string
-	deployStatus string
-	// createStatus, when non-zero, fails the next create call.
-	createStatus int
-
-	// recorded observations
-	polls          int
-	deploys        int
-	lastEnv        map[string]string
-	lastBindings   map[string]string
-	lastModuleSize int
-	lastMeta       map[string]string
-	deletedProject string
-	createdProject string
-	createAuth     string
-}
-
-// seenCreateAuth returns the Authorization header the most recent create
-// call carried (the version probes carry none — that is the point).
-func (f *fakePlatform) seenCreateAuth() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.createAuth
-}
-
-func newFakePlatform(t *testing.T) *fakePlatform {
-	f := &fakePlatform{
-		t:            t,
-		version:      RelayVersion,
-		readyState:   "BUILDING",
-		deployStatus: "pending",
-	}
-	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
-	t.Cleanup(f.srv.Close)
+func newFakeAPI(t *testing.T, route func(f *fakeAPI, w http.ResponseWriter, r *http.Request)) *fakeAPI {
+	t.Helper()
+	f := &fakeAPI{route: route, gate: make(chan struct{}, 1)}
+	srv := httptest.NewServer(f)
+	f.URL = srv.URL
+	t.Cleanup(srv.Close)
 	return f
 }
 
-func (f *fakePlatform) handle(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !strings.HasSuffix(r.URL.Path, "/__relay/version") {
-		// Version probes are unauthenticated by design; only record the
-		// credential headers of the platform API calls.
-		f.createAuth = r.Header.Get("Authorization")
-	}
-	switch {
-	case r.URL.Path == "/__relay/version":
-		f.json(w, http.StatusOK, map[string]string{"version": f.version})
-
-	// --- vercel ---
-	case r.URL.Path == "/v2/user" && r.Method == http.MethodGet:
-		f.json(w, http.StatusOK, map[string]any{"user": map[string]string{"username": "fake-user"}})
-	case r.URL.Path == "/v13/deployments" && r.Method == http.MethodPost:
-		if f.createStatus != 0 {
-			f.json(w, f.createStatus, map[string]any{"error": map[string]string{"message": "nope"}})
-			return
-		}
-		var body struct {
-			Name   string `json:"name"`
-			Target string `json:"target"`
-			Files  []struct {
-				File string `json:"file"`
-				Data string `json:"data"`
-			} `json:"files"`
-			Env []map[string]any `json:"env"`
-		}
-		f.decode(r, &body)
-		f.deploys++
-		f.lastEnv = map[string]string{}
-		for _, entry := range body.Env {
-			f.lastEnv[entry["key"].(string)] = entry["value"].(string)
-		}
-		if len(body.Files) != 1 || body.Files[0].File != "api/relay.js" || body.Files[0].Data == "" {
-			f.t.Errorf("vercel create: unexpected files payload %+v", body.Files)
-		}
-		f.json(w, http.StatusOK, map[string]any{
-			"id":         fmt.Sprintf("dpl_test_%d", f.deploys),
-			"url":        "per-deploy-abc.vercel.sh",
-			"alias":      []string{"my-relay.fake-team.vercel.app"},
-			"readyState": f.readyState,
-		})
-	case strings.HasPrefix(r.URL.Path, "/v13/deployments/") && r.Method == http.MethodGet:
-		// A BUILDING deployment finishes after the first poll.
-		if f.readyState == "BUILDING" {
-			f.polls++
-			if f.polls >= 1 {
-				f.readyState = "READY"
-			}
-		}
-		f.json(w, http.StatusOK, map[string]any{"readyState": f.readyState})
-	case strings.HasPrefix(r.URL.Path, "/v9/projects/") && r.Method == http.MethodDelete:
-		f.deletedProject = strings.TrimPrefix(r.URL.Path, "/v9/projects/")
-		f.json(w, http.StatusOK, map[string]any{"ok": true})
-
-	// --- cloudflare ---
-	case r.URL.Path == "/accounts/acc_123" && r.Method == http.MethodGet:
-		f.json(w, http.StatusOK, map[string]any{"success": true, "result": map[string]string{"id": "acc_123"}})
-	case strings.HasPrefix(r.URL.Path, "/accounts/acc_123/workers/scripts/") && r.Method == http.MethodPut:
-		if f.createStatus != 0 {
-			f.json(w, f.createStatus, map[string]any{"success": false, "errors": []map[string]any{{"message": "nope"}}})
-			return
-		}
-		f.deploys++
-		f.lastBindings = map[string]string{}
-		if err := r.ParseMultipartForm(1 << 20); err != nil {
-			f.t.Errorf("cloudflare deploy: multipart: %v", err)
-			f.json(w, http.StatusBadRequest, map[string]string{})
-			return
-		}
-		var meta struct {
-			Bindings []struct {
-				Type string `json:"type"`
-				Name string `json:"name"`
-				Text string `json:"text"`
-			} `json:"bindings"`
-		}
-		if err := json.Unmarshal([]byte(r.FormValue("metadata")), &meta); err != nil {
-			f.t.Errorf("cloudflare deploy: metadata: %v", err)
-		}
-		for _, b := range meta.Bindings {
-			if b.Type != "plain_text" {
-				f.t.Errorf("cloudflare deploy: binding type %q", b.Type)
-			}
-			f.lastBindings[b.Name] = b.Text
-		}
-		file, _, err := r.FormFile("relay.js")
-		if err != nil {
-			f.t.Errorf("cloudflare deploy: module part: %v", err)
-		} else {
-			n, _ := io.ReadAll(file)
-			f.lastModuleSize = len(n)
-			_ = file.Close()
-		}
-		f.json(w, http.StatusOK, map[string]any{"success": true, "result": map[string]string{}})
-	case strings.HasSuffix(r.URL.Path, "/subdomain") && r.Method == http.MethodPost:
-		f.json(w, http.StatusOK, map[string]any{"success": true, "result": map[string]bool{"enabled": true}})
-	case strings.HasSuffix(r.URL.Path, "/workers/subdomain") && r.Method == http.MethodGet:
-		f.json(w, http.StatusOK, map[string]any{"success": true, "result": map[string]string{"subdomain": "fake-team"}})
-	case strings.HasPrefix(r.URL.Path, "/accounts/acc_123/workers/scripts/") && r.Method == http.MethodDelete:
-		f.deletedProject = strings.TrimPrefix(r.URL.Path, "/accounts/acc_123/workers/scripts/")
-		f.json(w, http.StatusOK, map[string]any{"success": true})
-
-	// --- deno ---
-	case r.URL.Path == "/v1/user" && r.Method == http.MethodGet:
-		f.json(w, http.StatusOK, map[string]string{"id": "user-9"})
-	case r.URL.Path == "/v1/projects" && r.Method == http.MethodPost:
-		if f.createStatus != 0 {
-			w.WriteHeader(f.createStatus)
-			return
-		}
-		f.createdProject = "decoded-below"
-		f.json(w, http.StatusOK, map[string]string{"id": "proj_1"})
-	case strings.HasPrefix(r.URL.Path, "/v1/projects/") && !strings.Contains(r.URL.Path, "/deployments") && r.Method == http.MethodGet:
-		// Project lookup: missing until created.
-		if f.createdProject == "" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		f.json(w, http.StatusOK, map[string]string{"id": "proj_1"})
-	case strings.HasSuffix(r.URL.Path, "/deployments") && r.Method == http.MethodPost:
-		if f.createStatus != 0 {
-			w.WriteHeader(f.createStatus)
-			return
-		}
-		f.deploys++
-		if err := r.ParseMultipartForm(1 << 20); err != nil {
-			f.t.Errorf("deno deploy: multipart: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		var meta struct {
-			EnvVars       map[string]string `json:"envVars"`
-			EntryPointURL string            `json:"entryPointUrl"`
-		}
-		if err := json.Unmarshal([]byte(r.FormValue("meta")), &meta); err != nil {
-			f.t.Errorf("deno deploy: meta: %v", err)
-		}
-		f.lastMeta = meta.EnvVars
-		file, _, err := r.FormFile("file")
-		if err != nil {
-			f.t.Errorf("deno deploy: file part: %v", err)
-		} else {
-			n, _ := io.ReadAll(file)
-			f.lastModuleSize = len(n)
-			_ = file.Close()
-		}
-		f.json(w, http.StatusOK, map[string]string{"id": fmt.Sprintf("dep_%d", f.deploys), "status": f.deployStatus})
-	case strings.HasPrefix(r.URL.Path, "/v1/deployments/") && r.Method == http.MethodGet:
-		// A pending deployment finishes after the first poll.
-		if f.deployStatus == "pending" {
-			f.polls++
-			if f.polls >= 1 {
-				f.deployStatus = "success"
-			}
-		}
-		f.json(w, http.StatusOK, map[string]string{"status": f.deployStatus})
-	case strings.HasPrefix(r.URL.Path, "/v1/projects/") && r.Method == http.MethodDelete:
-		f.deletedProject = strings.TrimPrefix(r.URL.Path, "/v1/projects/")
-		f.json(w, http.StatusOK, map[string]string{})
-	default:
-		f.t.Errorf("unexpected platform call %s %s", r.Method, r.URL.Path)
-		f.json(w, http.StatusNotFound, map[string]string{})
-	}
-}
-
-func (f *fakePlatform) json(w http.ResponseWriter, code int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func (f *fakePlatform) decode(r *http.Request, into any) {
-	raw, _ := io.ReadAll(r.Body)
-	if err := json.Unmarshal(raw, into); err != nil {
-		f.t.Errorf("decode %s: %v", r.URL.Path, err)
-	}
-}
-
-func (f *fakePlatform) snapshot() (env, bindings, meta map[string]string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.lastEnv, f.lastBindings, f.lastMeta
-}
-
-func TestVercelDeployHappyPath(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newVercelClient(f.srv.URL, "vercel-token", "", routedClient(f.srv.URL))
-	ref, err := c.Verify(context.Background())
-	if err != nil || ref != "fake-user" {
-		t.Fatalf("Verify = %q, %v", ref, err)
-	}
-	res, err := c.Deploy(context.Background(), Spec{Project: "my-relay", Source: "// worker", Version: RelayVersion, Token: "relay-tok"})
+func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.active.Add(1)
+	defer f.active.Done()
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		t.Fatalf("Deploy: %v", err)
+		http.Error(w, "read body", http.StatusInternalServerError)
+		return
 	}
-	if res.ExternalID != "dpl_test_1" || res.Project != "my-relay" {
-		t.Fatalf("Result = %+v", res)
-	}
-	if res.URL != "https://my-relay.fake-team.vercel.app" {
-		t.Fatalf("stable URL = %q", res.URL)
-	}
-	env, _, _ := f.snapshot()
-	if env["RELAY_VERSION"] != RelayVersion || env["RELAY_AUTH_TOKEN"] != "relay-tok" {
-		t.Fatalf("deployment env = %v", env)
-	}
-	if !strings.Contains(f.seenCreateAuth(), "vercel-token") {
-		t.Fatalf("create auth header = %q", f.seenCreateAuth())
-	}
-}
-
-func TestVercelDeployErrorMapping(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newVercelClient(f.srv.URL, "t", "", routedClient(f.srv.URL))
-
-	f.createStatus = http.StatusForbidden
-	if _, err := c.Deploy(context.Background(), Spec{Project: "p", Source: "// worker", Version: "1", Token: "k"}); err == nil ||
-		!strings.Contains(err.Error(), "status 403") {
-		t.Fatalf("create failure error = %v", err)
-	}
-
-	f.createStatus = 0
-	f.readyState = "ERROR"
-	if _, err := c.Deploy(context.Background(), Spec{Project: "p", Source: "// worker", Version: "1", Token: "k"}); err == nil ||
-		!strings.Contains(err.Error(), "deployment error") {
-		t.Fatalf("readyState ERROR error = %v", err)
-	}
-
-	// Live check: the worker answers the wrong version — not READY, an error.
-	f.readyState = "READY"
-	f.version = "stale"
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-	_, err := c.Deploy(ctx, Spec{Project: "p", Source: "// worker", Version: RelayVersion, Token: "k"})
-	if err == nil || !strings.Contains(err.Error(), "relay not live") {
-		t.Fatalf("wrong live version error = %v", err)
-	}
-}
-
-func TestVercelDeleteToleratesMissing(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newVercelClient(f.srv.URL, "t", "", routedClient(f.srv.URL))
-	if err := c.Delete(context.Background(), "my-relay"); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if f.deletedProject != "my-relay" {
-		t.Fatalf("deleted project = %q", f.deletedProject)
-	}
-}
-
-func TestCloudflareDeployHappyPath(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newCloudflareClient(f.srv.URL, "cf-token", "acc_123", routedClient(f.srv.URL))
-	ref, err := c.Verify(context.Background())
-	if err != nil || ref != "acc_123" {
-		t.Fatalf("Verify = %q, %v", ref, err)
-	}
-	res, err := c.Deploy(context.Background(), Spec{Project: "my-relay", Source: "// worker", Version: RelayVersion, Token: "relay-tok"})
-	if err != nil {
-		t.Fatalf("Deploy: %v", err)
-	}
-	if res.URL != "https://my-relay.fake-team.workers.dev" {
-		t.Fatalf("URL = %q", res.URL)
-	}
-	_, bindings, _ := f.snapshot()
-	if bindings["RELAY_VERSION"] != RelayVersion || bindings["RELAY_AUTH_TOKEN"] != "relay-tok" {
-		t.Fatalf("bindings = %v", bindings)
-	}
-	if f.lastModuleSize == 0 {
-		t.Fatal("module part empty")
-	}
-}
-
-func TestCloudflareCredentialsError(t *testing.T) {
-	f := newFakePlatform(t)
-	f.createStatus = 0
-	// Make Verify hit a 403: no handler answers /accounts/other — the fake
-	// 404s unexpected calls, so use a distinct account id and a status hint.
-	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
+	_ = r.Body.Close()
+	f.mu.Lock()
+	f.calls = append(f.calls, fakeCall{
+		Method:        r.Method,
+		Path:          r.URL.Path,
+		RawQuery:      r.URL.RawQuery,
+		Authorization: r.Header.Get("Authorization"),
+		ContentType:   r.Header.Get("Content-Type"),
+		Body:          body,
 	})
-	c := newCloudflareClient(f.srv.URL, "t", "acc_123", routedClient(f.srv.URL))
-	_, err := c.Verify(context.Background())
-	if !errors.Is(err, ErrCredentials) {
-		t.Fatalf("Verify error = %v, want ErrCredentials", err)
+	f.mu.Unlock()
+	f.route(f, w, r)
+}
+
+func (f *fakeAPI) recorded() []fakeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeCall(nil), f.calls...)
+}
+
+func (f *fakeAPI) signal() {
+	select {
+	case f.gate <- struct{}{}:
+	default:
 	}
 }
 
-// TestVercelAndDenoVerifyRejectBadCredentials pins credential-mapping parity:
-// every platform's Verify must turn a 401/403 into ErrCredentials, so the
-// admin plane answers a typo'd token with the 422 field error, not a 502
-// platform outage.
-func TestVercelAndDenoVerifyRejectBadCredentials(t *testing.T) {
-	for _, tc := range []struct {
+// callFor finds the one recorded call for (method, path) or fails the test.
+func (f *fakeAPI) callFor(t *testing.T, method, path string) fakeCall {
+	t.Helper()
+	var found []fakeCall
+	for _, c := range f.recorded() {
+		if c.Method == method && c.Path == path {
+			found = append(found, c)
+		}
+	}
+	switch len(found) {
+	case 1:
+		return found[0]
+	case 0:
+		t.Fatalf("no recorded %s %s among %+v", method, path, f.recorded())
+	default:
+		t.Fatalf("%d recorded %s %s calls, want 1", len(found), method, path)
+	}
+	return fakeCall{}
+}
+
+func requireBearer(t *testing.T, call fakeCall, token string) {
+	t.Helper()
+	if want := "Bearer " + token; call.Authorization != want {
+		t.Errorf("%s %s Authorization = %q, want %q", call.Method, call.Path, call.Authorization, want)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+}
+
+// factoryAt points the given base-override env at the fake and builds a
+// production factory over a transport with no proxy path — fully
+// independent of the ambient environment and of net/http's proxy cache.
+func factoryAt(t *testing.T, baseEnv, baseURL string) Factory {
+	t.Helper()
+	t.Setenv(baseEnv, baseURL)
+	return NewFactory(&http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{},
+	})
+}
+
+// --- Deploy plumbing: Deploy ends in awaitLive, which polls the relay's
+// real public URL — unreachable from a test. The fakes therefore signal on
+// the last call before the live check; the test cancels the context and
+// Deploy unwinds immediately without ever dialing the platform domain. ---
+
+type deployOutcome struct {
+	result Result
+	err    error
+}
+
+func awaitOutcome(t *testing.T, done <-chan deployOutcome) deployOutcome {
+	t.Helper()
+	select {
+	case out := <-done:
+		return out
+	case <-time.After(10 * time.Second):
+		t.Fatal("Deploy did not return within 10s")
+		return deployOutcome{}
+	}
+}
+
+// runDeployUntilGate starts Deploy, waits for the fake to signal the marked
+// call, lets that request complete, cancels the context and returns the
+// outcome — unwinding awaitLive the moment it starts without cutting short
+// any in-flight platform call.
+func runDeployUntilGate(t *testing.T, ctx context.Context, cancel context.CancelFunc, f *fakeAPI, client Client, spec Spec) deployOutcome {
+	t.Helper()
+	done := make(chan deployOutcome, 1)
+	go func() {
+		result, err := client.Deploy(ctx, spec)
+		done <- deployOutcome{result: result, err: err}
+	}()
+	<-f.gate
+	f.active.Wait()
+	cancel()
+	return awaitOutcome(t, done)
+}
+
+// multipartForm parses a recorded multipart body using its content-type
+// boundary.
+func multipartForm(t *testing.T, call fakeCall) (*multipart.Form, error) {
+	t.Helper()
+	mediaType, params, err := mime.ParseMediaType(call.ContentType)
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		t.Fatalf("%s %s content type = %q (%v), want multipart", call.Method, call.Path, call.ContentType, err)
+	}
+	return multipart.NewReader(bytes.NewReader(call.Body), params["boundary"]).ReadForm(1 << 20)
+}
+
+func fileContent(t *testing.T, form *multipart.Form, field string) string {
+	t.Helper()
+	headers := form.File[field]
+	if len(headers) != 1 {
+		t.Fatalf("multipart field %q has %d file parts, want 1", field, len(headers))
+	}
+	fh, err := headers[0].Open()
+	if err != nil {
+		t.Fatalf("open %q part: %v", field, err)
+	}
+	defer func() { _ = fh.Close() }()
+	raw, err := io.ReadAll(fh)
+	if err != nil {
+		t.Fatalf("read %q part: %v", field, err)
+	}
+	return string(raw)
+}
+
+// --- Vercel ---
+
+func TestVercelDiscoverMatrix(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		wantExist bool
+		wantErr   error
+	}{
+		{name: "existing project", status: http.StatusOK, wantExist: true},
+		{name: "missing project", status: http.StatusNotFound},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+		{name: "forbidden", status: http.StatusForbidden, wantErr: ErrCredentials},
+		{name: "server error", status: http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.status, `{"name":"web-relay"}`)
+			})
+			client, err := factoryAt(t, VercelAPIBaseEnv, api.URL).For(PlatformVercel, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			if client.Platform() != PlatformVercel {
+				t.Errorf("Platform() = %q, want vercel", client.Platform())
+			}
+			discovery, err := client.Discover(context.Background(), "web-relay")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Discover error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil && tc.status >= 500 {
+				return // any error is fine for a server failure, as long as it is not success
+			}
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if discovery.Exists != tc.wantExist {
+				t.Errorf("Exists = %v, want %v", discovery.Exists, tc.wantExist)
+			}
+			if tc.wantExist && discovery.URL != "https://web-relay.vercel.app" {
+				t.Errorf("URL = %q, want the stable vercel domain", discovery.URL)
+			}
+		})
+	}
+}
+
+func TestVercelDiscoverPinsTeamScope(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{}`)
+	})
+	pinned, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok", Team: "team_42"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	if _, err := pinned.Discover(context.Background(), "web-relay"); err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	call := f.callFor(t, http.MethodGet, "/v9/projects/web-relay")
+	requireBearer(t, call, "tok")
+	if call.RawQuery != "teamId=team_42" {
+		t.Errorf("query = %q, want teamId=team_42", call.RawQuery)
+	}
+
+	// Without a pin the credential's own scope is used — no teamId.
+	unpinned, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	if _, err := unpinned.Discover(context.Background(), "web-relay"); err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	calls := f.recorded()
+	last := calls[len(calls)-1]
+	requireBearer(t, last, "tok")
+	if last.RawQuery != "" {
+		t.Errorf("unpinned query = %q, want empty", last.RawQuery)
+	}
+}
+
+func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
+			f.signal()
+			return
+		}
+		writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	spec := Spec{Project: "web-relay", Source: "// relay worker", Version: "1.0.0", Token: "relay-key"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+
+	// The cancellation races the final response read, so the error text
+	// varies (poll cut short vs live-check unwind); Deploy must never report
+	// success against a fake that cannot go live.
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+
+	call := f.callFor(t, http.MethodPost, "/v13/deployments")
+	requireBearer(t, call, "tok")
+	var payload struct {
+		Name   string `json:"name"`
+		Target string `json:"target"`
+		Files  []struct {
+			File     string `json:"file"`
+			Data     string `json:"data"`
+			Encoding string `json:"encoding"`
+		} `json:"files"`
+		ProjectSettings      map[string]any `json:"projectSettings"`
+		DeploymentProtection map[string]any `json:"deploymentProtection"`
+		Env                  []struct {
+			Key    string   `json:"key"`
+			Value  string   `json:"value"`
+			Target []string `json:"target"`
+		} `json:"env"`
+	}
+	if err := json.Unmarshal(call.Body, &payload); err != nil {
+		t.Fatalf("decode deploy payload: %v", err)
+	}
+	if payload.Name != "web-relay" || payload.Target != "production" {
+		t.Errorf("payload name/target = %q/%q, want web-relay/production", payload.Name, payload.Target)
+	}
+	if len(payload.Files) != 1 || payload.Files[0].File != "api/relay.js" || payload.Files[0].Encoding != "base64" {
+		t.Fatalf("files = %+v, want one base64 api/relay.js entry", payload.Files)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(payload.Files[0].Data)
+	if err != nil || string(decoded) != spec.Source {
+		t.Errorf("file data = %q (%v), want the worker source", decoded, err)
+	}
+	if v, ok := payload.ProjectSettings["framework"]; !ok || v != nil {
+		t.Errorf("projectSettings.framework = %v (present %v), want explicit null", v, ok)
+	}
+	if v, ok := payload.DeploymentProtection["ssoProtection"]; !ok || v != nil {
+		t.Errorf("deploymentProtection.ssoProtection = %v (present %v), want explicit null (no SSO wall)", v, ok)
+	}
+	env := map[string]struct {
+		value  string
+		target []string
+	}{}
+	for _, e := range payload.Env {
+		env[e.Key] = struct {
+			value  string
+			target []string
+		}{e.Value, e.Target}
+	}
+	if e, ok := env["RELAY_VERSION"]; !ok || e.value != "1.0.0" || len(e.target) != 1 || e.target[0] != "production" {
+		t.Errorf("RELAY_VERSION env = %+v, want 1.0.0 on production", e)
+	}
+	if e, ok := env["RELAY_AUTH_TOKEN"]; !ok || e.value != "relay-key" || len(e.target) != 1 || e.target[0] != "production" {
+		t.Errorf("RELAY_AUTH_TOKEN env = %+v, want the relay key on production", e)
+	}
+}
+
+func TestVercelDeployPollsUntilReady(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v13/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"BUILDING"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v13/deployments/dpl_1":
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
+			f.signal()
+		default:
+			writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
+		}
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok", Team: "team_42"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	spec := Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "relay-key"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+	// The cancellation races the poll response read, so either the live
+	// check unwound or the poll itself was cut short — Deploy must never
+	// report success either way; the recorded poll below proves the loop ran.
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+	call := f.callFor(t, http.MethodGet, "/v13/deployments/dpl_1")
+	if call.RawQuery != "teamId=team_42" {
+		t.Errorf("poll query = %q, want teamId=team_42", call.RawQuery)
+	}
+}
+
+func TestVercelDeployFailsOnErroredDeployment(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v13/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"BUILDING"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v13/deployments/dpl_1":
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"ERROR"}`)
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
+		}
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil || !strings.Contains(err.Error(), "deployment error") {
+		t.Fatalf("Deploy error = %v, want the errored-deployment failure", err)
+	}
+}
+
+func TestVercelDeployPostFailure(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusInternalServerError, `boom`)
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil {
+		t.Fatal("Deploy = nil error on a 500 create answer")
+	}
+}
+
+func TestVercelDeployAnswerWithoutID(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"readyState":"READY"}`)
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil || !strings.Contains(err.Error(), "without deployment id") {
+		t.Fatalf("Deploy error = %v, want the missing-id failure", err)
+	}
+}
+
+func TestVercelDeleteMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		wantErr error
+	}{
+		{name: "deleted", status: http.StatusNoContent},
+		{name: "already gone", status: http.StatusNotFound},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.status, `{}`)
+			})
+			client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			err = client.Delete(context.Background(), "web-relay")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Delete error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			call := f.callFor(t, http.MethodDelete, "/v9/projects/web-relay")
+			requireBearer(t, call, "tok")
+		})
+	}
+}
+
+// --- Cloudflare ---
+
+const cfSubdomainJSON = `{"success":true,"result":{"subdomain":"example"},"errors":[]}`
+
+func TestCloudflareDiscoverResolvesSingleAccount(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/accounts":
+			writeJSON(w, http.StatusOK, `{"success":true,"result":[{"id":"acc_1"}],"errors":[]}`)
+		case "/accounts/acc_1/workers/scripts/web-relay":
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{"id":"web-relay"},"errors":[]}`)
+		case "/accounts/acc_1/workers/subdomain":
+			writeJSON(w, http.StatusOK, cfSubdomainJSON)
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
+		}
+	})
+	client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	if client.Platform() != PlatformCloudflare {
+		t.Errorf("Platform() = %q, want cloudflare", client.Platform())
+	}
+	discovery, err := client.Discover(context.Background(), "web-relay")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if !discovery.Exists || discovery.URL != "https://web-relay.example.workers.dev" {
+		t.Errorf("discovery = %+v, want the existing script with its workers.dev URL", discovery)
+	}
+	// The account is resolved per call (Discover and the subdomain read each
+	// resolve it), so /accounts may repeat — every hit must carry the token.
+	for _, call := range f.recorded() {
+		if call.Path == "/accounts" {
+			requireBearer(t, call, "tok")
+		}
+	}
+	requireBearer(t, f.callFor(t, http.MethodGet, "/accounts/acc_1/workers/scripts/web-relay"), "tok")
+}
+
+func TestCloudflareDiscoverPinnedAccountSkipsResolution(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/accounts":
+			t.Error("/accounts must not be called when the account is pinned")
+		case "/accounts/acc_pin/workers/scripts/web-relay":
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{},"errors":[]}`)
+		case "/accounts/acc_pin/workers/subdomain":
+			writeJSON(w, http.StatusOK, cfSubdomainJSON)
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
+		}
+	})
+	client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok", Account: "acc_pin"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	discovery, err := client.Discover(context.Background(), "web-relay")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if !discovery.Exists {
+		t.Errorf("discovery = %+v, want the pinned-account script", discovery)
+	}
+}
+
+func TestCloudflareDiscoverAccountResolution(t *testing.T) {
+	cases := []struct {
+		name     string
+		accounts string
+		wantErr  error
+	}{
+		{name: "zero accounts", accounts: `[]`, wantErr: ErrCredentials},
+		{name: "several accounts", accounts: `[{"id":"a"},{"id":"b"}]`, wantErr: ErrAmbiguousScope},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK,
+					`{"success":true,"result":`+tc.accounts+`,"errors":[]}`)
+			})
+			client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			if _, err := client.Discover(context.Background(), "web-relay"); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Discover error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCloudflareDiscoverMissingScript(t *testing.T) {
+	cases := []struct {
 		name   string
 		status int
+		body   string
 	}{
-		{"unauthorized", http.StatusUnauthorized},
-		{"forbidden", http.StatusForbidden},
-	} {
-		t.Run("vercel/"+tc.name, func(t *testing.T) {
-			f := newFakePlatform(t)
-			f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.status)
+		{
+			name:   "http 404",
+			status: http.StatusNotFound,
+			body:   `{"success":false,"result":null,"errors":[]}`,
+		},
+		{
+			name:   "envelope 7003 inside a 200",
+			status: http.StatusOK,
+			body:   `{"success":false,"result":null,"errors":[{"code":7003,"message":"no route"}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/accounts":
+					writeJSON(w, http.StatusOK, `{"success":true,"result":[{"id":"acc_1"}],"errors":[]}`)
+				case "/accounts/acc_1/workers/scripts/web-relay":
+					writeJSON(w, tc.status, tc.body)
+				default:
+					writeJSON(w, http.StatusNotFound, `{}`)
+				}
 			})
-			c := newVercelClient(f.srv.URL, "t", "", routedClient(f.srv.URL))
-			if _, err := c.Verify(context.Background()); !errors.Is(err, ErrCredentials) {
-				t.Fatalf("Verify error = %v, want ErrCredentials", err)
+			client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
 			}
-		})
-		t.Run("deno/"+tc.name, func(t *testing.T) {
-			f := newFakePlatform(t)
-			f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.status)
-			})
-			c := newDenoClient(f.srv.URL, "t", "ref", routedClient(f.srv.URL))
-			if _, err := c.Verify(context.Background()); !errors.Is(err, ErrCredentials) {
-				t.Fatalf("Verify error = %v, want ErrCredentials", err)
+			discovery, err := client.Discover(context.Background(), "web-relay")
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if discovery.Exists {
+				t.Errorf("discovery = %+v, want a missing script", discovery)
 			}
 		})
 	}
 }
 
-func TestCloudflareDeleteToleratesMissing(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newCloudflareClient(f.srv.URL, "t", "acc_123", routedClient(f.srv.URL))
-	if err := c.Delete(context.Background(), "gone"); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-}
-
-func TestDenoDeployHappyPath(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newDenoClient(f.srv.URL, "deno-token", "acc-ref", routedClient(f.srv.URL))
-	ref, err := c.Verify(context.Background())
-	if err != nil || ref != "acc-ref" {
-		t.Fatalf("Verify = %q, %v", ref, err)
-	}
-	res, err := c.Deploy(context.Background(), Spec{Project: "my-relay", Source: "// worker", Version: RelayVersion, Token: "relay-tok"})
+func TestCloudflareDiscoverCredentialRejection(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusUnauthorized, `{"success":false,"errors":[{"code":10000,"message":"bad token"}]}`)
+	})
+	client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok"})
 	if err != nil {
-		t.Fatalf("Deploy: %v", err)
+		t.Fatalf("For: %v", err)
 	}
-	if res.URL != "https://my-relay.deno.dev" || res.ExternalID != "dep_1" {
-		t.Fatalf("Result = %+v", res)
-	}
-	_, _, meta := f.snapshot()
-	if meta["RELAY_VERSION"] != RelayVersion || meta["RELAY_AUTH_TOKEN"] != "relay-tok" {
-		t.Fatalf("envVars = %v", meta)
-	}
-	if f.lastModuleSize == 0 {
-		t.Fatal("file part empty")
+	if _, err := client.Discover(context.Background(), "web-relay"); !errors.Is(err, ErrCredentials) {
+		t.Fatalf("Discover error = %v, want ErrCredentials", err)
 	}
 }
 
-func TestDenoDeployErrorMapping(t *testing.T) {
-	f := newFakePlatform(t)
-	c := newDenoClient(f.srv.URL, "t", "ref", routedClient(f.srv.URL))
-
-	f.createStatus = http.StatusUnauthorized
-	if _, err := c.Deploy(context.Background(), Spec{Project: "p", Source: "// worker", Version: "1", Token: "k"}); err == nil {
-		t.Fatal("expected create failure")
+func TestCloudflareDeployUploadsScriptAndEnablesSubdomain(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/accounts/acc_pin/workers/scripts/web-relay":
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{},"errors":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/accounts/acc_pin/workers/scripts/web-relay/subdomain":
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{},"errors":[]}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/accounts/acc_pin/workers/subdomain":
+			writeJSON(w, http.StatusOK, cfSubdomainJSON)
+			f.signal()
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
+		}
+	})
+	client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok", Account: "acc_pin"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
 	}
-
-	f.createStatus = 0
-	f.deployStatus = "failed"
-	if _, err := c.Deploy(context.Background(), Spec{Project: "p", Source: "// worker", Version: "1", Token: "k"}); err == nil ||
-		!strings.Contains(err.Error(), "failed") {
-		t.Fatalf("deployment failed error = %v", err)
-	}
-
-	// Success on the platform but the live worker never confirms.
-	f.deployStatus = "success"
-	f.version = "stale"
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	spec := Spec{Project: "web-relay", Source: "// worker", Version: "2.0.0", Token: "relay-key"}
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, err := c.Deploy(ctx, Spec{Project: "p", Version: RelayVersion, Token: "k"}); err == nil ||
-		!strings.Contains(err.Error(), "relay not live") {
-		t.Fatalf("wrong live version error = %v", err)
+	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+	// The cancellation races the final response read, so the error text
+	// varies; Deploy must never report success against a fake that cannot
+	// go live.
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+
+	put := f.callFor(t, http.MethodPut, "/accounts/acc_pin/workers/scripts/web-relay")
+	requireBearer(t, put, "tok")
+	form, err := multipartForm(t, put)
+	if err != nil {
+		t.Fatalf("parse multipart body: %v", err)
+	}
+	var meta struct {
+		MainModule        string `json:"main_module"`
+		CompatibilityDate string `json:"compatibility_date"`
+		Bindings          []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+			Text string `json:"text"`
+		} `json:"bindings"`
+	}
+	if err := json.Unmarshal([]byte(form.Value["metadata"][0]), &meta); err != nil {
+		t.Fatalf("decode metadata: %v (%q)", err, form.Value["metadata"])
+	}
+	if meta.MainModule != "relay.js" {
+		t.Errorf("main_module = %q, want relay.js", meta.MainModule)
+	}
+	bindings := map[string]string{}
+	for _, b := range meta.Bindings {
+		if b.Type != "plain_text" {
+			t.Errorf("binding %s type = %q, want plain_text", b.Name, b.Type)
+		}
+		bindings[b.Name] = b.Text
+	}
+	if bindings["RELAY_VERSION"] != "2.0.0" || bindings["RELAY_AUTH_TOKEN"] != "relay-key" {
+		t.Errorf("bindings = %v, want the version and relay key", bindings)
+	}
+	if got := fileContent(t, form, "relay.js"); got != spec.Source {
+		t.Errorf("relay.js part = %q, want the worker source", got)
+	}
+
+	enable := f.callFor(t, http.MethodPost, "/accounts/acc_pin/workers/scripts/web-relay/subdomain")
+	if string(enable.Body) != `{"enabled":true}` {
+		t.Errorf("subdomain enable body = %q, want {\"enabled\":true}", enable.Body)
+	}
+	f.callFor(t, http.MethodGet, "/accounts/acc_pin/workers/subdomain")
+}
+
+func TestCloudflareDeployEnvelopeError(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"success":false,"result":null,"errors":[{"code":10021,"message":"validation failed"}]}`)
+	})
+	client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok", Account: "acc_pin"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil || !strings.Contains(err.Error(), "validation failed") {
+		t.Fatalf("Deploy error = %v, want the envelope message", err)
 	}
 }
 
-func TestFactoryPlatforms(t *testing.T) {
-	t.Setenv(VercelAPIBaseEnv, "http://127.0.0.1:1")
-	t.Setenv(CloudflareAPIBaseEnv, "http://127.0.0.1:2")
-	t.Setenv(DenoAPIBaseEnv, "http://127.0.0.1:3")
-	factory := NewFactory(nil)
-	for _, platform := range []string{PlatformVercel, PlatformCloudflare, PlatformDeno} {
-		client, err := factory.For(platform, "tok", "ref")
-		if err != nil {
-			t.Fatalf("For(%q): %v", platform, err)
+func TestCloudflareDeployMissingSubdomain(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{},"errors":[]}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/subdomain"):
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{},"errors":[]}`)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/subdomain"):
+			writeJSON(w, http.StatusOK, `{"success":true,"result":{"subdomain":""},"errors":[]}`)
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
 		}
-		if client.Platform() != platform {
-			t.Fatalf("For(%q) returned %q", platform, client.Platform())
-		}
+	})
+	client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok", Account: "acc_pin"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
 	}
-	if _, err := factory.For("nomad", "tok", "ref"); err == nil {
-		t.Fatal("unknown platform accepted")
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil || !strings.Contains(err.Error(), "no workers.dev subdomain") {
+		t.Fatalf("Deploy error = %v, want the missing-subdomain failure", err)
 	}
 }
 
-func TestTokenLengthAndUniqueness(t *testing.T) {
-	seen := map[string]bool{}
-	for range 100 {
-		token, err := Token()
-		if err != nil {
-			t.Fatalf("Token: %v", err)
+func TestCloudflareDeleteMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		wantErr error
+	}{
+		{name: "deleted", status: http.StatusOK},
+		{name: "already gone", status: http.StatusNotFound},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.status, `{"success":true,"result":{},"errors":[]}`)
+			})
+			client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok", Account: "acc_pin"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			err = client.Delete(context.Background(), "web-relay")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Delete error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			f.callFor(t, http.MethodDelete, "/accounts/acc_pin/workers/scripts/web-relay")
+		})
+	}
+}
+
+// --- Deno ---
+
+func TestDenoDiscoverMatrix(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		wantExist bool
+		wantErr   error
+	}{
+		{name: "existing project", status: http.StatusOK, wantExist: true},
+		{name: "missing project", status: http.StatusNotFound},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+		{name: "server error", status: http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.status, `{"id":"web-relay"}`)
+			})
+			client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			if client.Platform() != PlatformDeno {
+				t.Errorf("Platform() = %q, want deno", client.Platform())
+			}
+			discovery, err := client.Discover(context.Background(), "web-relay")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Discover error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if tc.status >= 500 {
+				if err == nil {
+					t.Fatal("Discover = nil error on a server failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if discovery.Exists != tc.wantExist {
+				t.Errorf("Exists = %v, want %v", discovery.Exists, tc.wantExist)
+			}
+			if tc.wantExist && discovery.URL != "https://web-relay.deno.dev" {
+				t.Errorf("URL = %q, want the stable deno.dev domain", discovery.URL)
+			}
+		})
+	}
+}
+
+func TestDenoDeployCreatesProjectThenDeploys(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/web-relay":
+			writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects":
+			writeJSON(w, http.StatusCreated, `{"id":"prj_1","name":"web-relay"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/web-relay/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"queued"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments/dep_1":
+			writeJSON(w, http.StatusOK, `{"status":"success"}`)
+			f.signal()
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
 		}
-		if len(token) != 43 {
-			t.Fatalf("token length = %d", len(token))
+	})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	spec := Spec{Project: "web-relay", Source: "// worker", Version: "3.0.0", Token: "relay-key"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+	// The cancellation races the final response read, so the error text
+	// varies; Deploy must never report success against a fake that cannot
+	// go live.
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+
+	create := f.callFor(t, http.MethodPost, "/v1/projects")
+	requireBearer(t, create, "tok")
+	if !strings.Contains(string(create.Body), `"name":"web-relay"`) {
+		t.Errorf("create-project body = %q, want the project name", create.Body)
+	}
+
+	deployCall := f.callFor(t, http.MethodPost, "/v1/projects/web-relay/deployments")
+	form, err := multipartForm(t, deployCall)
+	if err != nil {
+		t.Fatalf("parse multipart body: %v", err)
+	}
+	var meta struct {
+		EntryPointURL string            `json:"entryPointUrl"`
+		Production    bool              `json:"production"`
+		EnvVars       map[string]string `json:"envVars"`
+	}
+	if err := json.Unmarshal([]byte(form.Value["meta"][0]), &meta); err != nil {
+		t.Fatalf("decode meta: %v (%q)", err, form.Value["meta"])
+	}
+	if meta.EntryPointURL != "relay.js" || !meta.Production {
+		t.Errorf("meta = %+v, want relay.js production deployment", meta)
+	}
+	if meta.EnvVars["RELAY_VERSION"] != "3.0.0" || meta.EnvVars["RELAY_AUTH_TOKEN"] != "relay-key" {
+		t.Errorf("envVars = %v, want the version and relay key", meta.EnvVars)
+	}
+	if got := fileContent(t, form, "file"); got != spec.Source {
+		t.Errorf("file part = %q, want the worker source", got)
+	}
+	f.callFor(t, http.MethodGet, "/v1/deployments/dep_1")
+}
+
+func TestDenoDeployExistingProjectSkipsCreate(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/web-relay":
+			writeJSON(w, http.StatusOK, `{"id":"prj_1","name":"web-relay"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/web-relay/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"queued"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments/dep_1":
+			writeJSON(w, http.StatusOK, `{"status":"success"}`)
+			f.signal()
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
 		}
-		if seen[token] {
-			t.Fatal("token repeated")
+	})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runDeployUntilGate(t, ctx, cancel, f, client, Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	// The cancellation races the final response read, so the error text
+	// varies; Deploy must never report success against a fake that cannot
+	// go live.
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+	for _, call := range f.recorded() {
+		if call.Method == http.MethodPost && call.Path == "/v1/projects" {
+			t.Error("existing project must not be recreated")
 		}
-		seen[token] = true
+	}
+}
+
+func TestDenoDeployFailsOnErroredDeployment(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/web-relay":
+			writeJSON(w, http.StatusOK, `{"id":"prj_1"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/web-relay/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"queued"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments/dep_1":
+			writeJSON(w, http.StatusOK, `{"status":"failed"}`)
+		default:
+			writeJSON(w, http.StatusNotFound, `{}`)
+		}
+	})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil || !strings.Contains(err.Error(), "deployment failed") {
+		t.Fatalf("Deploy error = %v, want the failed-deployment failure", err)
+	}
+}
+
+func TestDenoDeleteMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		wantErr error
+	}{
+		{name: "deleted", status: http.StatusNoContent},
+		{name: "already gone", status: http.StatusNotFound},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.status, `{}`)
+			})
+			client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			err = client.Delete(context.Background(), "web-relay")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Delete error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			f.callFor(t, http.MethodDelete, "/v1/projects/web-relay")
+		})
+	}
+}
+
+// --- awaitLive ---
+
+func TestAwaitLiveSucceedsWhenVersionMatches(t *testing.T) {
+	srv := versionServer(t, http.StatusOK, versionJSON("1.0.0"), nil)
+	if err := awaitLive(context.Background(), srv.URL, "1.0.0", 5*time.Second); err != nil {
+		t.Fatalf("awaitLive: %v", err)
+	}
+}
+
+func TestAwaitLiveReportsVersionMismatch(t *testing.T) {
+	srv := versionServer(t, http.StatusOK, versionJSON("0.9.0"), nil)
+	err := awaitLive(context.Background(), srv.URL, "1.0.0", 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("awaitLive = nil error on a version mismatch")
+	}
+	if !strings.Contains(err.Error(), "relay answers version") || !strings.Contains(err.Error(), "not live after") {
+		t.Errorf("awaitLive error = %v, want the mismatch and deadline report", err)
+	}
+}
+
+func TestAwaitLiveReportsNonWorkerAnswer(t *testing.T) {
+	srv := versionServer(t, http.StatusOK, "<html>pause page</html>", nil)
+	err := awaitLive(context.Background(), srv.URL, "1.0.0", 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("awaitLive = nil error for a non-worker answer")
+	}
+	if !strings.Contains(err.Error(), "not a relay worker") {
+		t.Errorf("awaitLive error = %v, want the non-worker classification", err)
+	}
+}
+
+func TestAwaitLiveWaitsForTheNewWorker(t *testing.T) {
+	var probeCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if probeCount.Add(1) == 1 {
+			// First probe: the old worker is still answering.
+			writeJSON(w, http.StatusOK, versionJSON("0.9.0"))
+			return
+		}
+		writeJSON(w, http.StatusOK, versionJSON("1.0.0"))
+	}))
+	t.Cleanup(srv.Close)
+	if err := awaitLive(context.Background(), srv.URL, "1.0.0", 5*time.Second); err != nil {
+		t.Fatalf("awaitLive: %v", err)
 	}
 }

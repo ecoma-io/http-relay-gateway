@@ -1,232 +1,312 @@
 package pool
 
 import (
+	"encoding/json"
 	"errors"
 	"net/url"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
 
-// defaultMaxBody mirrors the resolved body limit for providers without an
-// explicit entry (config.DefaultMaxBody; kept literal so the pool package
-// stays independent of the config package).
-const defaultMaxBody = 8 << 20
-
-func testPool(t *testing.T, mutate func(*Input)) *Pool {
+func mustPool(t *testing.T, in Input) *Pool {
 	t.Helper()
-	in := &Input{
-		FailureThreshold: 2,
-		Cooldown:         1 * time.Second,
-		Relays: []RelayInput{
-			{ID: 1, Name: "v1", Provider: "vercel", URL: mustURL(t, "https://v1.example"), Active: true, Origin: OriginLegacy, MaxBody: 100},
-			{ID: 2, Name: "v2", Provider: "vercel", URL: mustURL(t, "https://v2.example"), Active: true, Origin: OriginLegacy, MaxBody: 100},
-			{ID: 3, Name: "c1", Provider: "cloudflare", URL: mustURL(t, "https://c1.example"), Active: true, Origin: OriginLegacy, MaxBody: defaultMaxBody},
-		},
-	}
-	if mutate != nil {
-		mutate(in)
-	}
-	p, err := New(*in)
+	p, err := New(in)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("pool.New: %v", err)
 	}
 	return p
 }
 
-func mustURL(t *testing.T, raw string) *url.URL {
+func relayInput(t *testing.T, name, provider string) RelayInput {
 	t.Helper()
-	u, err := url.Parse(raw)
+	u, err := url.Parse("http://" + name + "." + provider + ".internal")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse relay url: %v", err)
 	}
-	return u
+	return RelayInput{
+		Name:     name,
+		Provider: provider,
+		URL:      u,
+		Token:    "token-" + name,
+		MaxBody:  ProviderMaxBody(provider),
+	}
 }
 
-func relayByName(t *testing.T, p *Pool, name string) *Relay {
-	t.Helper()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, r := range p.relays {
-		if r.Name == name {
-			return r
-		}
-	}
-	t.Fatalf("relay %q not found", name)
-	return nil
-}
-
-func TestRoundRobinFairness(t *testing.T) {
-	p := testPool(t, nil)
-	count := map[string]int{}
+func TestPickRoundRobinFollowsInputOrder(t *testing.T) {
+	p := mustPool(t, Input{
+		FailureThreshold: 3,
+		Cooldown:         time.Second,
+		Relays: []RelayInput{
+			relayInput(t, "alpha", "vercel"),
+			relayInput(t, "beta", "cloudflare"),
+			relayInput(t, "gamma", "deno"),
+		},
+	})
+	var got []string
 	for range 6 {
-		count[p.Pick(KeyAll).Name]++
-	}
-	for name, n := range count {
-		if n != 2 {
-			t.Fatalf("relay %s picked %d times, want 2", name, n)
+		r := p.Pick(KeyAll)
+		if r == nil {
+			t.Fatal("Pick returned nil with a healthy pool")
 		}
+		got = append(got, r.Name)
+	}
+	want := []string{"alpha", "beta", "gamma", "alpha", "beta", "gamma"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round-robin sequence = %v, want the input order repeated: %v", got, want)
 	}
 }
 
-// TestPickServesExactConfigOrder pins the README contract verbatim: with all
-// relays healthy the served sequence is exactly the config order —
-// deterministic, so consumers can reason about which relay serves next.
-func TestPickServesExactConfigOrder(t *testing.T) {
-	p := testPool(t, nil)
-	for i, want := range []string{"v1", "v2", "c1", "v1", "v2", "c1"} {
-		if got := p.Pick(KeyAll).Name; got != want {
-			t.Fatalf("all-pick %d = %s, want %s (config order is the served order)", i+1, got, want)
-		}
+func TestPickPerProviderCursors(t *testing.T) {
+	relays := []RelayInput{
+		relayInput(t, "alpha", "vercel"),
+		relayInput(t, "beta", "vercel"),
+		relayInput(t, "gamma", "cloudflare"),
 	}
-	for i, want := range []string{"v1", "v2", "v1", "v2"} {
-		if got := p.Pick("vercel").Name; got != want {
-			t.Fatalf("vercel-pick %d = %s, want %s", i+1, got, want)
-		}
+	p := mustPool(t, Input{FailureThreshold: 3, Cooldown: time.Second, Relays: relays})
+
+	var gotAll, gotVercel, gotCloudflare []string
+	for range 2 {
+		gotAll = append(gotAll, p.Pick(KeyAll).Name)
+	}
+	for range 3 {
+		gotVercel = append(gotVercel, p.Pick("vercel").Name)
+	}
+	for range 2 {
+		gotAll = append(gotAll, p.Pick(KeyAll).Name)
+	}
+	for range 2 {
+		gotCloudflare = append(gotCloudflare, p.Pick("cloudflare").Name)
+	}
+
+	// The all-key sequence runs over the whole input order, the vercel
+	// sequence over its own two relays — the interleaved all picks above
+	// must not have skewed it.
+	wantAll := []string{"alpha", "beta", "gamma", "alpha"}
+	wantVercel := []string{"alpha", "beta", "alpha"}
+	wantCloudflare := []string{"gamma", "gamma"}
+	if !reflect.DeepEqual(gotAll, wantAll) {
+		t.Fatalf("all sequence = %v, want %v", gotAll, wantAll)
+	}
+	if !reflect.DeepEqual(gotVercel, wantVercel) {
+		t.Fatalf("vercel sequence = %v, want %v (per-key cursor skewed by interleaving)", gotVercel, wantVercel)
+	}
+	if !reflect.DeepEqual(gotCloudflare, wantCloudflare) {
+		t.Fatalf("cloudflare sequence = %v, want %v", gotCloudflare, wantCloudflare)
+	}
+
+	// The same pin on a dedicated pool yields the same sequence: pinning
+	// traffic costs the unpinned rotation nothing, and vice versa.
+	solo := mustPool(t, Input{FailureThreshold: 3, Cooldown: time.Second, Relays: relays})
+	var pure []string
+	for range 3 {
+		pure = append(pure, solo.Pick("vercel").Name)
+	}
+	if !reflect.DeepEqual(pure, wantVercel) {
+		t.Fatalf("isolated vercel sequence = %v, want %v", pure, wantVercel)
 	}
 }
 
-func TestPinProvider(t *testing.T) {
-	p := testPool(t, nil)
+func TestPassiveHealthStreakCooldownRecovery(t *testing.T) {
+	p := mustPool(t, Input{
+		FailureThreshold: 3,
+		Cooldown:         5 * time.Millisecond,
+		Relays:           []RelayInput{relayInput(t, "solo", "vercel")},
+	})
+	r := p.Pick(KeyAll)
+	if r == nil {
+		t.Fatal("Pick returned nil on a healthy single-relay pool")
+	}
+	boom := errors.New("dial relay: connection refused")
+
+	// Below the threshold the relay stays in rotation.
+	for range 2 {
+		p.RecordFailure(r, boom)
+	}
+	row := p.Stats()[0]
+	if !row.Healthy || row.Failures != 2 || row.LastError != boom.Error() {
+		t.Fatalf("below-threshold failures must keep the relay healthy: %+v", row)
+	}
+
+	// A success clears the streak: interleaved failures must not accumulate
+	// into a cooldown.
+	p.RecordSuccess(r)
+	p.RecordFailure(r, boom)
+	if row := p.Stats()[0]; !row.Healthy {
+		t.Fatalf("a success must reset the failure streak: %+v", row)
+	}
+
+	// The threshold-th consecutive failure puts the relay on cooldown.
+	p.RecordFailure(r, boom)
+	p.RecordFailure(r, boom)
+	row = p.Stats()[0]
+	if row.Healthy {
+		t.Fatalf("third consecutive failure must cool the relay down: %+v", row)
+	}
+	if row.Requests != 0 || row.Failures != 5 || row.LastError != boom.Error() {
+		t.Fatalf("counters drifted: %+v", row)
+	}
+
+	// Best effort beats a 503: the only candidate is still picked while down.
+	r.Requests.Add(3)
+	if got := p.Pick(KeyAll); got == nil {
+		t.Fatal("Pick must stay best effort while every candidate is down")
+	}
+	if row := p.Stats()[0]; row.Requests != 3 {
+		t.Fatalf("requests counter = %d, want 3", row.Requests)
+	}
+
+	// Half-open recovery: the relay returns once the cooldown has expired.
+	time.Sleep(15 * time.Millisecond)
+	row = p.Stats()[0]
+	if !row.Healthy {
+		t.Fatalf("relay must recover after the cooldown expires: %+v", row)
+	}
+	if got := p.Pick(KeyAll); got == nil || got.Name != "solo" {
+		t.Fatalf("recovered relay must serve again, got %+v", got)
+	}
+}
+
+func TestPickSkipsCooledDownRelay(t *testing.T) {
+	p := mustPool(t, Input{
+		FailureThreshold: 1,
+		Cooldown:         5 * time.Millisecond,
+		Relays:           []RelayInput{relayInput(t, "alpha", "vercel"), relayInput(t, "beta", "vercel")},
+	})
+	first, second := p.Pick(KeyAll), p.Pick(KeyAll)
+	if first.Name != "alpha" || second.Name != "beta" {
+		t.Fatalf("initial picks = %s, %s; want alpha, beta", first.Name, second.Name)
+	}
+
+	p.RecordFailure(second, errors.New("boom"))
 	for range 4 {
-		if got := p.Pick("vercel"); got.Provider != "vercel" {
-			t.Fatalf("picked provider %q, want vercel", got.Provider)
+		if got := p.Pick(KeyAll); got.Name != "alpha" {
+			t.Fatalf("cooled-down relay must be skipped, got %s", got.Name)
 		}
 	}
-	if !p.HasProvider("vercel") || p.HasProvider("deno") {
-		t.Fatal("HasProvider is broken")
-	}
-}
 
-func TestCursorsArePerKey(t *testing.T) {
-	p := testPool(t, nil)
-	// Drive the "vercel" cursor hard; the "all" rotation must stay even.
-	for range 10 {
-		p.Pick("vercel")
-	}
-	count := map[string]int{}
-	for range 6 {
-		count[p.Pick(KeyAll).Name]++
-	}
-	for name, n := range count {
-		if n != 2 {
-			t.Fatalf("relay %s picked %d times on 'all' after pinned traffic, want 2", name, n)
+	time.Sleep(15 * time.Millisecond) // the cooldown expires: half-open again
+	sawBeta := false
+	for range 4 {
+		if p.Pick(KeyAll).Name == "beta" {
+			sawBeta = true
+			break
 		}
 	}
-}
-
-func TestMaxBodyCarriesFromInput(t *testing.T) {
-	p := testPool(t, nil)
-	if got := relayByName(t, p, "v1").MaxBody; got != 100 {
-		t.Fatalf("vercel relay MaxBody = %d, want 100 (resolved by the caller)", got)
-	}
-	if got := relayByName(t, p, "c1").MaxBody; got != defaultMaxBody {
-		t.Fatalf("cloudflare relay MaxBody = %d, want the default %d", got, int64(defaultMaxBody))
+	if !sawBeta {
+		t.Fatal("recovered relay must rejoin the rotation")
 	}
 }
 
-func TestPassiveHealthSkipsAndRecovers(t *testing.T) {
-	p := testPool(t, nil)
-	v1 := relayByName(t, p, "v1")
+func TestBestEffortWhenEveryRelayIsDown(t *testing.T) {
+	p := mustPool(t, Input{
+		FailureThreshold: 1,
+		Cooldown:         time.Second,
+		Relays:           []RelayInput{relayInput(t, "alpha", "vercel"), relayInput(t, "beta", "cloudflare")},
+	})
 	boom := errors.New("boom")
-
-	// One failure is under the threshold — still eligible.
-	p.RecordFailure(v1, boom)
-	if !v1.healthy(time.Now()) {
-		t.Fatal("v1 tripped after a single failure, want threshold 2")
+	for _, r := range []*Relay{p.Pick(KeyAll), p.Pick(KeyAll)} {
+		p.RecordFailure(r, boom)
 	}
-
-	// Second consecutive failure trips cooldown (1s).
-	p.RecordFailure(v1, boom)
-	if v1.healthy(time.Now()) {
-		t.Fatal("v1 should be on cooldown after 2 consecutive failures")
-	}
-	for i := range 10 {
-		if got := p.Pick("vercel"); got.Name == "v1" {
-			t.Fatalf("v1 should be skipped while unhealthy, got it on pick %d", i+1)
+	for _, row := range p.Stats() {
+		if row.Healthy {
+			t.Fatalf("%s should be on cooldown: %+v", row.Name, row)
 		}
-	}
-
-	// A success resets the streak.
-	v1.RecordSuccess()
-	if !v1.healthy(time.Now()) {
-		t.Fatal("v1 should be healthy after RecordSuccess")
-	}
-
-	// Half-open recovery: cooldown expiry makes it eligible again.
-	p.RecordFailure(v1, boom)
-	p.RecordFailure(v1, boom)
-	time.Sleep(1100 * time.Millisecond)
-	if !v1.healthy(time.Now()) {
-		t.Fatal("v1 should recover after cooldown expiry")
-	}
-}
-
-func TestAllDownIsBestEffort(t *testing.T) {
-	p := testPool(t, nil)
-	boom := errors.New("boom")
-	for _, name := range []string{"v1", "v2", "c1"} {
-		r := relayByName(t, p, name)
-		p.RecordFailure(r, boom)
-		p.RecordFailure(r, boom)
 	}
 	if got := p.Pick(KeyAll); got == nil {
-		t.Fatal("Pick returned nil with all relays down; want best-effort relay")
+		t.Fatal("Pick must return a relay even when the whole pool is down")
+	}
+	// Membership is passive-health independent: cooldowns never evict.
+	if p.ReadyCount() != 2 {
+		t.Fatalf("ReadyCount = %d after cooldowns, want 2", p.ReadyCount())
 	}
 }
 
-func TestInactiveRelayNeverPicked(t *testing.T) {
-	p := testPool(t, func(in *Input) {
-		in.Relays[0].Active = false
+func TestPickNilCases(t *testing.T) {
+	empty := mustPool(t, Input{})
+	if r := empty.Pick(KeyAll); r != nil {
+		t.Fatalf("empty pool Pick = %+v, want nil", r)
+	}
+	if empty.ReadyCount() != 0 {
+		t.Fatalf("empty pool ReadyCount = %d, want 0", empty.ReadyCount())
+	}
+
+	p := mustPool(t, Input{
+		FailureThreshold: 3,
+		Cooldown:         time.Second,
+		Relays:           []RelayInput{relayInput(t, "alpha", "vercel")},
 	})
-	for range 6 {
-		if got := p.Pick(KeyAll); got.Name == "v1" {
-			t.Fatal("inactive relay was picked")
-		}
+	if r := p.Pick("deno"); r != nil {
+		t.Fatalf("Pick on an unmatched provider = %+v, want nil", r)
+	}
+	if !p.HasProvider("vercel") {
+		t.Fatal("HasProvider must find a serving provider")
+	}
+	if p.HasProvider("deno") {
+		t.Fatal("HasProvider must reject a provider with no relays")
 	}
 }
 
-func TestStatsRowsExposeOriginAndManaged(t *testing.T) {
-	p := testPool(t, func(in *Input) {
-		in.Relays[0].Origin = OriginManaged
-		in.Relays[0].Token = "relay-secret"
+func TestStatsRowsCarryNoSecrets(t *testing.T) {
+	p := mustPool(t, Input{
+		FailureThreshold: 3,
+		Cooldown:         time.Second,
+		Relays:           []RelayInput{relayInput(t, "alpha", "vercel")},
 	})
-	rows := p.Stats()
-	if rows[0].Origin != "managed" || !rows[0].Managed {
-		t.Fatalf("managed row = %+v, want origin managed", rows[0])
+	r := p.Pick(KeyAll)
+	r.Requests.Add(4)
+	p.RecordFailure(r, errors.New("connection refused"))
+
+	raw, err := json.Marshal(p.Stats())
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
 	}
-	if rows[1].Origin != "legacy" || rows[1].Managed {
-		t.Fatalf("legacy row = %+v, want origin legacy, managed false", rows[1])
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
 	}
-	// The token must never surface in stats rows.
-	if rows[0].Name != "v1" {
-		t.Fatal("unexpected row order")
+	if len(rows) != 1 {
+		t.Fatalf("stats rows = %d, want 1", len(rows))
 	}
-	for _, row := range rows {
-		if row.LastError == "relay-secret" {
-			t.Fatal("token leaked into stats")
+	allowed := map[string]bool{
+		"name": true, "provider": true, "healthy": true, "maxBody": true,
+		"requests": true, "failures": true, "lastError": true,
+	}
+	for k := range rows[0] {
+		if !allowed[k] {
+			t.Fatalf("stats row carries unexpected key %q — a URL or token would leak here", k)
 		}
+	}
+	row := rows[0]
+	if row["name"] != "alpha" || row["provider"] != "vercel" {
+		t.Fatalf("identity fields wrong: %v", row)
+	}
+	if row["healthy"] != true || row["failures"] != float64(1) || row["requests"] != float64(4) {
+		t.Fatalf("health and counters wrong: %v", row)
+	}
+	if row["maxBody"] != float64(VercelMaxBody) {
+		t.Fatalf("maxBody = %v, want %d", row["maxBody"], VercelMaxBody)
+	}
+	// The relay origin and token must not appear anywhere in the snapshot.
+	if s := string(raw); strings.Contains(s, "token-alpha") || strings.Contains(s, ".internal") || strings.Contains(s, "http://") {
+		t.Fatalf("stats expose secrets: %s", s)
 	}
 }
 
-func TestReadyCount(t *testing.T) {
-	p := testPool(t, func(in *Input) {
-		in.Relays[0].Active = false
-	})
-	if got := p.ReadyCount(); got != 2 {
-		t.Fatalf("ReadyCount = %d, want 2 (one inactive relay)", got)
+func TestProviderMaxBody(t *testing.T) {
+	cases := []struct {
+		provider string
+		want     int64
+	}{
+		{"vercel", 4_500_000},
+		{"cloudflare", 100 << 20},
+		{"deno", 100 << 20},
+		{"unknown", 4_500_000},
 	}
-
-	all := testPool(t, nil)
-	if got := all.ReadyCount(); got != 3 {
-		t.Fatalf("ReadyCount = %d, want 3 with every relay active", got)
-	}
-
-	none := testPool(t, func(in *Input) {
-		for i := range in.Relays {
-			in.Relays[i].Active = false
+	for _, tc := range cases {
+		if got := ProviderMaxBody(tc.provider); got != tc.want {
+			t.Fatalf("ProviderMaxBody(%q) = %d, want %d", tc.provider, got, tc.want)
 		}
-	})
-	if got := none.ReadyCount(); got != 0 {
-		t.Fatalf("ReadyCount = %d, want 0 with no active relays", got)
 	}
 }

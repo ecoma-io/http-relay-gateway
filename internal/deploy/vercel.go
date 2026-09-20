@@ -7,14 +7,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
 
 // Vercel client. One project per relay, deployed from one inline file
-// (api/relay.js) with the version and token riding as deployment env. The
-// stable URL is the project's production alias — never the per-deployment
-// URL, which changes on every redeploy.
+// (api/relay.js) with the version and relay key riding as deployment env.
+// The stable URL is the project's default production domain
+// (<project>.vercel.app) — derived deterministically, identical across
+// redeploys, and never the per-deployment URL, which changes on every push.
+//
+// Scope: without a Team pin the credential's own user scope is used; with a
+// Team pin every call carries teamId. Discovery and deploy always resolve
+// the same scope, so (provider, name) maps to exactly one project.
 const (
 	vercelDefaultBase  = "https://api.vercel.com"
 	vercelReadyTimeout = 2 * time.Minute
@@ -24,42 +30,56 @@ const (
 )
 
 type vercelClient struct {
-	base  string
-	token string
-	http  *http.Client
+	base string
+	cred Credential
+	http *http.Client
 }
 
 // newVercelClient builds the client; base empty selects the real API.
-func newVercelClient(base, token, _ string, hc *http.Client) *vercelClient {
+func newVercelClient(base string, cred Credential, hc *http.Client) *vercelClient {
 	if base == "" {
 		base = vercelDefaultBase
 	}
-	return &vercelClient{base: strings.TrimRight(base, "/"), token: token, http: hc}
+	return &vercelClient{base: strings.TrimRight(base, "/"), cred: cred, http: hc}
 }
 
 func (c *vercelClient) Platform() string { return PlatformVercel }
 
-// Verify resolves the account's username from the token.
-func (c *vercelClient) Verify(ctx context.Context) (string, error) {
-	var answer struct {
-		User struct {
-			Username string `json:"username"`
-		} `json:"user"`
+// stableURL is the project's default production domain. Vercel serves every
+// project at <name>.vercel.app unless the operator deleted that domain; the
+// slug charset (lowercase letters, digits, dashes) needs no domain-encoding.
+// The test-only VERCEL_URL_BASE override replaces the origin so the e2e
+// suite can answer for the platform.
+func vercelStableURL(project string) string {
+	if base := strings.TrimRight(os.Getenv(VercelURLBaseEnv), "/"); base != "" {
+		return base + "/" + project
 	}
-	err := platformCall(ctx, c.http, http.MethodGet, c.base+"/v2/user", c.token, "", nil, &answer)
-	if err != nil {
-		// 401/403 is the platform rejecting the token — client data, not a
-		// gateway fault; the admin plane turns it into a field error instead
-		// of reporting a platform outage.
-		if strings.Contains(err.Error(), "status 401") || strings.Contains(err.Error(), "status 403") {
-			return "", fmt.Errorf("vercel verify: %w", ErrCredentials)
-		}
-		return "", fmt.Errorf("vercel verify: %w", err)
+	return "https://" + project + ".vercel.app"
+}
+
+// teamQuery appends the team scope when pinned.
+func (c *vercelClient) teamQuery() string {
+	if c.cred.Team == "" {
+		return ""
 	}
-	if answer.User.Username == "" {
-		return "", fmt.Errorf("vercel verify: answer without username")
+	return "?teamId=" + url.QueryEscape(c.cred.Team)
+}
+
+// Discover resolves the project's existence and stable URL in the
+// credential's scope.
+func (c *vercelClient) Discover(ctx context.Context, project string) (Discovery, error) {
+	err := platformCall(ctx, c.http, http.MethodGet,
+		c.base+"/v9/projects/"+url.PathEscape(project)+c.teamQuery(), c.cred.Token, "", nil, nil)
+	switch {
+	case err == nil:
+		return Discovery{Exists: true, URL: vercelStableURL(project)}, nil
+	case notFound(err):
+		return Discovery{Exists: false}, nil
+	case credentialsRejected(err):
+		return Discovery{}, fmt.Errorf("vercel discover: %w", ErrCredentials)
+	default:
+		return Discovery{}, fmt.Errorf("vercel discover: %w", err)
 	}
-	return answer.User.Username, nil
 }
 
 type vercelFile struct {
@@ -69,24 +89,8 @@ type vercelFile struct {
 }
 
 type vercelDeployment struct {
-	ID         string   `json:"id"`
-	URL        string   `json:"url"`
-	Alias      []string `json:"alias"`
-	ReadyState string   `json:"readyState"`
-}
-
-// stableURL prefers the production alias — stable across redeploys — over
-// the per-deployment URL the creation answer leads with.
-func (d vercelDeployment) stableURL(project string) string {
-	for _, alias := range d.Alias {
-		if alias != "" {
-			return "https://" + alias
-		}
-	}
-	if d.URL != "" {
-		return "https://" + d.URL
-	}
-	return "https://" + project + ".vercel.app"
+	ID         string `json:"id"`
+	ReadyState string `json:"readyState"`
 }
 
 // Deploy uploads the worker as a production deployment of the project (the
@@ -115,7 +119,7 @@ func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 		return Result{}, err
 	}
 	var created vercelDeployment
-	err = platformCall(ctx, c.http, http.MethodPost, c.base+"/v13/deployments", c.token,
+	err = platformCall(ctx, c.http, http.MethodPost, c.base+"/v13/deployments"+c.teamQuery(), c.cred.Token,
 		"application/json", strings.NewReader(string(body)), &created)
 	if err != nil {
 		return Result{}, fmt.Errorf("vercel deploy: %w", err)
@@ -141,7 +145,7 @@ func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 		}
 		var poll vercelDeployment
 		err := platformCall(deadlineCtx, c.http, http.MethodGet,
-			c.base+"/v13/deployments/"+url.PathEscape(created.ID), c.token, "", nil, &poll)
+			c.base+"/v13/deployments/"+url.PathEscape(created.ID)+c.teamQuery(), c.cred.Token, "", nil, &poll)
 		if err != nil {
 			return Result{}, fmt.Errorf("vercel deploy: poll: %w", err)
 		}
@@ -150,9 +154,9 @@ func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 	result := Result{
 		Project:    spec.Project,
 		ExternalID: created.ID,
-		URL:        created.stableURL(spec.Project),
+		URL:        vercelStableURL(spec.Project),
 	}
-	if err := awaitLive(ctx, c.http, result.URL, spec.Version, vercelLiveTimeout); err != nil {
+	if err := awaitLive(ctx, result.URL, spec.Version, vercelLiveTimeout); err != nil {
 		return Result{}, fmt.Errorf("vercel deploy: %w", err)
 	}
 	return result, nil
@@ -162,12 +166,13 @@ func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 // state.
 func (c *vercelClient) Delete(ctx context.Context, project string) error {
 	err := platformCall(ctx, c.http, http.MethodDelete,
-		c.base+"/v9/projects/"+url.PathEscape(project), c.token, "", nil, nil)
-	if err != nil && strings.Contains(err.Error(), "status 404") {
+		c.base+"/v9/projects/"+url.PathEscape(project)+c.teamQuery(), c.cred.Token, "", nil, nil)
+	switch {
+	case err == nil, notFound(err):
 		return nil
-	}
-	if err != nil {
+	case credentialsRejected(err):
+		return fmt.Errorf("vercel delete: %w", ErrCredentials)
+	default:
 		return fmt.Errorf("vercel delete: %w", err)
 	}
-	return nil
 }

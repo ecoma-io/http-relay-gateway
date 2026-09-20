@@ -1,16 +1,27 @@
-package e2e_test
+// Package e2e is the black-box desired-state matrix: every test drives the
+// real http-relay-gateway binary as a subprocess — HTTP only, plus the
+// process's structured stdout — against in-process fakes that speak the
+// platforms' REST shapes and worker sims that answer for the deployed
+// relays. Nothing from internal/ is imported or linked: the binary under
+// test is the only production code in the loop.
+//
+// Run: go test ./e2e/ -count=1 (skip with -short).
+package e2e
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
-	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,337 +30,188 @@ import (
 	"time"
 )
 
-// lockedBuffer is a goroutine-safe sink for gateway process output.
-type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
+// binPath is the gateway binary TestMain builds once for the whole run.
+var binPath string
 
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.b.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.b.String()
-}
-
-// adminPassword is the setup password every e2e gateway installs.
-const adminPassword = "e2e-admin-password-123"
-
-// applySettle bounds one database-mutation-to-pool-swap cycle: the applier
-// reacts to the store's change signal in-process, so this is pure headroom
-// for slow machines.
-const applySettle = 5 * time.Second
-
-// StatsView is the decoded /stats body.
-type StatsView struct {
-	Version   string         `json:"version"`
-	Relays    []RelayView    `json:"relays"`
-	Readiness ReadinessView  `json:"readiness"`
-	Lifecycle []LifecycleRow `json:"lifecycle"`
-}
-
-// ReadinessView is the /stats readiness summary: whether at least one relay
-// was admitted to the pool after verified readiness.
-type ReadinessView struct {
-	Ready       bool `json:"ready"`
-	ReadyRelays int  `json:"readyRelays"`
-}
-
-// LifecycleRow is one configured relay's readiness phase as seen by the
-// coordinating registry — every row appears here whether or not it earned
-// pool admission.
-type LifecycleRow struct {
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	State    string `json:"state"`
-	Reason   string `json:"reason,omitempty"`
-}
-
-// RelayView is one per-relay row from /stats.
-type RelayView struct {
-	Name      string `json:"name"`
-	Provider  string `json:"provider"`
-	Origin    string `json:"origin"`
-	Managed   bool   `json:"managed"`
-	Active    bool   `json:"active"`
-	Healthy   bool   `json:"healthy"`
-	MaxBody   int64  `json:"maxBody"`
-	Requests  int64  `json:"requests"`
-	Failures  int64  `json:"failures"`
-	LastError string `json:"lastError,omitempty"`
-}
-
-func (s *StatsView) relay(name string) (RelayView, bool) {
-	for _, r := range s.Relays {
-		if r.Name == name {
-			return r, true
-		}
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() {
+		fmt.Fprintln(os.Stderr, "e2e: skipping matrix in -short mode")
+		os.Exit(0)
 	}
-	return RelayView{}, false
-}
-
-func (s *StatsView) lifecycle(name string) (LifecycleRow, bool) {
-	for _, r := range s.Lifecycle {
-		if r.Name == name {
-			return r, true
-		}
+	dir, err := os.MkdirTemp("", "e2e-gateway-bin")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: temp dir: %v\n", err)
+		os.Exit(1)
 	}
-	return LifecycleRow{}, false
+	binPath = filepath.Join(dir, "http-relay-gateway")
+	build := exec.Command("go", "build", "-ldflags", "-X main.version=e2e-build",
+		"-o", binPath, "../cmd/http-relay-gateway")
+	if out, err := build.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: build gateway: %v\n%s", err, out)
+		os.Exit(1)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
 }
 
-func relayNames(st *StatsView) []string {
-	out := make([]string, 0, len(st.Relays))
-	for _, r := range st.Relays {
-		out = append(out, r.Name)
+// --- gateway process ---
+
+// gatewayProc is one running gateway subprocess and everything the tests
+// need to observe it: the listener URL, its desired-state directory, the
+// relay key it booted with, and a rolling copy of its stdout+stderr.
+type gatewayProc struct {
+	t    *testing.T
+	base string
+	dir  string
+	key  string
+
+	cmd     *exec.Cmd
+	exited  chan error
+	stopMu  sync.Mutex
+	stopped bool
+
+	logMu  sync.Mutex
+	logBuf bytes.Buffer
+}
+
+// gwOptions shapes one gateway run.
+type gwOptions struct {
+	// config is the desired-state YAML; empty starts with the file absent
+	// (the legal empty-fleet boot test 1 exercises).
+	config string
+	// key is the relay key; it reaches the process through
+	// RELAY_AUTH_TOKEN, or RELAY_AUTH_TOKEN_FILE when keyFile is set.
+	key     string
+	keyFile bool
+	// extraEnv rides on top of a scrubbed copy of the test environment.
+	extraEnv map[string]string
+}
+
+// startGateway builds, envures and launches one gateway against fake, and
+// registers cleanup (stop + log scan) on the test.
+func startGateway(t *testing.T, fake *fakeEdge, o gwOptions) *gatewayProc {
+	t.Helper()
+	port := freePort(t)
+	g := &gatewayProc{
+		t:    t,
+		base: "http://127.0.0.1:" + port,
+		dir:  t.TempDir(),
+		key:  o.key,
+	}
+	cfgPath := filepath.Join(g.dir, "config.yaml")
+	if o.config != "" {
+		g.writeConfig(o.config)
+	}
+
+	env := scrubbedEnv()
+	set := func(k, v string) { env = append(env, k+"="+v) }
+	set("LISTEN_ADDR", "127.0.0.1:"+port)
+	set("CONFIG_FILE", cfgPath)
+	set("SHUTDOWN_GRACE", "5s")
+	for _, k := range []string{
+		"VERCEL_API_BASE", "CLOUDFLARE_API_BASE", "DENO_API_BASE",
+		"VERCEL_URL_BASE", "CLOUDFLARE_URL_BASE", "DENO_URL_BASE",
+	} {
+		set(k, fake.base)
+	}
+	if o.keyFile {
+		keyPath := filepath.Join(g.dir, "relay-key")
+		if err := os.WriteFile(keyPath, []byte(o.key+"\n"), 0o600); err != nil {
+			t.Fatalf("write relay key file: %v", err)
+		}
+		set("RELAY_AUTH_TOKEN_FILE", keyPath)
+	} else {
+		set("RELAY_AUTH_TOKEN", o.key)
+	}
+	for k, v := range o.extraEnv {
+		set(k, v)
+	}
+
+	g.cmd = exec.Command(binPath)
+	g.cmd.Env = env
+	stdout, err := g.cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderr, err := g.cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	if err := g.cmd.Start(); err != nil {
+		t.Fatalf("start gateway: %v", err)
+	}
+	g.exited = make(chan error, 1)
+	go func() { g.exited <- g.cmd.Wait() }()
+	go g.tail(stdout)
+	go g.tail(stderr)
+
+	g.awaitServing(10 * time.Second)
+	t.Cleanup(func() {
+		_ = g.stop(10 * time.Second)
+		g.scanLog(t, fake)
+	})
+	return g
+}
+
+// scrubbedEnv is the test environment without proxies and without anything
+// the gateway would read, so a developer's ambient VERCEL_* or RELAY_*
+// variables can never leak into a run.
+func scrubbedEnv() []string {
+	out := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		upper := strings.ToUpper(key)
+		switch {
+		case strings.Contains(upper, "PROXY"):
+			continue
+		case strings.HasPrefix(upper, "RELAY_"),
+			strings.HasPrefix(upper, "VERCEL_"),
+			strings.HasPrefix(upper, "CLOUDFLARE_"),
+			strings.HasPrefix(upper, "DENO_"),
+			upper == "LISTEN_ADDR", upper == "CONFIG_FILE", upper == "SHUTDOWN_GRACE":
+			continue
+		}
+		out = append(out, kv)
 	}
 	return out
 }
 
-// fastVerifyEnv shrinks every readiness-gate bound from its production
-// default so the gate is observable inside test windows: a 60s verify
-// cadence would make every "relay becomes ready" assertion outlast the
-// suite. Tests that need production-like timing pass their own entries —
-// extraEnv always wins because entries are merged without duplicating a
-// name already present.
-func fastVerifyEnv() []string {
-	return []string{
-		"RELAY_VERIFY_INTERVAL=300ms",
-		"RELAY_REVIVE_SCAN_INTERVAL=300ms",
-		"RELAY_VERIFY_BACKOFF_BASE=100ms",
-		"RELAY_VERIFY_BACKOFF_MAX=2s",
-		"RELAY_VERIFY_RECOVER_MAX=200ms",
-		"RELAY_VERIFY_DEMOTE_AFTER=1000",
-	}
-}
-
-// mergeEnv puts extraEnv first, then every fastVerifyEnv entry whose name
-// extraEnv did not already supply — the caller's value wins by construction.
-func mergeEnv(extraEnv []string) []string {
-	merged := make([]string, 0, len(extraEnv)+len(fastVerifyEnv()))
-	merged = append(merged, extraEnv...)
-	for _, kv := range fastVerifyEnv() {
-		name := kv[:strings.Index(kv, "=")]
-		dup := false
-		for _, have := range merged {
-			if strings.HasPrefix(have, name+"=") {
-				dup = true
-				break
-			}
+func (g *gatewayProc) tail(r io.Reader) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		g.logMu.Lock()
+		if g.logBuf.Len() > 8<<20 {
+			g.logBuf.Reset()
 		}
-		if !dup {
-			merged = append(merged, kv)
-		}
-	}
-	return merged
-}
-
-// Gateway is one real gateway subprocess with its own data file and ports.
-type Gateway struct {
-	t         testing.TB
-	dir       string
-	dataFile  string
-	cmd       *exec.Cmd
-	output    *lockedBuffer
-	admin     *adminClient
-	adminPass string
-	env       []string
-
-	Addr      string
-	AdminAddr string
-}
-
-// handedOut records every loopback address freeAddr returned in this process.
-// The OS can hand back a just-closed ephemeral port immediately, which would
-// collide two listeners of one test run; the registry makes every allocation
-// unique for the whole run.
-var (
-	handedOutMu sync.Mutex
-	handedOut   = map[string]bool{}
-)
-
-func freeAddr(t testing.TB) string {
-	t.Helper()
-	handedOutMu.Lock()
-	defer handedOutMu.Unlock()
-	for {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		if !handedOut[addr] {
-			handedOut[addr] = true
-			return addr
-		}
+		g.logBuf.WriteString(sc.Text())
+		g.logBuf.WriteByte('\n')
+		g.logMu.Unlock()
 	}
 }
 
-// deadRelayURL returns a relay URL that refuses connections (a closed
-// listener) — the e2e stand-in for a downed edge deployment.
-func deadRelayURL(t testing.TB) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return "http://" + addr
+func (g *gatewayProc) logDump() string {
+	g.logMu.Lock()
+	defer g.logMu.Unlock()
+	return g.logBuf.String()
 }
 
-// RelaySeed is one relay a test creates through the admin API.
-type RelaySeed struct {
-	Name     string
-	Provider string
-	URL      string
-	Active   *bool
-	// AccountID makes the relay born managed: the reconciler deploys the
-	// embedded worker onto the platform and verifies it instead of marking
-	// the URL as a legacy edge.
-	AccountID *int64
-}
-
-func activePtr(v bool) *bool { return &v }
-
-// NewGateway starts a bare gateway (no relays, no setup yet) and waits for
-// both listeners.
-func NewGateway(t testing.TB) *Gateway {
-	return newGateway(t, nil)
-}
-
-// NewGatewayWithEnv is NewGateway with extra bootstrap environment entries
-// (for example "SHUTDOWN_GRACE=1s") appended to the standard set.
-func NewGatewayWithEnv(t testing.TB, extraEnv ...string) *Gateway {
-	return newGateway(t, extraEnv)
-}
-
-// NewGatewayWithRelays performs the whole first-run flow — setup, then relay
-// creation through the admin API — and waits for the pool to reflect it.
-// Relay order is creation order, which is the pool's round-robin order.
-func NewGatewayWithRelays(t testing.TB, seeds ...RelaySeed) *Gateway {
-	return newGatewayWith(t, nil, nil, seeds)
-}
-
-// NewGatewayWithProviders is NewGatewayWithRelays with provider rows (name ->
-// max body bytes) written first, so relay generation resolves their limits.
-func NewGatewayWithProviders(t testing.TB, providers map[string]int64, seeds ...RelaySeed) *Gateway {
-	return newGatewayWith(t, providers, nil, seeds)
-}
-
-func newGatewayWith(t testing.TB, providers map[string]int64, extraEnv []string, seeds []RelaySeed) *Gateway {
-	t.Helper()
-	g := newGateway(t, extraEnv)
-	g.Setup(t, adminPassword)
-	if len(providers) > 0 {
-		g.PutProviders(t, providers)
-	}
-	names := make([]string, 0, len(seeds))
-	for _, seed := range seeds {
-		g.CreateRelay(t, seed)
-		names = append(names, seed.Name)
-	}
-	if len(names) > 0 {
-		g.WaitForRelays(names, applySettle)
-	}
-	return g
-}
-
-func newGateway(t testing.TB, extraEnv []string) *Gateway {
-	t.Helper()
-	if testBinaryPath == "" {
-		t.Skip("e2e binary not built (short mode?)")
-	}
-	dir := t.TempDir()
-	adminAddr := freeAddr(t)
-	admin, err := newAdminClient(adminAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := &Gateway{
-		t:         t,
-		dir:       dir,
-		dataFile:  "gateway.db",
-		output:    &lockedBuffer{},
-		Addr:      freeAddr(t),
-		AdminAddr: adminAddr,
-		admin:     admin,
-		adminPass: adminPassword,
-	}
-	g.start(mergeEnv(extraEnv))
-	t.Cleanup(g.stop)
-	g.waitHealthy(10 * time.Second)
-	g.waitAdminReady(10 * time.Second)
-	return g
-}
-
-// start launches the gateway subprocess with this instance's paths and ports.
-func (g *Gateway) start(extraEnv []string) {
-	g.t.Helper()
-	g.env = extraEnv
-	cmd := exec.Command(testBinaryPath)
-	cmd.Dir = g.dir
-	cmd.Env = append([]string{
-		"LISTEN_ADDR=" + g.Addr,
-		"ADMIN_ADDR=" + g.AdminAddr,
-		"DATA_FILE=" + g.dataFile,
-		"PATH=" + os.Getenv("PATH"),
-	}, extraEnv...)
-	cmd.Stdout = g.output
-	cmd.Stderr = g.output
-	if err := cmd.Start(); err != nil {
-		g.t.Fatalf("start gateway: %v", err)
-	}
-	g.cmd = cmd
-}
-
-// Restart stops the process and starts a fresh one with the same data file,
-// ports and bootstrap environment — the harness stand-in for a container
-// restart, which re-reads its env too.
-func (g *Gateway) Restart() {
-	g.t.Helper()
-	g.stop()
-	g.start(g.env)
-	g.waitHealthy(10 * time.Second)
-	g.waitAdminReady(10 * time.Second)
-}
-
-func (g *Gateway) waitHealthy(timeout time.Duration) {
+// awaitServing waits for /healthz to answer, failing early (with the
+// process log) when the process dies instead.
+func (g *gatewayProc) awaitServing(timeout time.Duration) {
 	g.t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited() {
-			g.t.Fatalf("gateway exited during startup; output:\n%s", g.output.String())
+		select {
+		case err := <-g.exited:
+			g.t.Fatalf("gateway exited during startup: %v\nlog:\n%s", err, g.logDump())
+		default:
 		}
-		resp, err := http.Get("http://" + g.Addr + "/healthz")
+		resp, err := http.Get(g.base + "/healthz")
 		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && string(body) == "ok\n" {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	g.t.Fatalf("gateway never became healthy; output:\n%s", g.output.String())
-}
-
-// waitAdminReady polls the admin plane until it answers — the data listener
-// binds first, so health alone does not prove the admin API is up.
-func (g *Gateway) waitAdminReady(timeout time.Duration) {
-	g.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited() {
-			g.t.Fatalf("gateway exited during startup; output:\n%s", g.output.String())
-		}
-		resp, err := http.Get("http://" + g.AdminAddr + "/api/v1/ping")
-		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return
@@ -357,429 +219,293 @@ func (g *Gateway) waitAdminReady(timeout time.Duration) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	g.t.Fatalf("admin plane never became ready; output:\n%s", g.output.String())
+	g.t.Fatalf("gateway did not start serving within %s\nlog:\n%s", timeout, g.logDump())
 }
 
-// WaitForReady polls /stats until exactly want relays were admitted to the
-// pool — the readiness gate completing end to end, not just rows existing.
-func (g *Gateway) WaitForReady(want int, timeout time.Duration) *StatsView {
-	g.t.Helper()
-	return g.WaitForCondition(timeout, fmt.Sprintf("readyRelays == %d", want), func(st *StatsView) bool {
-		return st.Readiness.ReadyRelays == want
-	})
-}
-
-// readyzDo returns the /readyz status and body verbatim.
-func readyzDo(t testing.TB, addr string) (int, string) {
-	t.Helper()
-	resp, err := http.Get("http://" + addr + "/readyz")
-	if err != nil {
-		t.Fatalf("readyz: %v", err)
+// stop terminates the process (SIGTERM, then SIGKILL past timeout) and
+// returns its exit status: nil only for a clean exit. Idempotent — the
+// second call returns immediately; the first caller already observed the
+// exit status.
+func (g *gatewayProc) stop(timeout time.Duration) error {
+	g.stopMu.Lock()
+	if g.stopped {
+		g.stopMu.Unlock()
+		return nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, string(raw)
-}
-
-// WaitForRelays polls /stats until the relay list reports exactly want in order.
-func (g *Gateway) WaitForRelays(want []string, timeout time.Duration) {
-	g.t.Helper()
-	g.WaitForCondition(timeout, fmt.Sprintf("relays == %v", want), func(st *StatsView) bool {
-		return equalStrings(relayNames(st), want)
-	})
-}
-
-// WaitForCondition polls until cond holds on the live /stats.
-func (g *Gateway) WaitForCondition(timeout time.Duration, what string, cond func(*StatsView) bool) *StatsView {
-	g.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		st, err := g.Stats()
-		if err == nil && cond(st) {
-			return st
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	st, _ := g.Stats()
-	g.t.Fatalf("condition %q never held; stats=%+v\nlogs:\n%s", what, st, g.output.String())
-	return nil
-}
-
-func waitForLog(t testing.TB, g *Gateway, substr string, timeout time.Duration) {
-	t.Helper()
-	waitForLogCount(t, g, substr, 1, timeout)
-}
-
-// waitForLogCount waits until substr has appeared at least want times.
-// Substrings that repeat every apply (like "configuration reloaded") need a
-// count, not a membership check, or the wait passes on an older line.
-func waitForLogCount(t testing.TB, g *Gateway, substr string, want int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if strings.Count(g.Logs(), substr) >= want {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("logs never contained %q %d times\nlogs:\n%s", substr, want, g.output.String())
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// Stats fetches and decodes /stats.
-func (g *Gateway) Stats() (*StatsView, error) {
-	resp, err := http.Get("http://" + g.Addr + "/stats")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var st StatsView
-	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
-		return nil, err
-	}
-	return &st, nil
-}
-
-// RawStats returns the /stats body verbatim, for redaction assertions.
-func (g *Gateway) RawStats(t testing.TB) string {
-	t.Helper()
-	resp, err := http.Get("http://" + g.Addr + "/stats")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
-	return string(raw)
-}
-
-// Logs returns captured gateway stdout/stderr.
-func (g *Gateway) Logs() string { return g.output.String() }
-
-func (g *Gateway) stop() {
-	if g.cmd == nil || (g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited()) {
-		return
-	}
+	g.stopped = true
+	g.stopMu.Unlock()
 	_ = g.cmd.Process.Signal(syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() { _ = g.cmd.Wait(); close(done) }()
 	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
+	case err := <-g.exited:
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 0 {
+			return nil
+		}
+		return err
+	case <-time.After(timeout):
 		_ = g.cmd.Process.Kill()
-		<-done
+		return <-g.exited
 	}
 }
 
-// --- admin API client ---
-
-// adminClient talks to the admin API with a cookie jar, like a browser.
-type adminClient struct {
-	base string
-	http *http.Client
-}
-
-func newAdminClient(base string) (*adminClient, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
-	}
-	return &adminClient{base: "http://" + base, http: &http.Client{Jar: jar, Timeout: 15 * time.Second}}, nil
-}
-
-// do sends one JSON request and returns status, headers and the raw body.
-func (a *adminClient) do(t testing.TB, method, path string, body any) (int, http.Header, string) {
-	t.Helper()
-	var reader io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reader = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequest(method, a.base+path, reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	res, err := a.http.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = res.Body.Close() }()
-	raw, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return res.StatusCode, res.Header, string(raw)
-}
-
-// AdminDo is the escape hatch for tests asserting on raw API behavior.
-func (g *Gateway) AdminDo(t testing.TB, method, path string, body any) (int, http.Header, string) {
+// exitOK asserts a clean SIGTERM exit within timeout.
+func (g *gatewayProc) exitOK(timeout time.Duration) {
 	g.t.Helper()
-	return g.admin.do(t, method, path, body)
-}
-
-// Setup performs first-run setup and fails on any non-200.
-func (g *Gateway) Setup(t testing.TB, password string) {
-	t.Helper()
-	code, _, body := g.admin.do(t, http.MethodPost, "/api/v1/setup", map[string]string{
-		"password": password, "confirm": password,
-	})
-	if code != http.StatusOK {
-		t.Fatalf("setup status = %d: %s\nlogs:\n%s", code, body, g.Logs())
+	if err := g.stop(timeout); err != nil {
+		g.t.Fatalf("gateway did not exit cleanly: %v\nlog:\n%s", err, g.logDump())
 	}
 }
 
-// Login attempts a login and returns the status code.
-func (g *Gateway) Login(t testing.TB, password string) int {
+// scanLog fails the test when a secret or a relay/fake URL appears anywhere
+// in the process log — including the transport-failure paths, whose Go
+// *url.Error strings the sanitizer strips down to `Get "…": cause`.
+func (g *gatewayProc) scanLog(t *testing.T, fake *fakeEdge) {
 	t.Helper()
-	code, _, _ := g.admin.do(t, http.MethodPost, "/api/v1/login", map[string]string{"password": password})
-	return code
-}
-
-// CreateRelay creates one relay through the API and fails on non-201.
-func (g *Gateway) CreateRelay(t testing.TB, seed RelaySeed) int64 {
-	t.Helper()
-	fields := map[string]any{
-		"name": seed.Name, "provider": seed.Provider, "url": seed.URL,
-	}
-	if seed.AccountID != nil {
-		fields["accountId"] = *seed.AccountID
-	}
-	if seed.Active != nil {
-		fields["active"] = *seed.Active
-	}
-	code, _, body := g.admin.do(t, http.MethodPost, "/api/v1/relays", fields)
-	if code != http.StatusCreated {
-		t.Fatalf("create relay %s status = %d: %s\nlogs:\n%s", seed.Name, code, body, g.Logs())
-	}
-	var created struct {
-		ID int64 `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(body), &created); err != nil {
-		t.Fatalf("decode created relay: %v (%s)", err, body)
-	}
-	return created.ID
-}
-
-// PatchRelay patches one relay and returns status plus the decoded body.
-func (g *Gateway) PatchRelay(t testing.TB, id int64, fields map[string]any) (int, map[string]any) {
-	t.Helper()
-	code, _, raw := g.admin.do(t, http.MethodPatch, "/api/v1/relays/"+strconv.FormatInt(id, 10), fields)
-	var parsed map[string]any
-	_ = json.Unmarshal([]byte(raw), &parsed)
-	return code, parsed
-}
-
-// DeleteRelay deletes one relay and fails on non-200.
-func (g *Gateway) DeleteRelay(t testing.TB, id int64) {
-	t.Helper()
-	code, _, body := g.admin.do(t, http.MethodDelete, "/api/v1/relays/"+strconv.FormatInt(id, 10), nil)
-	if code != http.StatusOK {
-		t.Fatalf("delete relay %d status = %d: %s", id, code, body)
-	}
-}
-
-// PutProviders replaces the provider set (name -> max body bytes).
-func (g *Gateway) PutProviders(t testing.TB, providers map[string]int64) {
-	t.Helper()
-	rows := make([]map[string]any, 0, len(providers))
-	names := make([]string, 0, len(providers))
-	for name := range providers {
-		names = append(names, name)
-	}
-	// Sorted for determinism in failures.
-	for i := 1; i < len(names); i++ {
-		for j := i; j > 0 && names[j] < names[j-1]; j-- {
-			names[j], names[j-1] = names[j-1], names[j]
+	log := g.logDump()
+	markers := []string{g.key}
+	markers = append(markers, fake.secretMarkers()...)
+	markers = append(markers, fake.urlMarkers()...)
+	for _, m := range markers {
+		if m == "" {
+			continue
 		}
-	}
-	for _, name := range names {
-		rows = append(rows, map[string]any{"name": name, "maxBody": providers[name]})
-	}
-	code, _, body := g.admin.do(t, http.MethodPut, "/api/v1/providers", rows)
-	if code != http.StatusOK {
-		t.Fatalf("put providers status = %d: %s", code, body)
-	}
-}
-
-// PatchSettings patches runtime settings and fails on non-200.
-func (g *Gateway) PatchSettings(t testing.TB, fields map[string]any) {
-	t.Helper()
-	code, _, body := g.admin.do(t, http.MethodPatch, "/api/v1/settings", fields)
-	if code != http.StatusOK {
-		t.Fatalf("patch settings status = %d: %s", code, body)
-	}
-}
-
-// AdminStatus returns setupRequired from the public status endpoint.
-func (g *Gateway) AdminStatus(t testing.TB) bool {
-	t.Helper()
-	code, _, raw := g.admin.do(t, http.MethodGet, "/api/v1/status", nil)
-	if code != http.StatusOK {
-		t.Fatalf("admin status = %d: %s", code, raw)
-	}
-	var parsed struct {
-		SetupRequired bool `json:"setupRequired"`
-	}
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		t.Fatal(err)
-	}
-	return parsed.SetupRequired
-}
-
-// edgeSim is one fake edge relay (the Vercel/Deno/Cloudflare deployment the
-// gateway forwards into). It records the last request and answers with its
-// own name, so assertions can tell which relay served. It also behaves like
-// the embedded worker for the readiness gate: the unauthenticated version
-// route answers direct version probes and, as the inner origin, end-to-end
-// forward probes — a probe counts separately from relay traffic, and the
-// forward path can be broken at will to exercise probe failures.
-type edgeSim struct {
-	name string
-	URL  string
-	srv  *httptest.Server
-
-	mu            sync.Mutex
-	headers       http.Header
-	body          []byte
-	hits          int
-	forwardProbes int
-	forwardBroken bool
-}
-
-func (s *edgeSim) header(name string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.headers == nil {
-		return ""
-	}
-	return s.headers.Get(name)
-}
-
-func (s *edgeSim) lastBody() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]byte(nil), s.body...)
-}
-
-func (s *edgeSim) hitCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hits
-}
-
-func (s *edgeSim) servedBody() string { return s.name + "\n" }
-
-// setForwardBroken flips the origin path of the end-to-end forward probe to
-// 502 — the worker answers, but the forwarded request fails, which the gate
-// classifies as probe_failed (no redeploy, no admission).
-func (s *edgeSim) setForwardBroken(broken bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.forwardBroken = broken
-}
-
-// shutdown kills the server, turning the URL into a refused connection — the
-func (s *edgeSim) shutdown() {
-	if s.srv != nil {
-		s.srv.Close()
-	}
-}
-
-// NewEdgeSim starts one fake edge relay. The response body is the sim's name
-// so tests can identify which relay answered.
-func NewEdgeSim(t testing.TB, name string) *edgeSim {
-	t.Helper()
-	s := &edgeSim{name: name}
-	srv := httptestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-
-		// Both the direct version probe and the inner origin of a forward
-		// probe land on the worker's unauthenticated version route. The
-		// forward probe is the readmission gate for a legacy relay, so it
-		// must never count as relay traffic.
-		relayPath := r.Header.Get("X-Relay-Path")
-		if relayPath == "" {
-			relayPath = r.URL.Path
-		}
-		if r.URL.Path == "/__relay/version" || relayPath == "/__relay/version" {
-			s.mu.Lock()
-			broken := s.forwardBroken
-			s.forwardProbes++
-			s.mu.Unlock()
-			if broken {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadGateway)
-				_, _ = w.Write([]byte(`{"error":"origin unreachable"}`))
-				return
+		if strings.Contains(log, m) {
+			for _, line := range strings.Split(log, "\n") {
+				if strings.Contains(line, m) {
+					t.Errorf("gateway log leaks %q: %s", leakLabel(m, g.key, fake), line)
+					break
+				}
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			_, _ = w.Write([]byte(`{"version":"1"}`))
-			return
 		}
-
-		// Ordinary relay traffic.
-		s.mu.Lock()
-		s.headers = r.Header.Clone()
-		s.body = raw
-		s.hits++
-		s.mu.Unlock()
-		w.Header().Set("Content-Type", "text/plain")
-		w.Header().Set("X-Sim-Relay", name)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(s.servedBody()))
-	}))
-	s.srv = srv
-	s.URL = srv.URL
-	return s
-}
-
-func httptestServer(t testing.TB, h http.Handler) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(h)
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-// relayDo sends one spec-conformant relay request to the gateway: the origin
-// travels in X-Relay-Target, the real path+query
-// in X-Relay-Path, everything else is pass-through. Keep-alives are disabled
-// so one call is one gateway request.
-func relayDo(t testing.TB, addr, path, body string, headers map[string]string) (int, http.Header, string) {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, "http://"+addr+path, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Relay-Target", "https://api.example.com")
-	req.Header.Set("X-Relay-Path", "/v1/messages?beta=true")
+}
+
+// leakLabel names a leaked marker without printing the secret itself.
+func leakLabel(marker, key string, fake *fakeEdge) string {
+	switch marker {
+	case key:
+		return "relay key"
+	default:
+		return fake.markerLabel(marker)
+	}
+}
+
+// --- HTTP helpers ---
+
+var relayClient = &http.Client{Timeout: 30 * time.Second}
+
+// do issues one request against the gateway and returns it with the body
+// fully read.
+func (g *gatewayProc) do(t *testing.T, method, path string, headers map[string]string, body []byte) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), method, g.base+path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{
-		Transport: &http.Transport{DisableKeepAlives: true},
-		Timeout:   15 * time.Second,
-	}
-	resp, err := client.Do(req)
+	resp, err := relayClient.Do(req)
 	if err != nil {
-		t.Fatalf("POST http://%s%s: %v", addr, path, err)
+		t.Fatalf("%s %s: %v", method, path, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, resp.Header, string(raw)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("%s %s: read body: %v", method, path, err)
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
+	return resp, raw
+}
+
+// --- typed /stats ---
+
+type statsDoc struct {
+	Version      string `json:"version"`
+	RelayVersion string `json:"relayVersion"`
+	Relays       []struct {
+		Name      string `json:"name"`
+		Provider  string `json:"provider"`
+		Healthy   bool   `json:"healthy"`
+		MaxBody   int64  `json:"maxBody"`
+		Requests  int64  `json:"requests"`
+		Failures  int64  `json:"failures"`
+		LastError string `json:"lastError,omitempty"`
+	} `json:"relays"`
+	Readiness struct {
+		Ready       bool `json:"ready"`
+		ReadyRelays int  `json:"readyRelays"`
+	} `json:"readiness"`
+	Lifecycle []lifecycleRow `json:"lifecycle"`
+}
+
+type lifecycleRow struct {
+	Name       string `json:"name"`
+	Provider   string `json:"provider"`
+	State      string `json:"state"`
+	Reason     string `json:"reason,omitempty"`
+	Generation uint64 `json:"generation"`
+}
+
+func (g *gatewayProc) stats(t *testing.T) *statsDoc {
+	t.Helper()
+	resp, raw := g.do(t, http.MethodGet, "/stats", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/stats: status %d body %s", resp.StatusCode, raw)
+	}
+	d := &statsDoc{}
+	if err := json.Unmarshal(raw, d); err != nil {
+		t.Fatalf("/stats: decode %s: %v", raw, err)
+	}
+	return d
+}
+
+func lifecycleOf(d *statsDoc, provider, name string) (lifecycleRow, bool) {
+	for _, row := range d.Lifecycle {
+		if row.Provider == provider && row.Name == name {
+			return row, true
+		}
+	}
+	return lifecycleRow{}, false
+}
+
+// --- waiting ---
+
+func waitFor(t *testing.T, timeout time.Duration, what string, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+// waitForReady waits until /readyz answers 200.
+func (g *gatewayProc) waitForReady(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, timeout, "/readyz to answer 200", func() bool {
+		resp, raw := g.do(t, http.MethodGet, "/readyz", nil, nil)
+		return resp.StatusCode == http.StatusOK && strings.Contains(string(raw), `"ready":true`)
+	})
+}
+
+// waitForZeroReady waits until /readyz answers 503 with an empty pool.
+func (g *gatewayProc) waitForZeroReady(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, timeout, "/readyz to answer 503", func() bool {
+		resp, _ := g.do(t, http.MethodGet, "/readyz", nil, nil)
+		return resp.StatusCode == http.StatusServiceUnavailable
+	})
+}
+
+// waitForStats polls /stats until pred holds, returning the matching
+// snapshot; on timeout it fails with the last snapshot and the process log.
+func (g *gatewayProc) waitForStats(t *testing.T, timeout time.Duration, what string, pred func(*statsDoc) bool) *statsDoc {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last *statsDoc
+	for time.Now().Before(deadline) {
+		last = g.stats(t)
+		if pred(last) {
+			return last
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s\nlast /stats: %+v\ngateway log:\n%s",
+		timeout, what, last, g.logDump())
+	return nil
+}
+
+// waitForLifecycle waits for one relay's lifecycle row to reach the given
+// state (and reason, when non-empty).
+func (g *gatewayProc) waitForLifecycle(t *testing.T, provider, name, state, reason string, timeout time.Duration) lifecycleRow {
+	t.Helper()
+	label := fmt.Sprintf("relay %s/%s to reach state %s", provider, name, state)
+	if reason != "" {
+		label += fmt.Sprintf(" (reason %s)", reason)
+	}
+	doc := g.waitForStats(t, timeout, label, func(d *statsDoc) bool {
+		row, ok := lifecycleOf(d, provider, name)
+		return ok && row.State == state && (reason == "" || row.Reason == reason)
+	})
+	row, _ := lifecycleOf(doc, provider, name)
+	return row
+}
+
+// --- config and secrets ---
+
+// writeConfig replaces the desired-state file atomically (the poller reads
+// on a one-second tick, rename keeps every read whole).
+func (g *gatewayProc) writeConfig(content string) {
+	g.t.Helper()
+	tmp := filepath.Join(g.dir, fmt.Sprintf("config-%d.yaml", time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		g.t.Fatalf("write config temp: %v", err)
+	}
+	if err := os.Rename(tmp, filepath.Join(g.dir, "config.yaml")); err != nil {
+		g.t.Fatalf("rename config: %v", err)
+	}
+}
+
+// configYAML assembles a desired-state file: fast test cadences plus the
+// given relay blocks.
+func configYAML(relays ...string) string {
+	var b strings.Builder
+	b.WriteString("settings:\n")
+	b.WriteString("  log_level: debug\n")
+	b.WriteString("  failure_threshold: 2\n")
+	b.WriteString("  cooldown: 2s\n")
+	b.WriteString("  max_retries: 1\n")
+	b.WriteString("  verify_interval: 1s\n")
+	b.WriteString("  revive_scan_interval: 2s\n")
+	b.WriteString("  verify_backoff_base: 200ms\n")
+	b.WriteString("  verify_backoff_max: 1s\n")
+	b.WriteString("  verify_recover_max: 300ms\n")
+	b.WriteString("  verify_demote_after: 2\n")
+	if len(relays) > 0 {
+		b.WriteString("relays:\n")
+		for _, r := range relays {
+			b.WriteString(r)
+		}
+	}
+	return b.String()
+}
+
+// relayBlock renders one relay entry; secret is the indented token or
+// token_file line(s).
+func relayBlock(name, provider, secret string) string {
+	return fmt.Sprintf("  - name: %s\n    provider: %s\n%s", name, provider, secret)
+}
+
+// tokenEnvLine is a ${VAR} credential reference resolved from the process
+// environment at load time.
+func tokenEnvLine(varName string) string { return "    token: ${" + varName + "}\n" }
+
+// tokenFileLine points the credential at a secret file.
+func tokenFileLine(path string) string { return "    token_file: " + path + "\n" }
+
+// --- small utilities ---
+
+func freePort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return strconv.Itoa(port)
+}
+
+// randSuffix keeps per-test credentials and marker strings unique, so a
+// leak in one run can never be masked by another run's values.
+func randSuffix(n int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alphabet[rand.IntN(len(alphabet))]
+	}
+	return string(b)
 }

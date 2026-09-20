@@ -1,488 +1,724 @@
 package readiness
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 )
 
-// fakeClock lets tests drive backoff and removal deterministically.
-type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
+// clock is the injected test clock: tests advance it explicitly instead of
+// sleeping.
+type clock struct {
+	nanos int64
 }
 
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
+func newClock() *clock {
+	return &clock{nanos: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()}
 }
 
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
-}
+func (c *clock) Now() time.Time { return time.Unix(0, c.nanos) }
 
-func newFakeClock() *fakeClock {
-	return &fakeClock{now: time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)}
-}
+func (c *clock) Advance(d time.Duration) { c.nanos += int64(d) }
 
-// newTestRegistry builds a registry with a fake clock and tiny knobs so the
-// test matrix can walk every transition without waiting.
-func newTestRegistry() (*Registry, *fakeClock) {
-	clock := newFakeClock()
-	r := New(Config{
-		BackoffBase: 5 * time.Second,
-		BackoffMax:  40 * time.Second,
-		RecoverMax:  2 * time.Second,
+func testRegistry(c *clock) *Registry {
+	return New(Config{
+		BackoffBase: time.Second,
+		BackoffMax:  8 * time.Second,
+		RecoverMax:  4 * time.Second,
+		PauseRetry:  10 * time.Minute,
 		DemoteAfter: 3,
-		Now:         clock.Now,
+		Now:         c.Now,
 	})
-	return r, clock
 }
+
+func key(provider, name string) Key { return Key{Provider: provider, Name: name} }
 
 var (
-	keyA = Key{Provider: "vercel", Name: "alpha"}
-	keyB = Key{Provider: "cloudflare", Name: "bravo"}
+	keyA = key("cloudflare", "alpha")
+	keyB = key("vercel", "beta")
+	keyC = key("deno", "gamma")
 )
 
-// drain eats one pending notification, reporting whether any fired.
-func drain(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
+// admit brings a relay to ready through the normal Begin/Ready flow.
+func admit(t *testing.T, r *Registry, k Key, url, token string) uint64 {
+	t.Helper()
+	release, gen, ok := r.Begin(k)
+	if !ok {
+		t.Fatal("Begin failed on an idle relay")
+	}
+	r.Ready(k, gen, url, token, 10*time.Millisecond)
+	release()
+	if !r.IsReady(k) {
+		t.Fatal("relay not admitted after Ready")
+	}
+	return gen
+}
+
+// generationOf fetches a relay's current incarnation, failing the test when
+// the entry is gone.
+func generationOf(t *testing.T, r *Registry, k Key) uint64 {
+	t.Helper()
+	gen, ok := r.GenerationOf(k)
+	if !ok {
+		t.Fatalf("no registry entry for %v", k)
+	}
+	return gen
+}
+
+func TestSyncAnnouncesNewKeysAndRemovesMissing(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Key{keyA, keyB})
+	rec, ok := r.StateOf(keyA)
+	if !ok || rec.State != StateConfigured || rec.Generation != 1 {
+		t.Fatalf("new key = %+v ok=%t, want configured generation 1", rec, ok)
+	}
+	if r.NotifySeq() != 2 {
+		t.Fatalf("seq = %d, want 2 (one announcement per new key)", r.NotifySeq())
+	}
+
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	if got := r.ReadyCount(); got != 1 {
+		t.Fatalf("readyCount = %d, want 1", got)
+	}
+
+	r.Sync(nil) // keyA leaves the configuration
+	rec, ok = r.StateOf(keyA)
+	if !ok || rec.State != StateRemoving {
+		t.Fatalf("removed key state = %+v ok=%t, want removing", rec, ok)
+	}
+	if rec.Generation != gen+1 {
+		t.Fatalf("generation = %d, want %d (bumped on removal)", rec.Generation, gen+1)
+	}
+	if r.IsReady(keyA) || r.ReadyCount() != 0 || len(r.Serving()) != 0 {
+		t.Fatal("removal must revoke admission atomically")
+	}
+	// Two announcements (keyA, keyB), the admission grant, then two removals
+	// (keyA and the never-admitted keyB both left the configuration).
+	if r.NotifySeq() != 5 {
+		t.Fatalf("seq = %d, want 5", r.NotifySeq())
 	}
 }
 
-func TestSyncAnnouncesConfigured(t *testing.T) {
-	r, _ := newTestRegistry()
+func TestSyncReaddStartsNewIncarnation(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
 	r.Sync([]Key{keyA})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Sync(nil) // removed: generation bumps, admission revoked
+	r.Sync([]Key{keyA})
+
 	rec, ok := r.StateOf(keyA)
 	if !ok || rec.State != StateConfigured {
-		t.Fatalf("record = %+v ok=%v, want configured", rec, ok)
+		t.Fatalf("re-added key state = %+v ok=%t, want configured", rec, ok)
 	}
-	if r.IsReady(keyA) || r.ReadyCount() != 0 {
-		t.Fatalf("a configured relay must never serve: ready=%v count=%d",
-			r.IsReady(keyA), r.ReadyCount())
+	if rec.Generation != gen+2 {
+		t.Fatalf("generation = %d, want %d (removal + re-add)", rec.Generation, gen+2)
 	}
-	if drain(r.Changes()) {
-		t.Fatal("announcing a configured relay must not notify — membership did not change")
-	}
-}
-
-func TestReadyAdmitsAndNotifies(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, 50*time.Millisecond)
-	if !r.IsReady(keyA) || r.ReadyCount() != 1 {
-		t.Fatalf("ready relay not admitted: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
-	}
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateReady || rec.Reason != "" || rec.FailStreak != 0 || rec.LastResult != 50*time.Millisecond {
-		t.Fatalf("record = %+v, want ready with streak 0 and no reason", rec)
-	}
-	if !drain(r.Changes()) {
-		t.Fatal("first admission must notify the applier")
-	}
-	// A second Ready (another successful scan tick) is a no-op admission-wise
-	// and must not fire a second notification for the same membership.
-	r.Ready(keyA, 40*time.Millisecond)
-	if drain(r.Changes()) {
-		t.Fatal("re-verifying an already-serving relay must not re-notify")
-	}
-}
-
-func TestFailingDemotesOnlyAfterThreshold(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	drain(r.Changes()) // consume the admission notification
-
-	// Blip one: still serving, still counted, no notification.
-	r.Failing(keyA, ReasonProbeFailed, time.Second)
-	if drain(r.Changes()) {
-		t.Fatal("a single blip must not notify")
-	}
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateReady || rec.FailStreak != 1 {
-		t.Fatalf("record = %+v, want ready with streak 1", rec)
-	}
-	// Blip two: still the fast layer's job.
-	r.Failing(keyA, ReasonProbeFailed, time.Second)
-	if !r.IsReady(keyA) {
-		t.Fatal("two blips must still not demote")
-	}
-	// Blip three: past the threshold, demoted, notified.
-	r.Failing(keyA, ReasonProbeFailed, time.Second)
-	if r.IsReady(keyA) || r.ReadyCount() != 0 {
-		t.Fatalf("demoted relay must not serve: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
-	}
-	rec, _ = r.StateOf(keyA)
-	if rec.State != StateUnready || rec.Reason != ReasonProbeFailed {
-		t.Fatalf("record = %+v, want unready with %q", rec, ReasonProbeFailed)
-	}
-	if !drain(r.Changes()) {
-		t.Fatal("demotion must notify the applier")
-	}
-
-	// Later failures keep it in unready, never re-admitting silently.
-	r.Failing(keyA, ReasonUnreachable, time.Second)
-	rec, _ = r.StateOf(keyA)
-	if rec.State != StateUnready {
-		t.Fatalf("record = %+v, want unready to persist", rec)
-	}
-	if r.Allow(keyA) {
-		t.Fatal("a fresh failure must close the backoff gate")
-	}
-}
-
-func TestDemoteRevokesAdmissionImmediately(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	drain(r.Changes()) // consume the admission notification
-
-	// A failing replacement drops admission NOW — one Demote, no streak
-	// wait: the previous verified deployment no longer exists.
-	r.Demote(keyA, ReasonProbeFailed)
-	if r.IsReady(keyA) || r.ReadyCount() != 0 {
-		t.Fatalf("demoted relay must not serve: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
-	}
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateUnready || rec.Reason != ReasonProbeFailed {
-		t.Fatalf("record = %+v, want unready with %q", rec, ReasonProbeFailed)
-	}
-	if !drain(r.Changes()) {
-		t.Fatal("demotion must notify the applier")
-	}
-	if r.Allow(keyA) {
-		t.Fatal("a demotion must close the backoff gate")
-	}
-
-	// Re-admission happens only through a successful Ready.
-	r.Ready(keyA, time.Millisecond)
-	if !r.IsReady(keyA) || r.ReadyCount() != 1 {
-		t.Fatalf("ready after demote not admitted: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
-	}
-}
-
-func TestDemoteNeverServedGoesFailed(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Enter(keyA, StateDiscovered, "")
-
-	// A relay that never verified ends up failed, not unready — same
-	// semantics as a Failing streak's never-serving branch.
-	r.Demote(keyA, ReasonAuthFailed)
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateFailed || rec.Reason != ReasonAuthFailed {
-		t.Fatalf("record = %+v, want failed with %q", rec, ReasonAuthFailed)
-	}
-	if r.IsReady(keyA) || r.ReadyCount() != 0 {
-		t.Fatalf("never-served relay must stay out: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
-	}
-}
-
-func TestEnterVerifyingDoesNotResetStreak(t *testing.T) {
-	// Routine scans interleave Enter(verifying) with every attempt. If that
-	// reset the streak, a serving relay failing every scan tick would sit at
-	// streak 1 forever and never demote — the flagship guarantee silently
-	// dies. Verify the demote still fires across interleaved verifying
-	// phases.
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	for range 3 {
-		r.Enter(keyA, StateVerifying, "")
-		r.Failing(keyA, ReasonProbeFailed, time.Second)
-	}
-	if r.IsReady(keyA) || r.ReadyCount() != 0 {
-		t.Fatalf("interleaved verifying phases defeated the demote threshold: ready=%v count=%d",
-			r.IsReady(keyA), r.ReadyCount())
-	}
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateUnready || rec.FailStreak != 3 {
-		t.Fatalf("record = %+v, want unready with streak 3", rec)
-	}
-}
-
-func TestEnterDeployingResetsStreakAndBackoff(t *testing.T) {
-	// A deploy is a genuinely fresh attempt: it clears the failure history
-	// so the new deployment is not pre-judged by the old one's failures.
-	r, clock := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	for range 3 {
-		r.Failing(keyA, ReasonUnreachable, time.Second)
-	}
-	if r.IsReady(keyA) {
-		t.Fatal("precondition: three failures demote")
-	}
-	r.Enter(keyA, StateDeploying, "")
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateDeploying || rec.FailStreak != 0 {
-		t.Fatalf("record = %+v, want deploying with streak 0", rec)
+	if rec.Reason != "" || rec.FailStreak != 0 {
+		t.Fatalf("re-added record = %+v, want a clean slate", rec)
 	}
 	if !r.Allow(keyA) {
-		t.Fatal("a deploying relay must not be backoff-gated")
+		t.Fatal("re-added relay must not inherit the old incarnation's backoff")
 	}
 	if r.IsReady(keyA) {
-		t.Fatal("deploying must never admit a relay")
+		t.Fatal("a new incarnation must re-verify from scratch, never from memory")
 	}
-	clock.Advance(0)
 }
 
-func TestFailingNeverReadyGoesFailed(t *testing.T) {
-	r, _ := newTestRegistry()
+func TestReadyPublishesURLAndTokenAtomically(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
 	r.Sync([]Key{keyA})
-	r.Failing(keyA, ReasonAuthFailed, time.Second)
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateFailed || rec.Reason != ReasonAuthFailed {
-		t.Fatalf("record = %+v, want failed with %q", rec, ReasonAuthFailed)
-	}
-	if r.IsReady(keyA) {
-		t.Fatal("a failed relay must never serve")
-	}
-	// The relay never served, so pool membership is unchanged — but the
-	// lifecycle transition must still reach the applier: /stats and the
-	// admin plane render the failed row from a rebuilt generation, and
-	// without this notification the transition stays invisible forever.
-	if !drain(r.Changes()) {
-		t.Fatal("failure of a never-serving relay must notify for lifecycle visibility")
-	}
-}
 
-func TestUnreadyRecoversToReady(t *testing.T) {
-	r, clock := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	drain(r.Changes()) // admission notification
-	for range 3 {
-		r.Failing(keyA, ReasonUnreachable, time.Second)
-	}
-	drain(r.Changes()) // demotion notification
-	if r.IsReady(keyA) {
-		t.Fatal("precondition: three failures demote")
-	}
-	clock.Advance(time.Hour) // backoff elapses before the recovery attempt
-	r.Ready(keyA, 30*time.Millisecond)
-	if !r.IsReady(keyA) || r.ReadyCount() != 1 {
-		t.Fatalf("recovered relay must serve: ready=%v count=%d", r.IsReady(keyA), r.ReadyCount())
-	}
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateReady || rec.Reason != "" {
-		t.Fatalf("record = %+v, want clean ready", rec)
-	}
-	if !drain(r.Changes()) {
-		t.Fatal("recovery to readiness must notify")
-	}
-}
-
-func TestDeployTransitionsPreserveServingOldDeployment(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	// A replacement deploys: phase shows deploying, the old verified relay
-	// keeps serving — nothing unverified is admitted, nothing healthy is
-	// dropped early.
-	r.Enter(keyA, StateDeploying, "")
-	if !r.IsReady(keyA) || r.ReadyCount() != 1 {
-		t.Fatalf("replacing a healthy relay must keep serving it: ready=%v count=%d",
-			r.IsReady(keyA), r.ReadyCount())
-	}
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateDeploying {
-		t.Fatalf("record = %+v, want deploying phase", rec)
-	}
-	// The replacement finished verifying: back to ready, still serving.
-	r.Ready(keyA, 20*time.Millisecond)
-	rec, _ = r.StateOf(keyA)
-	if rec.State != StateReady || !r.IsReady(keyA) {
-		t.Fatalf("record = %+v ready=%v, want ready and serving", rec, r.IsReady(keyA))
-	}
-}
-
-func TestFirstDeployDoesNotServeUntilReady(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Enter(keyA, StateDeploying, "")
-	if r.IsReady(keyA) {
-		t.Fatal("a never-verified relay must not serve while deploying")
-	}
-	r.Failing(keyA, ReasonDeployFailed, time.Second)
-	rec, _ := r.StateOf(keyA)
-	if rec.State != StateFailed {
-		t.Fatalf("record = %+v, want failed after a failed first deploy", rec)
-	}
-}
-
-func TestBackoffGrowthAndCap(t *testing.T) {
-	// keyB stays serving so keyA's growth is never folded into the
-	// nothing-serves recovery cap — this test pins the pure exponential.
-	r, clock := newTestRegistry()
-	r.Sync([]Key{keyA, keyB})
-	r.Ready(keyB, time.Millisecond)
-
-	failAndCheck := func(wantWait time.Duration) {
-		t.Helper()
-		r.Failing(keyA, ReasonProbeFailed, time.Second)
-		// Closed until wantWait (checked at wantWait-1s), open at wantWait.
-		clock.Advance(wantWait - time.Second)
-		if r.Allow(keyA) {
-			t.Fatalf("gate open at %s; want closed until %s after failure", wantWait-time.Second, wantWait)
-		}
-		clock.Advance(time.Second)
-		if !r.Allow(keyA) {
-			t.Fatalf("gate still closed at %s; want open", wantWait)
-		}
-	}
-
-	// Failure 1 → 5s. Failure 2 → 10s. Failure 3 → 20s. Failure 4 → 40s,
-	// the cap: it must not keep doubling.
-	failAndCheck(5 * time.Second)
-	failAndCheck(10 * time.Second)
-	failAndCheck(20 * time.Second)
-	failAndCheck(40 * time.Second) // would be 80s un-capped
-	failAndCheck(40 * time.Second)
-}
-
-func TestBackoffCappedHardWhileNothingServes(t *testing.T) {
-	r, clock := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	for range 3 {
-		r.Failing(keyA, ReasonUnreachable, time.Second)
-	}
-	if r.ReadyCount() != 0 {
-		t.Fatalf("precondition: nothing serves, count=%d", r.ReadyCount())
-	}
-	// The demoting failure itself gates the next attempt by the grown wait;
-	// from then on, with zero relays serving, the gate reopens within
-	// RecoverMax of every failure — a total outage heals at a steady, fast
-	// cadence instead of waiting out a long backoff.
-	clock.Advance(20 * time.Second)
-	for range 5 {
-		// Wait out the recover cap, then the gate must be open and one more
-		// failure re-gates it for no more than RecoverMax.
-		clock.Advance(2 * time.Second)
-		if !r.Allow(keyA) {
-			t.Fatal("gate must reopen within RecoverMax while nothing serves")
-		}
-		r.Failing(keyA, ReasonProbeFailed, time.Second)
-	}
-}
-func TestStreakCountsPerRelay(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA, keyB})
-	r.Ready(keyA, time.Millisecond)
-	r.Ready(keyB, time.Millisecond)
-	for range 3 {
-		r.Failing(keyB, ReasonProbeFailed, time.Second)
-	}
-	if !r.IsReady(keyA) || r.ReadyCount() != 1 {
-		t.Fatalf("independent relays must not share demotion: keyA ready=%v count=%d",
-			r.IsReady(keyA), r.ReadyCount())
-	}
-	recB, _ := r.StateOf(keyB)
-	if recB.State != StateUnready {
-		t.Fatalf("record = %+v, want unready", recB)
-	}
-}
-
-func TestBeginSingleFlight(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	end, ok := r.Begin(keyA)
+	release, gen, ok := r.Begin(keyA)
 	if !ok {
-		t.Fatal("first Begin must win")
+		t.Fatal("Begin failed")
 	}
-	if _, ok := r.Begin(keyA); ok {
-		t.Fatal("concurrent Begin must lose the single-flight hold")
+	r.Ready(keyA, gen, "https://alpha.example", "rk-1", 5*time.Millisecond)
+	release()
+
+	serving := r.Serving()
+	if len(serving) != 1 {
+		t.Fatalf("serving = %+v, want exactly one admission", serving)
 	}
-	end()
-	if _, ok := r.Begin(keyA); !ok {
-		t.Fatal("Begin must succeed again after release")
+	s := serving[0]
+	if s.Key != keyA || s.URL != "https://alpha.example" || s.Token != "rk-1" || s.Version != gen {
+		t.Fatalf("serving entry = %+v, want the exact verified URL+key pair at generation %d", s, gen)
+	}
+
+	seq := r.NotifySeq()
+	r.Ready(keyA, gen, "https://alpha.example", "rk-1", 5*time.Millisecond)
+	if r.NotifySeq() != seq {
+		t.Error("re-verifying an already-serving relay must not notify")
+	}
+	if got := r.ReadyCount(); got != 1 {
+		t.Fatalf("readyCount = %d after re-verification, want 1", got)
 	}
 }
 
-func TestSyncRemovesDeletedRelay(t *testing.T) {
-	r, clock := newTestRegistry()
-	r.Sync([]Key{keyA, keyB})
-	r.Ready(keyA, time.Millisecond)
-	r.Ready(keyB, time.Millisecond)
-
-	r.Sync([]Key{keyA}) // keyB deleted from config
-	if r.IsReady(keyB) || r.ReadyCount() != 1 {
-		t.Fatalf("deleted relay must leave the pool: ready=%v count=%d", r.IsReady(keyB), r.ReadyCount())
-	}
-	rec, ok := r.StateOf(keyB)
-	if !ok || rec.State != StateRemoving {
-		t.Fatalf("record = %+v ok=%v, want removing phase", rec, ok)
-	}
-	if !drain(r.Changes()) {
-		t.Fatal("removing a serving relay must notify")
-	}
-
-	// After the hold, the removing entry is purged; a re-added relay must
-	// re-verify from scratch, never remembered-ready.
-	clock.Advance(removingHold + time.Second)
+func TestStaleCompletionsAreDiscarded(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
 	r.Sync([]Key{keyA})
-	if _, ok := r.StateOf(keyB); ok {
-		t.Fatal("removing entry must be purged after the hold")
+	release, gen, ok := r.Begin(keyA)
+	if !ok {
+		t.Fatal("Begin failed")
 	}
-	r.Sync([]Key{keyA, keyB})
-	if r.IsReady(keyB) {
-		t.Fatal("re-added relay must start configured, never remembered-ready")
-	}
-}
+	r.Sync(nil) // removal invalidates every in-flight operation on gen
 
-func TestSyncResurrectsReaddedWithinHold(t *testing.T) {
-	// A relay deleted and re-added before the removal hold elapses must read
-	// configured again — the registry mirrors the database rows, and the row
-	// now exists.
-	r, clock := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Ready(keyA, time.Millisecond)
-	r.Sync(nil) // deleted
-	clock.Advance(10 * time.Second)
-	r.Sync([]Key{keyA}) // re-added within the hold
+	// Every completion API from the OLD incarnation must land in the void.
+	r.Ready(keyA, gen, "https://stale.example", "rk", time.Millisecond)
+	if r.IsReady(keyA) || len(r.Serving()) != 0 {
+		t.Fatal("stale Ready admitted the old incarnation")
+	}
+	r.Enter(keyA, gen, StateDeploying, "")
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	r.Demote(keyA, gen, ReasonReplacing)
+	r.Pause(keyA, gen, ReasonPaused)
+	r.DeleteDone(keyA, gen)
+	r.DeleteFailed(keyA, gen, "stale delete")
+	release()
+
 	rec, ok := r.StateOf(keyA)
-	if !ok || rec.State != StateConfigured {
-		t.Fatalf("record = %+v ok=%v, want resurrected as configured", rec, ok)
+	if !ok {
+		t.Fatal("stale DeleteDone purged the entry")
+	}
+	if rec.State != StateRemoving || rec.Generation != gen+1 {
+		t.Fatalf("record after stale completions = %+v, want untouched removing at generation %d", rec, gen+1)
+	}
+	if rec.Reason != "" {
+		t.Fatalf("reason = %q, want untouched", rec.Reason)
+	}
+
+	// The current incarnation is configured again: even a CURRENT-generation
+	// DeleteDone is discarded because the relay is not removing.
+	r.Sync([]Key{keyA})
+	rec, _ = r.StateOf(keyA)
+	r.DeleteDone(keyA, rec.Generation)
+	if _, ok := r.StateOf(keyA); !ok {
+		t.Fatal("DeleteDone purged a relay that was not removing")
+	}
+}
+
+func TestFailingBlipsKeepServingUntilDemoteAfter(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	seq := r.NotifySeq()
+
+	r.Failing(keyA, generationOf(t, r, keyA), ReasonUnreachable, 10*time.Millisecond)
+	r.Failing(keyA, generationOf(t, r, keyA), ReasonUnreachable, 10*time.Millisecond)
+	if !r.IsReady(keyA) {
+		t.Fatal("two blips must not pull a verified relay out of rotation")
+	}
+	if r.NotifySeq() != seq {
+		t.Error("blips below the threshold must not notify")
+	}
+
+	rec, _ := r.StateOf(keyA)
+	if rec.FailStreak != 2 || rec.Reason != ReasonUnreachable {
+		t.Fatalf("record = %+v, want streak 2 with the failure reason recorded", rec)
+	}
+
+	r.Failing(keyA, generationOf(t, r, keyA), ReasonUnreachable, 10*time.Millisecond)
+	if r.IsReady(keyA) {
+		t.Fatal("the third consecutive failure must revoke admission")
+	}
+	rec, _ = r.StateOf(keyA)
+	if rec.State != StateUnready {
+		t.Fatalf("state = %s, want unready", rec.State)
+	}
+	if r.NotifySeq() != seq+1 {
+		t.Fatalf("seq = %d, want %d (demote notifies)", r.NotifySeq(), seq+1)
+	}
+}
+
+func TestDemoteRevokesImmediatelyAndIdempotently(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+
+	gen := generationOf(t, r, keyA)
+	r.Demote(keyA, gen, ReasonReplacing)
+	if r.IsReady(keyA) || r.ReadyCount() != 0 {
+		t.Fatal("Demote must revoke admission immediately, bypassing the streak")
+	}
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StateUnready || rec.Reason != ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing", rec.State, rec.Reason)
+	}
+	if rec.FailStreak != 3 {
+		t.Fatalf("FailStreak = %d, want the DemoteAfter threshold", rec.FailStreak)
+	}
+
+	seq := r.NotifySeq()
+	r.Demote(keyA, gen, ReasonReplacing)
+	if r.NotifySeq() != seq {
+		t.Error("a second Demote of an already-demoted relay must not notify")
+	}
+	if rec, _ := r.StateOf(keyA); rec.State != StateUnready {
+		t.Fatalf("state after the second Demote = %s, want still unready", rec.State)
+	}
+}
+
+func TestDemoteNeverServingLabelsFailed(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	seq := r.NotifySeq()
+
+	r.Demote(keyA, generationOf(t, r, keyA), ReasonVersionFailed)
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StateFailed || rec.Reason != ReasonVersionFailed {
+		t.Fatalf("state/reason = %s/%s, want failed/version_failed", rec.State, rec.Reason)
 	}
 	if r.IsReady(keyA) {
-		t.Fatal("resurrected relay must re-verify from scratch")
+		t.Fatal("a never-serving relay gained admission via Demote")
+	}
+	if r.NotifySeq() != seq+1 {
+		t.Fatalf("seq = %d, want %d", r.NotifySeq(), seq+1)
 	}
 }
 
-func TestSyncRemovesUnreadyWithoutNotify(t *testing.T) {
-	r, _ := newTestRegistry()
-	r.Sync([]Key{keyA})
-	r.Failing(keyA, ReasonAuthFailed, time.Second)
-	drain(r.Changes()) // the never-serving failure transition notified
-	r.Sync(nil)
-	if drain(r.Changes()) {
-		t.Fatal("removing a never-serving relay must not notify — the pool did not change")
-	}
-}
-
-func TestSnapshotSortedDeterministic(t *testing.T) {
-	r, _ := newTestRegistry()
+func TestBackoffDoublesAndCapsWhileSomethingServes(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
 	r.Sync([]Key{keyA, keyB})
-	r.Ready(keyB, time.Millisecond)
-	r.Enter(keyA, StateVerifying, "")
-	records := r.Snapshot()
-	if len(records) != 2 {
-		t.Fatalf("snapshot = %d records, want 2", len(records))
+	admit(t, r, keyB, "https://beta.example", "rk") // readyCount > 0: no RecoverMax cap
+
+	gen := generationOf(t, r, keyA)
+	waits := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second}
+	for i, want := range waits {
+		r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+		if r.Allow(keyA) {
+			t.Fatalf("streak %d: attempt allowed immediately after failure", i+1)
+		}
+		c.Advance(want - time.Second)
+		if r.Allow(keyA) {
+			t.Fatalf("streak %d: attempt allowed after %s, want to wait %s", i+1, want-time.Second, want)
+		}
+		c.Advance(time.Second)
+		if !r.Allow(keyA) {
+			t.Fatalf("streak %d: attempt still blocked after the full %s wait", i+1, want)
+		}
 	}
-	// Sorted by "provider/name": cloudflare/bravo before vercel/alpha, and
-	// only keyB holds admission.
-	if records[0].Key != keyB || records[1].Key != keyA {
-		t.Fatalf("snapshot order = %v, %v; want keyB then keyA", records[0].Key, records[1].Key)
+}
+
+func TestRecoverMaxCapsBackoffWhenNothingServes(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA}) // nothing serving at all
+
+	gen := generationOf(t, r, keyA)
+	for range 4 {
+		r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
 	}
-	if records[0].State != StateReady || records[1].State != StateVerifying {
-		t.Fatalf("records = %+v, %+v; want ready and verifying", records[0], records[1])
+	// The exponential wait would be 8s (BackoffMax); RecoverMax caps it at 4s.
+	if r.Allow(keyA) {
+		t.Fatal("attempt allowed immediately after failure")
+	}
+	c.Advance(3 * time.Second)
+	if r.Allow(keyA) {
+		t.Fatal("attempt allowed before the RecoverMax window")
+	}
+	c.Advance(1 * time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("attempt blocked past the RecoverMax window")
+	}
+}
+
+func TestReadyAndDeployingResetTheGate(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if r.Allow(keyA) {
+		t.Fatal("gate should be closed after failures")
+	}
+
+	// Ready resets streak and gate.
+	r.Ready(keyA, gen, "https://alpha.example", "rk", time.Millisecond)
+	if !r.Allow(keyA) {
+		t.Fatal("Ready must reopen the backoff gate")
+	}
+	rec, _ := r.StateOf(keyA)
+	if rec.FailStreak != 0 {
+		t.Fatalf("FailStreak = %d after Ready, want 0", rec.FailStreak)
+	}
+
+	// Enter(deploying) counts as a fresh attempt; routine phases do not.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if r.Allow(keyA) {
+		t.Fatal("gate should be closed again")
+	}
+	r.Enter(keyA, gen, StateVerifying, "")
+	if r.Allow(keyA) {
+		t.Fatal("Enter(verifying) must not reset the backoff gate")
+	}
+	r.Enter(keyA, gen, StateDeploying, "")
+	if !r.Allow(keyA) {
+		t.Fatal("Enter(deploying) must reset the backoff gate")
+	}
+	rec, _ = r.StateOf(keyA)
+	if rec.FailStreak != 0 {
+		t.Fatalf("FailStreak = %d after Enter(deploying), want 0", rec.FailStreak)
+	}
+}
+
+func TestPauseUsesTheRevivalCadence(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA, keyB})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	admit(t, r, keyB, "https://beta.example", "rk")
+
+	r.Pause(keyA, generationOf(t, r, keyA), ReasonPaused)
+	if r.IsReady(keyA) || r.ReadyCount() != 1 {
+		t.Fatal("Pause must revoke admission immediately")
+	}
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+
+	// The gate is armed at the revival cadence, not the ordinary backoff —
+	// 10 minutes out even though the failure backoff would have been 1s.
+	c.Advance(9 * time.Minute)
+	if r.Allow(keyA) {
+		t.Fatal("paused relay re-probed before the revival cadence")
+	}
+	c.Advance(1 * time.Minute)
+	if !r.Allow(keyA) {
+		t.Fatal("paused relay still blocked at the revival cadence")
+	}
+}
+
+func TestFailingKeepsPausedRelaysPaused(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+	r.Pause(keyA, gen, ReasonPaused)
+
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StatePaused {
+		t.Fatalf("state = %s, want still paused (the revival scan owns it)", rec.State)
+	}
+	if rec.Reason != ReasonUnreachable {
+		t.Fatalf("reason = %q, want refreshed", rec.Reason)
+	}
+	if r.IsReady(keyA) {
+		t.Fatal("paused relay admitted")
+	}
+}
+
+func TestDeleteLifecycleGuardsAndPurge(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	// BeginDelete refuses anything that is not labeled removing.
+	r.Sync([]Key{keyA})
+	if _, _, ok := r.BeginDelete(keyA); ok {
+		t.Fatal("BeginDelete succeeded on a configured relay")
+	}
+
+	r.Sync(nil)
+	release, gen, ok := r.BeginDelete(keyA)
+	if !ok {
+		t.Fatal("BeginDelete failed on a removing relay")
+	}
+	if _, _, ok := r.BeginDelete(keyA); ok {
+		t.Fatal("a second delete started while the first holds the relay")
+	}
+	if _, _, ok := r.Begin(keyA); ok {
+		t.Fatal("a deploy started while a delete holds the relay")
+	}
+
+	r.DeleteFailed(keyA, gen, "platform 500")
+	rec, ok := r.StateOf(keyA)
+	if !ok || rec.State != StateRemoving {
+		t.Fatalf("record after DeleteFailed = %+v ok=%t, want still removing", rec, ok)
+	}
+	if rec.Reason != "platform 500" {
+		t.Fatalf("reason = %q, want the delete failure", rec.Reason)
+	}
+	if rec.FailStreak != 1 {
+		t.Fatalf("FailStreak = %d, want 1 (a failed delete is a failed attempt)", rec.FailStreak)
+	}
+	if r.Allow(keyA) {
+		t.Fatal("the delete retry must be backoff-gated")
+	}
+	release()
+
+	r.DeleteDone(keyA, gen)
+	if _, ok := r.StateOf(keyA); ok {
+		t.Fatal("DeleteDone must purge the completed removal")
+	}
+	if r.NotifySeq() == 0 {
+		t.Error("the purge never notified")
+	}
+}
+
+func TestSingleFlightSpansTheWholeOperation(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+
+	release, gen, ok := r.Begin(keyA)
+	if !ok {
+		t.Fatal("first Begin failed")
+	}
+	if _, _, ok := r.Begin(keyA); ok {
+		t.Fatal("second Begin succeeded while the first holds the relay")
+	}
+	release()
+	release2, gen2, ok := r.Begin(keyA)
+	if !ok {
+		t.Fatal("Begin failed after release")
+	}
+	if gen2 != gen {
+		t.Fatalf("generation moved from %d to %d without a removal", gen, gen2)
+	}
+	release2()
+}
+
+func TestNotificationSemantics(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+	base := r.NotifySeq() // two announcements so far: keyA + keyB absent
+
+	// Plain phase moves never notify.
+	r.Enter(keyA, gen, StateDiscovering, "")
+	if r.NotifySeq() != base {
+		t.Fatalf("seq = %d after Enter, want %d", r.NotifySeq(), base)
+	}
+
+	// A first failure of a never-serving relay changes the lifecycle record.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if r.NotifySeq() != base+1 {
+		t.Fatalf("seq = %d after first Failing, want %d", r.NotifySeq(), base+1)
+	}
+
+	// Granting admission notifies; re-verifying it does not.
+	r.Ready(keyA, gen, "https://alpha.example", "rk", time.Millisecond)
+	if r.NotifySeq() != base+2 {
+		t.Fatalf("seq = %d after admission, want %d", r.NotifySeq(), base+2)
+	}
+	r.Ready(keyA, gen, "https://alpha.example", "rk", time.Millisecond)
+	if r.NotifySeq() != base+2 {
+		t.Fatalf("seq = %d after re-verification, want %d", r.NotifySeq(), base+2)
+	}
+
+	// Revocation notifies.
+	r.Pause(keyA, gen, ReasonPaused)
+	if r.NotifySeq() != base+3 {
+		t.Fatalf("seq = %d after Pause, want %d", r.NotifySeq(), base+3)
+	}
+}
+
+func TestChangesChannelCoalescesBursts(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA, keyB, keyC})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	admit(t, r, keyB, "https://beta.example", "rk")
+	r.Demote(keyA, generationOf(t, r, keyA), ReasonReplacing)
+
+	select {
+	case <-r.Changes():
+	default:
+		t.Fatal("a burst of notifications left no pending signal")
+	}
+	select {
+	case <-r.Changes():
+		t.Fatal("the coalesced channel delivered more than one signal per burst")
+	default:
+	}
+}
+
+func TestServingAndSnapshotAreSorted(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyC, keyA, keyB})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	admit(t, r, keyC, "https://gamma.example", "rk")
+	admit(t, r, keyB, "https://beta.example", "rk")
+
+	var got []string
+	for _, s := range r.Serving() {
+		got = append(got, s.Key.String())
+	}
+	want := []string{keyA.String(), keyC.String(), keyB.String()} // sorted by key string
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("serving order = %v, want %v", got, want)
+	}
+
+	recs := r.Snapshot()
+	if len(recs) != 3 {
+		t.Fatalf("snapshot = %d records, want 3", len(recs))
+	}
+	for i, rec := range recs {
+		if rec.Key.String() != want[i] {
+			t.Fatalf("snapshot[%d] = %s, want %s", i, rec.Key.String(), want[i])
+		}
+	}
+}
+
+func TestDefaultsTakeTheDocumentedValues(t *testing.T) {
+	c := newClock()
+	r := New(Config{Now: c.Now})
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+	admit(t, r, keyA, "https://alpha.example", "rk")
+
+	// DemoteAfter defaults to 3.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if !r.IsReady(keyA) {
+		t.Fatal("default DemoteAfter is not 3")
+	}
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if r.IsReady(keyA) {
+		t.Fatal("relay still serving after three failures at the default threshold")
+	}
+
+	// After the demote the fleet sits at zero-ready: the relay dropped out
+	// of readyCount before the gate was computed, so the very first gate is
+	// capped at the default 15s RecoverMax — a total outage heals fast, not
+	// at the uncapped 3 × 5s = 20s.
+	c.Advance(14 * time.Second)
+	if r.Allow(keyA) {
+		t.Fatal("zero-ready demotion gate must be capped at the 15s RecoverMax")
+	}
+	c.Advance(1 * time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("relay still blocked after the RecoverMax ceiling")
+	}
+}
+
+func TestConcurrencyKeepsCountersConsistent(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	keys := []Key{keyA, keyB, keyC,
+		key("cloudflare", "delta"), key("vercel", "epsilon"), key("deno", "zeta")}
+	r.Sync(keys)
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for range 120 {
+				k := keys[(i+len(keys))%len(keys)]
+				switch i % 4 {
+				case 0:
+					release, gen, ok := r.Begin(k)
+					if !ok {
+						continue
+					}
+					r.Ready(k, gen, "https://"+k.Name+".example", "rk", time.Millisecond)
+					release()
+				case 1:
+					if gen, ok := r.GenerationOf(k); ok {
+						r.Failing(k, gen, ReasonUnreachable, time.Millisecond)
+					}
+				case 2:
+					if rel, gen, ok := r.Begin(k); ok {
+						r.Demote(k, gen, ReasonReplacing)
+						rel()
+					}
+				default:
+					_ = r.Serving()
+					_ = r.ReadyCount()
+					_ = r.Snapshot()
+					_, _ = r.StateOf(k)
+					_ = r.Allow(k)
+					_ = r.IsReady(k)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if r.ReadyCount() != len(r.Serving()) {
+		t.Fatalf("readyCount = %d, len(Serving) = %d — counters diverged",
+			r.ReadyCount(), len(r.Serving()))
+	}
+	ready := map[Key]bool{}
+	for _, s := range r.Serving() {
+		ready[s.Key] = true
+		if !r.IsReady(s.Key) {
+			t.Fatalf("serving relay %v is not admitted", s.Key)
+		}
+	}
+	for _, rec := range r.Snapshot() {
+		if ready[rec.Key] != r.IsReady(rec.Key) {
+			t.Fatalf("snapshot/serving disagreement for %v", rec.Key)
+		}
+	}
+}
+
+func TestDemoteIntoTotalOutageCapsTheFirstGateAtRecoverMax(t *testing.T) {
+	c := newClock()
+	// A base far above RecoverMax: if the demotion counted itself as ready
+	// when the gate was computed, the first gate would be 30s << 2 uncapped;
+	// the contract caps a total outage at RecoverMax from the very first
+	// retry.
+	r := New(Config{
+		BackoffBase: 30 * time.Second,
+		BackoffMax:  5 * time.Minute,
+		RecoverMax:  15 * time.Second,
+		PauseRetry:  10 * time.Minute,
+		DemoteAfter: 3,
+		Now:         c.Now,
+	})
+	r.Sync([]Key{keyA})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Demote(keyA, gen, ReasonReplacing)
+	c.Advance(14 * time.Second)
+	if r.Allow(keyA) {
+		t.Fatal("first gate after a total-outage demote exceeded RecoverMax")
+	}
+	c.Advance(1 * time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("RecoverMax ceiling did not release the retry gate")
+	}
+}
+
+func TestPausedRelayKeepsItsRevivalGateThroughOrdinaryFailures(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Pause(keyA, gen, ReasonPaused)
+
+	// A generic probe failure while paused must not erode the PauseRetry
+	// gate into ordinary backoff: the revival cadence holds until a marked
+	// suspension answer or the revival itself re-arms it.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if rec, _ := r.StateOf(keyA); rec.State != StatePaused {
+		t.Fatalf("state = %q, want paused", rec.State)
+	}
+	if r.Allow(keyA) {
+		t.Fatal("paused relay retry gate did not hold at PauseRetry after an ordinary failure")
+	}
+	c.Advance(8 * time.Second) // far beyond any ordinary backoff step
+	if r.Allow(keyA) {
+		t.Fatal("ordinary failure eroded the pause gate below PauseRetry")
+	}
+	c.Advance(10 * time.Minute) // past the PauseRetry cadence
+	if !r.Allow(keyA) {
+		t.Fatal("pause gate did not release at the PauseRetry cadence")
 	}
 }

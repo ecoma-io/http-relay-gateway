@@ -8,7 +8,6 @@ allowBuilds:
   lefthook: true
   esbuild: true
 
-# The management SPA lives here; `make web` builds it and syncs the output
-# into internal/web/dist for go:embed.
-packages:
-  - web
+# No workspace packages remain: the management SPA is gone; the root manifest
+# carries the repo toolchain (commitlint, lefthook, prettier) only.
+packages: []

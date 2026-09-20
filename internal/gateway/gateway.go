@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,14 +29,14 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// HeaderProvider pins a provider ("vercel" | "cloudflare" | "deno" | ...).
+// HeaderProvider pins a provider ("vercel" | "cloudflare" | "deno").
 // Empty, "none", "auto" or "all" means round-robin across every provider.
 const HeaderProvider = "X-Relay-Provider"
 
-// HeaderToken authenticates the gateway to a managed relay. A
-// client-supplied value is always stripped: only the gateway's own stored
-// token may ever authenticate, and only when the relay leg is built (the
-// engine sends it once managed relays exist).
+// HeaderToken authenticates the gateway to a relay's worker. A
+// client-supplied value is always stripped: only the verified snapshot's
+// token may ever authenticate, and it is set only when the relay leg is
+// built.
 const HeaderToken = "X-Relay-Token"
 
 // HeaderTarget and HeaderPath carry the relay spec's origin and real path.
@@ -51,7 +52,9 @@ func unpinned(v string) bool { return v == "" || v == "none" || v == "auto" || v
 
 // State is one coherent serving snapshot, swappable atomically. Everything
 // the hot path reads is resolved here — request handling never re-derives
-// limits or rebuilds clients.
+// limits or rebuilds clients. The pool is built exclusively from the
+// readiness registry's verified serving snapshot, so membership here means
+// "verified for the current incarnation".
 type State struct {
 	Pool   *pool.Pool
 	Client *http.Client
@@ -76,18 +79,29 @@ type State struct {
 // never carries URLs or tokens: the registry snapshot is the only source,
 // and /stats renders it verbatim.
 type LifecycleRow struct {
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	State    string `json:"state"`
-	Reason   string `json:"reason,omitempty"`
+	Name       string `json:"name"`
+	Provider   string `json:"provider"`
+	State      string `json:"state"`
+	Reason     string `json:"reason,omitempty"`
+	Generation uint64 `json:"generation"`
 }
 
 // Gateway is the root http.Handler.
 type Gateway struct {
-	st      atomic.Pointer[State]
+	st atomic.Pointer[State]
+	// mu serializes the relay hot path's load+pick+track against Swap: a
+	// request either observes the new pool, or it picked from the old one
+	// and its in-flight count is already visible when Swap returns — which
+	// is what makes AwaitIdle exact rather than advisory.
+	mu sync.Mutex
+	// inflight counts requests per relay identity for the replacement
+	// rollout: a relay being replaced must not receive new traffic while
+	// its old incarnation still carries requests.
+	inflight inflight
+
 	version string
 	// relayVersion is the worker generation this binary deploys; /stats
-	// exposes it so the dashboard can compare it against the fleet.
+	// exposes it so the operator can compare it against the fleet.
 	relayVersion string
 	log          zerolog.Logger
 }
@@ -130,13 +144,43 @@ func New(st *State, version, relayVersion string, log zerolog.Logger) *Gateway {
 	return g
 }
 
-// Swap atomically replaces the active state (reload, settings change). The
-// outgoing client's idle connections are closed so a timeout-settings
-// change does not strand pooled keep-alive sockets; in-flight requests on
-// the old client finish untouched.
+// Swap atomically replaces the active state. The mutex makes the swap exact
+// for the drain: when Swap returns, every request that will still use the
+// old pool is already counted in inflight, so an AwaitIdle call after Swap
+// cannot miss one. The outgoing client's idle connections are closed so a
+// timeout-settings change does not strand pooled keep-alive sockets;
+// in-flight requests on the old client finish untouched.
 func (g *Gateway) Swap(st *State) {
-	if old := g.st.Swap(st); old != nil && old.Client != nil {
+	g.mu.Lock()
+	old := g.st.Swap(st)
+	g.mu.Unlock()
+	if old != nil && old.Client != nil {
 		old.Client.CloseIdleConnections()
+	}
+}
+
+// AwaitIdle blocks until the relay identity (provider, name) carries no
+// in-flight request, or the timeout expires. The replacement rollout calls
+// it after demotion and the pool swap, before the new deploy may cut over:
+// serving traffic must have drained from the old incarnation first. It
+// reports whether the drain completed.
+func (g *Gateway) AwaitIdle(provider, name string, timeout time.Duration) bool {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		ch := g.inflight.zeroChan(provider, name)
+		if ch == nil {
+			return true
+		}
+		select {
+		case <-ch:
+			// The count reached zero; loop once to re-check in case a new
+			// request began in the interim (the caller demoted first, so
+			// this can only be a straggler finishing, not new traffic).
+			continue
+		case <-deadline.C:
+			return false
+		}
 	}
 }
 
@@ -302,7 +346,21 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 	var lastErr error
 	skippedBySize := 0
 	for attempt := range attempts {
-		relay := st.Pool.Pick(key)
+		// Pick and register in flight under one lock, from the CURRENT
+		// generation — not the snapshot taken at entry: a request that
+		// arrived before a Swap but picks after it (body buffering can hold
+		// it for seconds) must drain from the new pool, or Swap + AwaitIdle
+		// would conclude the old generation idle while this request was
+		// still to come, and the replacement would deploy beneath it.
+		// Serializing the load with Swap inside the same mutex that guards
+		// inflight keeps that window closed: every post-Swap pick is visible
+		// to AwaitIdle before the Swap returns.
+		g.mu.Lock()
+		relay := g.st.Load().Pool.Pick(key)
+		if relay != nil {
+			g.inflight.begin(relay.Provider, relay.Name)
+		}
+		g.mu.Unlock()
 		if relay == nil {
 			jsonError(w, http.StatusServiceUnavailable, "no relay configured for "+key)
 			return
@@ -310,6 +368,7 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		// Provider body limits are only enforceable on a buffered body; a
 		// streaming body goes to the picked relay as-is by design.
 		if !streaming && int64(len(body)) > relay.MaxBody {
+			g.inflight.end(relay.Provider, relay.Name)
 			skippedBySize++
 			log.Debug().Str("relay", relay.Name).Str("provider", relay.Provider).
 				Int64("body", int64(len(body))).Int64("maxBody", relay.MaxBody).
@@ -319,6 +378,7 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		start := time.Now()
 		resp, err := g.roundTrip(st.Client, r, relay, body, liveBody)
 		if err != nil {
+			g.inflight.end(relay.Provider, relay.Name)
 			// The request never produced a response — health-recorded
 			// everywhere; replayed on the next relay only while the body was
 			// buffered. Once response bytes have reached the client, or the
@@ -344,6 +404,7 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 			Str("duration", time.Since(start).Round(time.Millisecond).String()).
 			Msg("relayed")
 		g.copyResponse(w, resp)
+		g.inflight.end(relay.Provider, relay.Name)
 		return
 	}
 	if skippedBySize == attempts && skippedBySize > 0 {
@@ -373,10 +434,11 @@ func (g *Gateway) roundTrip(client *http.Client, r *http.Request, relay *pool.Re
 	if err != nil {
 		return nil, err
 	}
-	copyFilteredHeaders(out.Header, r.Header, relay.Policy)
+	copyFilteredHeaders(out.Header, r.Header)
 	if relay.Token != "" {
-		// Managed-relay auth: the stored token is the only one that may ride
-		// this header, and only here — client-supplied values were stripped.
+		// Relay auth: the verified snapshot's token is the only one that may
+		// ride this header, and only here — client-supplied values were
+		// stripped.
 		out.Header.Set(HeaderToken, relay.Token)
 	}
 	return client.Do(out)
@@ -459,11 +521,11 @@ func parseProvider(r *http.Request, p *pool.Pool) (provider string, ok bool) {
 	return "", false
 }
 
-// copyFilteredHeaders forwards end-to-end headers only. Hop-by-hop headers,
+// copyFilteredHeaders forwards end-to-end headers only: hop-by-hop headers,
 // the gateway-internal spec headers (provider pin, relay token) and
-// Content-Length/Host are stripped; then the relay's resolved policy strips
-// and sets. X-Forwarded-For is deliberately never added.
-func copyFilteredHeaders(dst, src http.Header, policy *pool.HeaderPolicy) {
+// Content-Length/Host are stripped. X-Forwarded-For is deliberately never
+// added.
+func copyFilteredHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		ck := http.CanonicalHeaderKey(k)
 		if pool.HopByHop[ck] {
@@ -475,30 +537,6 @@ func copyFilteredHeaders(dst, src http.Header, policy *pool.HeaderPolicy) {
 		}
 		for _, v := range vv {
 			dst.Add(k, v)
-		}
-	}
-	applyHeaderPolicy(dst, policy)
-}
-
-// applyHeaderPolicy applies a resolved policy to the outgoing header set:
-// stripped names are deleted first, then static sets replace their headers —
-// except names the policy also strips, where strip wins.
-func applyHeaderPolicy(dst http.Header, policy *pool.HeaderPolicy) {
-	if policy == nil {
-		return
-	}
-	stripped := make(map[string]bool, len(policy.Strip))
-	for _, name := range policy.Strip {
-		dst.Del(name)
-		stripped[name] = true
-	}
-	for name, values := range policy.Set {
-		if stripped[name] {
-			continue
-		}
-		dst.Del(name)
-		for _, v := range values {
-			dst.Add(name, v)
 		}
 	}
 }
@@ -514,4 +552,64 @@ func providerLabel(provider string) string {
 		return "auto"
 	}
 	return provider
+}
+
+// inflight is the per-relay-identity request counter behind AwaitIdle. Each
+// identity keeps a count plus a channel closed whenever the count reaches
+// zero; waiters observe the close instead of polling. begin must be called
+// under the Gateway mutex (serializing against Swap); end is lock-free
+// against the swap path.
+type inflight struct {
+	mu    sync.Mutex
+	perms map[string]*inflightPerm
+}
+
+type inflightPerm struct {
+	count int
+	zero  chan struct{} // closed on every 1 -> 0 transition
+}
+
+func identityKey(provider, name string) string { return provider + "/" + name }
+
+func (f *inflight) begin(provider, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.perms == nil {
+		f.perms = map[string]*inflightPerm{}
+	}
+	id := identityKey(provider, name)
+	p := f.perms[id]
+	if p == nil {
+		p = &inflightPerm{zero: make(chan struct{})}
+		f.perms[id] = p
+	}
+	if p.count == 0 {
+		p.zero = make(chan struct{})
+	}
+	p.count++
+}
+
+func (f *inflight) end(provider, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.perms[identityKey(provider, name)]
+	if p == nil {
+		return
+	}
+	p.count--
+	if p.count == 0 {
+		close(p.zero)
+	}
+}
+
+// zeroChan returns a channel closed when the identity's count next reaches
+// zero, or nil when it is already zero.
+func (f *inflight) zeroChan(provider, name string) <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.perms[identityKey(provider, name)]
+	if p == nil || p.count == 0 {
+		return nil
+	}
+	return p.zero
 }

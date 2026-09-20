@@ -2,12 +2,13 @@
 #
 # The relay endpoint (20130) has no authentication: the gateway is an
 # internal-network sidecar. Do not publish it beyond the host or compose
-# network. The admin plane (20131) is password-protected but kept on host
-# loopback anyway — reach it at http://127.0.0.1:20131/ and complete the
-# one-time setup on first visit.
+# network.
 #
-# All state lives in the SQLite database inside the named volume; back that
-# volume up and the whole system moves with it.
+# Desired state is the config.yaml bind-mounted into the container; provider
+# credentials and the relay key ride the environment as ${VAR} references
+# resolved inside the file (or live in secret files the container can read).
+# Back up the config file — plus whatever secret store holds the referenced
+# variables — and the whole system moves with it.
 services:
   relay-gateway:
     build:
@@ -16,16 +17,21 @@ services:
         VERSION: 0.1.0-dev
     container_name: relay-gateway
     ports:
-      - "20130:20130" # relay endpoint (HTTP): /healthz and /stats included
-      - "127.0.0.1:20131:20131" # admin plane (setup/login + REST API), host loopback only
+      - "20130:20130" # relay endpoint (HTTP): /healthz, /readyz and /stats included
     environment:
       # Bootstrap-only settings: changes require a container restart.
       LISTEN_ADDR: 0.0.0.0:20130
-      ADMIN_ADDR: 0.0.0.0:20131
-      DATA_FILE: /app/data/gateway.db
+      CONFIG_FILE: /app/config.yaml
+      # Exactly one of the two relay-key sources is required; the key
+      # authenticates the gateway to its own edge relays.
+      RELAY_AUTH_TOKEN: ${RELAY_AUTH_TOKEN:?set RELAY_AUTH_TOKEN}
       # Optional. The drain budget covers in-flight relay requests and must
       # stay below stop_grace_period so docker's SIGKILL never cuts it short.
       # SHUTDOWN_GRACE: 20s
+    volumes:
+      # The desired state. Edit + rewrite the file atomically (mv) — the
+      # poller re-reads it every second and reconciles the fleet to match.
+      - ./config.yaml:/app/config.yaml:ro
     # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
     # above the gateway's SHUTDOWN_GRACE (default 20s) plus a little margin.
     stop_grace_period: 30s
@@ -34,10 +40,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    volumes:
-      # A named volume, not a bind mount: the image runs as uid 65532 and the
-      # volume guarantees it owns the database files without host chowning.
-      - gateway-data:/app/data
     healthcheck:
       test: ["CMD", "/app/http-relay-gateway", "healthcheck"]
       interval: 30s
@@ -45,6 +47,3 @@ services:
       start_period: 15s
       retries: 3
     restart: unless-stopped
-
-volumes:
-  gateway-data:

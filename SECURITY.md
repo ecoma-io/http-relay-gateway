@@ -11,19 +11,19 @@ leaked credential is itself a disclosure.
   reproduction or proof of concept, and your assessment of the impact.
 
 Please never paste real relay URLs with private hostnames, provider
-credentials, platform tokens, or database contents into any report — a PoC
-that needs them should hold placeholders.
+credentials, platform tokens, relay keys, or desired-state file contents
+into any report — a PoC that needs them should hold placeholders.
 
 ## What counts as a vulnerability here
 
-The gateway has two planes with two trust models. The **data plane**
-(relay endpoint, `LISTEN_ADDR`) is an **unauthenticated** network hop whose
-entire purpose is hiding the caller — its security boundary _is_ the
-network placement. The **admin plane** (`ADMIN_ADDR`) holds credentials
-(admin password hash, session secret, platform tokens in the database) and
-authenticates every management call. Defect classes on either plane count
-as security vulnerabilities even when the underlying mechanism is an
-ordinary bug:
+The gateway has one network plane and one credential boundary. The **data
+plane** (relay endpoint, `LISTEN_ADDR`) is an **unauthenticated** network
+hop whose entire purpose is hiding the caller — its security boundary _is_
+the network placement. The **credential boundary** is the relay key plus
+the provider credentials the process holds: the relay key authenticates
+the gateway to its own workers, and the provider credentials manage the
+deployments. Defect classes on either count as security vulnerabilities
+even when the underlying mechanism is an ordinary bug:
 
 - **The client's identity reaching the edge relay or the provider.** The
   documented contract is that the gateway forwards end-to-end headers
@@ -31,16 +31,22 @@ ordinary bug:
   the `X-Relay-Provider` pin. A change that leaks the caller's address,
   a proxy-chain header, or the gateway's own identity upstream defeats the
   reason the gateway exists — the report is a disclosure, not a bug.
-- **A provider credential, relay token, or private relay URL reaching
+- **A provider credential, the relay key, or a private relay URL reaching
   logs, `/stats`, error text, or a response body.** `Authorization` and
   friends must flow through the pipe, never into it; `/stats` exposes relay
-  names, providers, and health — never URLs; the admin API surfaces tokens
-  as a last-4 suffix at most. A redaction that misses a format fails in the
-  quiet direction.
-- **Admin-plane authentication failures.** Session tokens that survive
-  secret rotation they should not, setup re-runnable after completion,
-  rate-limit bypass, or any management endpoint answerable without a valid
-  session are vulnerabilities in the credential boundary, not UI bugs.
+  names, providers, health, and lifecycle — never URLs or tokens. A
+  redaction that misses a format fails in the quiet direction.
+- **Relay-key boundary failures.** A client-supplied `X-Relay-Token` that
+  reaches a relay leg instead of being stripped, a worker accepting
+  traffic without the key, the key surfacing anywhere a caller can read,
+  or relay traffic and probes riding an ambient proxy (HTTP_PROXY) while
+  the data plane goes direct — each defeats the assumption that only this
+  gateway's verified fleet can serve through its workers.
+- **Secret-handling failures in the desired-state surface.** A
+  `${VAR}` reference or secret file whose contents end up in a log line,
+  an error message, or a committed file; credentials leaking through
+  interpolation errors; secret files read with more permissions than the
+  process needs.
 
 Supply-chain defects in the CI itself (an unpinned action, an unpinned
 container image, a workflow interpolating attacker-reachable input into a
@@ -61,10 +67,13 @@ ingress route — hands arbitrary third parties a relay hop through your edge
 deployments and your provider credentials. Treat any such exposure as a
 vulnerability in the deployment, and report it the same way.
 
-The admin plane does authenticate, but its database holds every secret the
-system has: expose it only behind TLS, keep it off shared networks (the
-compose file binds it to host loopback), and set `ADMIN_COOKIE_SECURE`
-when TLS terminates in front of it.
+The desired-state file and the secrets it references are the rest of the
+system: the file carries relay identities, the environment (or the secret
+files) carries the provider credentials and the relay key. Keep the file
+and the secret files readable only by the process's user, never commit
+them (`.gitignore` excludes `config.yaml` by default), and back them up
+with the same care as credentials — because they are the credentials'
+front door.
 
 ## Supported versions
 
