@@ -70,6 +70,25 @@ limit, then enforces the picked relay's per-provider limit by _skipping_ to
 a provider that accepts the body. `413` is returned only when the pin leaves
 no accepting provider or the body exceeds every configured limit.
 
+### Proxy inbound
+
+The same endpoint also speaks forward proxy: an HTTP client that routes
+through the gateway (`--proxy`, `HTTP_PROXY`, any library's proxy setting)
+hits the same pool. Routing intent is read from the absolute-form request
+target itself — the gateway derives `X-Relay-Target` (scheme + host) and
+`X-Relay-Path` (path + query) from the URL — so client-supplied values of
+those two headers are **overwritten**, never trusted. The provider pin is
+header-only in proxy mode (`X-Relay-Provider`); the `/{provider}` prefix is a
+relay-spec feature and has no meaning here — the target's path belongs to the
+target. `CONNECT` tunneling is not supported (edge relays carry HTTP, not raw
+TCP) and is answered `501`; an absolute-form `https://` target works as an
+ordinary request because the relay itself fetches the target:
+
+```bash
+curl --proxy http://relay-gateway:20130 http://api.example.com/v1/chat \
+  -H 'Authorization: Bearer $TARGET_TOKEN'
+```
+
 ## Configure
 
 Everything dynamic — relays, providers, runtime settings — lives in the

@@ -67,6 +67,12 @@ Read [`README.md`](README.md) before changing the wire contract.
   Round-robin cursors are per selector key; with all relays healthy the
   served sequence is exactly the config order — deterministic, so tests pin
   exact sequences. An unknown pin is a `404`.
+- Forward-proxy inbound: an absolute-form request target (or `CONNECT`)
+  routes through the proxy branch, which derives `X-Relay-Target` /
+  `X-Relay-Path` from the URL and overwrites client-supplied values
+  (no smuggling); the pin is header-only; `CONNECT` is a documented `501`
+  (edge relays carry no raw TCP tunnels). Control endpoints answer
+  origin-form only — a proxy-form `/healthz` relays, it does not shadow.
 - Failover replays the buffered body on the next relay only while the
   failure is a transport error (before any response byte). Once the relay
   answered, the response streams through untouched — never retried.

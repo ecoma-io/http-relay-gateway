@@ -591,3 +591,124 @@ func TestHealthzBody(t *testing.T) {
 		t.Fatalf("healthz = %d %q, want 200 %q", res.StatusCode, body, "ok\n")
 	}
 }
+
+// proxyRequest serves one proxy-form request straight through the gateway
+// with an absolute-form request target, exactly as Go's server would parse
+// a client that speaks HTTP_PROXY.
+func proxyRequest(t *testing.T, g *Gateway, method, absTarget string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, absTarget, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestProxyFormDerivesSpecHeaders(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := proxyRequest(t, f.gateway, http.MethodGet,
+		"http://api.example.com/v1/chat?beta=true",
+		map[string]string{"X-Relay-Provider": "cloudflare"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := f.saw.header("X-Relay-Target"); got != "http://api.example.com" {
+		t.Fatalf("upstream X-Relay-Target = %q", got)
+	}
+	if got := f.saw.header("X-Relay-Path"); got != "/v1/chat?beta=true" {
+		t.Fatalf("upstream X-Relay-Path = %q", got)
+	}
+	if f.saw.method != http.MethodGet {
+		t.Fatalf("upstream method = %q", f.saw.method)
+	}
+	if got := f.saw.header("X-Relay-Provider"); got != "" {
+		t.Fatalf("provider pin leaked upstream: %q", got)
+	}
+}
+
+func TestProxyFormOverwritesSmuggledSpecHeaders(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := proxyRequest(t, f.gateway, http.MethodGet,
+		"http://api.example.com/v1",
+		map[string]string{
+			"X-Relay-Provider": "cloudflare",
+			"X-Relay-Target":   "http://evil.example",
+			"X-Relay-Path":     "/evil",
+		})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := f.saw.header("X-Relay-Target"); got != "http://api.example.com" {
+		t.Fatalf("smuggled target rode upstream: %q", got)
+	}
+	if got := f.saw.header("X-Relay-Path"); got != "/v1" {
+		t.Fatalf("smuggled path rode upstream: %q", got)
+	}
+}
+
+func TestProxyFormIgnoresPathAsProviderPin(t *testing.T) {
+	f := newFixture(t, nil)
+	// "unknownprovider" is not a configured provider: origin-form would 404.
+	// Proxy mode must round-robin instead of reading the target's path.
+	rec := proxyRequest(t, f.gateway, http.MethodGet,
+		"http://api.example.com/unknownprovider/x", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (target path was read as a pin)", rec.Code)
+	}
+	if got := f.saw.header("X-Relay-Path"); got != "/unknownprovider/x" {
+		t.Fatalf("upstream X-Relay-Path = %q", got)
+	}
+}
+
+func TestProxyFormUnknownHeaderPinRejected(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := proxyRequest(t, f.gateway, http.MethodGet,
+		"http://api.example.com/v1",
+		map[string]string{"X-Relay-Provider": "nosuch"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestProxyFormPreservesSchemeAndUserinfo(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := proxyRequest(t, f.gateway, http.MethodGet,
+		"https://user:secret@api.example.com:8443/v1",
+		map[string]string{"X-Relay-Provider": "cloudflare"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := f.saw.header("X-Relay-Target"); got != "https://user:secret@api.example.com:8443" {
+		t.Fatalf("upstream X-Relay-Target = %q", got)
+	}
+	if got := f.saw.header("X-Relay-Path"); got != "/v1" {
+		t.Fatalf("upstream X-Relay-Path = %q", got)
+	}
+}
+
+func TestConnectRejectedByProxyAdapter(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := proxyRequest(t, f.gateway, http.MethodConnect, "http://api.example.com:443", nil)
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", rec.Code)
+	}
+	if f.saw.method != "" {
+		t.Fatalf("CONNECT reached the relay (%q)", f.saw.method)
+	}
+}
+
+func TestProxyFormDoesNotShadowControlEndpoints(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := proxyRequest(t, f.gateway, http.MethodGet, "http://api.example.com/healthz", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if body := rec.Body.String(); body == "ok\n" {
+		t.Fatal("absolute-form /healthz was shadowed by the control endpoint")
+	}
+	if f.saw.method != http.MethodGet {
+		t.Fatal("request never reached the relay pipeline")
+	}
+}
