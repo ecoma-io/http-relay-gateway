@@ -2,6 +2,9 @@ bin/
 .claude/
 node_modules/
 
+# A compiled binary once landed at the root by accident; keep it out.
+/http-relay-gateway
+
 # Local desired-state files carry relay identities and reference secrets;
 # every real deployment names its own file. Never committed.
 config.yaml
