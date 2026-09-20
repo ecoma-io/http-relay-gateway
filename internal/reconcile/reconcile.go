@@ -1,6 +1,15 @@
 // Package reconcile keeps the managed relay fleet in step with the gateway:
-// it probes every managed relay's version endpoint, marks drift, and
-// redeploys the embedded worker when a relay's deployment no longer matches.
+// it proves every relay's readiness end to end, marks drift, and redeploys
+// the embedded worker when a relay's deployment no longer matches.
+//
+// Readiness is the admission gate: a relay enters the serving pool only after
+// a positive verification — its deployment answers with the gateway's worker
+// version, the relay key is accepted, and a relay-spec request forwarded back
+// through the relay's own origin round-trips. The gate lives in
+// internal/readiness (in-memory, derived runtime state); the database stays
+// the single source of configuration truth. A relay that fails verification
+// stays out (or leaves the pool after a bounded streak), and the always-on
+// verify tick re-proves every relay so recovery never needs a restart.
 //
 // One worker goroutine owns all fleet work. Mutations land on a coalesced
 // queue — a flood of requests for the same action collapses into one — and
@@ -31,28 +40,38 @@ import (
 
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/deploy/workers"
+	"http-relay-gateway/internal/readiness"
 	"http-relay-gateway/internal/sanitize"
 	"http-relay-gateway/internal/store"
 )
 
-// probeParallelism bounds concurrent version probes; redeploys run two at a
-// time so a large fleet heals quickly without hammering one platform's API.
-// reviveScanInterval is how often the revival scan re-probes paused relays —
-// independent of the reconcile interval, which defaults to off, so a relay
-// parked by its platform comes back on its own without any operator action.
+// probeParallelism bounds concurrent verification probes; redeploys run two
+// at a time so a large fleet heals quickly without hammering one platform's
+// API. reviveScanInterval is how often the revival scan re-probes paused
+// relays — independent of the reconcile interval, which defaults to off —
+// and verifyScanInterval is how often every relay's readiness is re-proven,
+// the always-on assurance that demotions recover without a restart.
 const (
 	probeParallelism   = 4
 	deployParallelism  = 2
 	reviveScanInterval = 10 * time.Minute
+	verifyScanInterval = 60 * time.Second
 )
+
+// VerifyScanIntervalEnv overrides the readiness re-probe cadence. It is a
+// test-only knob like ReviveScanIntervalEnv — the black-box suite shrinks the
+// minute-default so a relay's admission flips are observable in seconds — and
+// it never appears in the API or the database.
+const VerifyScanIntervalEnv = "RELAY_VERIFY_INTERVAL"
 
 // jobKind names one unit of fleet work on the queue.
 type jobKind string
 
 const (
 	jobCheck     jobKind = "check"     // probe everything, update statuses
-	jobStartup   jobKind = "startup"   // probe, then queue redeploys for drift
-	jobReconcile jobKind = "reconcile" // probe, then redeploy drift in-batch
+	jobStartup   jobKind = "startup"   // verify, then queue redeploys for drift
+	jobVerify    jobKind = "verify"    // re-prove every relay's readiness
+	jobReconcile jobKind = "reconcile" // verify, then redeploy drift in-batch
 	jobRevive    jobKind = "revive"    // re-probe paused relays, rejoin or redeploy
 	jobRedeploy  jobKind = "redeploy"  // one relay
 	jobAdopt     jobKind = "adopt"     // one relay onto one account
@@ -105,7 +124,7 @@ func (q *queue) drain() []job {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	jobs := make([]job, 0, len(q.pending))
-	for _, kind := range []jobKind{jobStartup, jobCheck, jobReconcile, jobRevive} {
+	for _, kind := range []jobKind{jobStartup, jobVerify, jobCheck, jobReconcile, jobRevive} {
 		if j, ok := q.pending[string(kind)]; ok {
 			jobs = append(jobs, j)
 			delete(q.pending, string(kind))
@@ -127,6 +146,8 @@ type Worker struct {
 	queue       *queue
 	interval    func() int64  // seconds until the next automatic reconcile; 0 = off
 	reviveEvery time.Duration // cadence of the paused-relay revival scan; 0 = off
+	verifyEvery time.Duration // cadence of the always-on readiness pass; 0 = off
+	reg         *readiness.Registry
 
 	platformLocks map[string]*sync.Mutex
 	ctx           context.Context
@@ -145,22 +166,29 @@ type intervalFn func() int64
 // API or the database.
 const ReviveScanIntervalEnv = "RELAY_REVIVE_SCAN_INTERVAL"
 
-// Start launches the fleet worker. It does no work on the hot path of
-// serving — the pool is already live from the database — and returns
-// immediately.
-func Start(db *store.Store, factory deploy.Factory, log zerolog.Logger, interval intervalFn) *Worker {
+// Start launches the fleet worker. reg is the readiness registry the worker
+// drives — every admission and demotion funnels through it, and the gateway
+// rebuilds its pool from it. It does no work on the hot path of serving —
+// the pool is already live from the database — and returns immediately.
+func Start(db *store.Store, factory deploy.Factory, log zerolog.Logger, interval intervalFn, reg *readiness.Registry) *Worker {
 	reviveEvery := reviveScanInterval
 	if v := os.Getenv(ReviveScanIntervalEnv); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
 			reviveEvery = d
 		}
 	}
-	return startWorker(db, factory, log, interval, reviveEvery)
+	verifyEvery := verifyScanInterval
+	if v := os.Getenv(VerifyScanIntervalEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			verifyEvery = d
+		}
+	}
+	return startWorker(db, factory, log, interval, reg, reviveEvery, verifyEvery)
 }
 
-// startWorker is Start with the revival cadence as a parameter — tests run
-// the scanner at test-scale intervals by calling it directly.
-func startWorker(db *store.Store, factory deploy.Factory, log zerolog.Logger, interval intervalFn, reviveEvery time.Duration) *Worker {
+// startWorker is Start with the revival and verify cadences as parameters —
+// tests run both at test-scale intervals by calling it directly.
+func startWorker(db *store.Store, factory deploy.Factory, log zerolog.Logger, interval intervalFn, reg *readiness.Registry, reviveEvery, verifyEvery time.Duration) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Worker{
 		db:          db,
@@ -170,6 +198,8 @@ func startWorker(db *store.Store, factory deploy.Factory, log zerolog.Logger, in
 		queue:       newQueue(),
 		interval:    interval,
 		reviveEvery: reviveEvery,
+		verifyEvery: verifyEvery,
+		reg:         reg,
 		platformLocks: map[string]*sync.Mutex{
 			deploy.PlatformVercel:     {},
 			deploy.PlatformCloudflare: {},
@@ -223,14 +253,19 @@ func (w *Worker) Stop() {
 }
 
 // loop drains the queue until stopped, inserting an automatic reconcile
-// between batches when the interval setting is non-zero and a paused-relay
-// revival scan on its own always-on cadence.
+// between batches when the interval setting is non-zero, a paused-relay
+// revival scan on its own always-on cadence, and the readiness verify tick
+// that re-proves every relay.
 func (w *Worker) loop() {
 	defer close(w.done)
-	var revive *time.Ticker
+	var revive, verify *time.Ticker
 	if w.reviveEvery > 0 {
 		revive = time.NewTicker(w.reviveEvery)
 		defer revive.Stop()
+	}
+	if w.verifyEvery > 0 {
+		verify = time.NewTicker(w.verifyEvery)
+		defer verify.Stop()
 	}
 	for {
 		var timer *time.Timer
@@ -239,9 +274,12 @@ func (w *Worker) loop() {
 			timer = time.NewTimer(time.Duration(seconds) * time.Second)
 			timeout = timer.C
 		}
-		var reviveC <-chan time.Time
+		var reviveC, verifyC <-chan time.Time
 		if revive != nil {
 			reviveC = revive.C
+		}
+		if verify != nil {
+			verifyC = verify.C
 		}
 		select {
 		case <-w.queue.wake:
@@ -254,6 +292,9 @@ func (w *Worker) loop() {
 			w.run(w.queue.drain())
 		case <-reviveC:
 			w.queue.push(job{kind: jobRevive})
+			w.run(w.queue.drain())
+		case <-verifyC:
+			w.queue.push(job{kind: jobVerify})
 			w.run(w.queue.drain())
 		case <-w.ctx.Done():
 			if timer != nil {
@@ -274,13 +315,15 @@ func (w *Worker) run(jobs []job) {
 	for _, j := range jobs {
 		switch j.kind {
 		case jobStartup:
-			for _, id := range w.probeFleet(true) {
+			for _, id := range w.verifyFleet(true) {
 				w.queue.push(job{kind: jobRedeploy, relayID: id})
 			}
+		case jobVerify:
+			redeploys = append(redeploys, w.verifyFleet(true)...)
 		case jobCheck:
-			w.probeFleet(false)
+			w.verifyFleet(false)
 		case jobReconcile:
-			redeploys = append(redeploys, w.probeFleet(true)...)
+			redeploys = append(redeploys, w.verifyFleet(true)...)
 		case jobRevive:
 			redeploys = append(redeploys, w.revivePaused()...)
 		case jobRedeploy:
@@ -294,58 +337,226 @@ func (w *Worker) run(jobs []job) {
 	}
 }
 
-// probeFleet versions every managed deployment in parallel. When requeue is
-// true (startup and reconcile) the ids of relays found stale come back for
-// redeployment; a passive check just records the verdicts. Probe transport
-// failures mark unreachable and never redeploy; an HTTP answer that is not
-// the worker marks paused and never redeploys either — the revival scan owns
-// paused relays from there, so a fleet pass skips them rather than flipping
-// the pause to unreachable on one transport blip.
-func (w *Worker) probeFleet(requeue bool) []int64 {
+// verifyVerdict classifies one readiness verification.
+type verifyVerdict uint8
+
+const (
+	verifiedOK verifyVerdict = iota
+	verifyUnreachable
+	verifyNotWorker // the platform answered, our worker did not
+	verifyVersionMismatch
+	verifyAuthFailed  // the worker answered and rejected the relay key
+	verifyProbeFailed // the worker answered but the forward round trip failed
+)
+
+// statusFor maps a verification verdict to the deployment row's status —
+// Active-with-reason for verdicts where the worker itself answers but is not
+// usable, Paused/Unreachable/Stale for verdicts where the URL is not the
+// worker or not reachable at all.
+func statusFor(v verifyVerdict) string {
+	switch v {
+	case verifiedOK:
+		return store.DeployActive
+	case verifyUnreachable:
+		return store.DeployUnreachable
+	case verifyNotWorker:
+		return store.DeployPaused
+	case verifyVersionMismatch:
+		return store.DeployStale
+	default: // verifyAuthFailed, verifyProbeFailed
+		return store.DeployActive
+	}
+}
+
+// reasonFor maps a verification verdict to the readiness failure reason.
+func reasonFor(v verifyVerdict) string {
+	switch v {
+	case verifyUnreachable:
+		return readiness.ReasonUnreachable
+	case verifyNotWorker:
+		return readiness.ReasonPaused
+	case verifyVersionMismatch:
+		return readiness.ReasonVersionFailed
+	case verifyAuthFailed:
+		return readiness.ReasonAuthFailed
+	default:
+		return readiness.ReasonProbeFailed
+	}
+}
+
+// relayKey is the registry identity of one relay row.
+func relayKey(relay *store.RelayRow) readiness.Key {
+	return readiness.Key{Provider: relay.Provider, Name: relay.Name}
+}
+
+// verifyDeployment proves one deployment ready end to end: the URL answers
+// with the gateway's worker version, then a relay-spec request forwarded back
+// through the relay's own origin round-trips with the relay key accepted. The
+// returned duration is the probe time fed to the registry's backoff; the
+// detail string is a sanitized reason for the database status row.
+func (w *Worker) verifyDeployment(url, token string) (verifyVerdict, time.Duration, string) {
+	start := time.Now()
+	answer, err := deploy.Probe(w.ctx, w.probeHTTP, url)
+	if err != nil {
+		return verifyUnreachable, time.Since(start), sanitize.ErrorString(err)
+	}
+	if answer.Version == "" {
+		return verifyNotWorker, time.Since(start), sanitize.ErrorString(answer.NotWorkerErr())
+	}
+	if answer.Version != deploy.RelayVersion {
+		return verifyVersionMismatch, time.Since(start),
+			"gateway worker version " + deploy.RelayVersion + ", relay reports " + answer.Version
+	}
+	fwd, err := deploy.ForwardProbe(w.ctx, w.probeHTTP, url, token)
+	if err != nil {
+		return verifyUnreachable, time.Since(start), sanitize.ErrorString(err)
+	}
+	switch {
+	case fwd.Status == http.StatusNotFound:
+		// The worker answered 404 — its relay key check rejected the token.
+		// A fresh token heals this, so it queues a redeploy.
+		return verifyAuthFailed, time.Since(start), "relay key rejected"
+	case fwd.Status < 500 && fwd.JSON:
+		return verifiedOK, time.Since(start), ""
+	default:
+		// The worker forwarded but the round trip failed on its side (for
+		// example its own fetch of the target answered 502). No redeploy:
+		// the worker is current; whatever it fetches is its own business.
+		return verifyProbeFailed, time.Since(start),
+			fmt.Sprintf("end-to-end probe did not round-trip (relay answered HTTP %d)", fwd.Status)
+	}
+}
+
+// verifyRelay probes one managed relay and records the verdict in both
+// layers: the deployment row keeps the current URL truth, the registry keeps
+// admission. Returns the relay id when the deployment demonstrably failed —
+// a rejected key or drifted version — and a redeploy is requested.
+func (w *Worker) verifyRelay(relay *store.RelayRow, dep *store.DeploymentRow, requeue bool) int64 {
+	key := relayKey(relay)
+	if !w.reg.Allow(key) {
+		return 0 // backoff-gated: keep the fleet pass off a failing relay
+	}
+	w.reg.Enter(key, readiness.StateVerifying, "")
+	verdict, dur, detail := w.verifyDeployment(dep.URL, dep.AuthToken)
+	now := time.Now().Unix()
+	switch verdict {
+	case verifiedOK:
+		_ = w.db.SetDeploymentStatus(relay.ID, store.DeployActive, "", now)
+		w.reg.Ready(key, dur)
+	case verifyUnreachable:
+		_ = w.db.SetDeploymentStatus(relay.ID, store.DeployUnreachable, detail, now)
+		w.reg.Failing(key, readiness.ReasonUnreachable, dur)
+	case verifyNotWorker:
+		// The platform answered, our worker did not: a suspension page
+		// (quota exhausted), a deleted deployment, a stranger's app. A
+		// redeploy cannot lift a platform suspension, so the relay waits for
+		// the revival scan instead of burning deploy attempts.
+		_ = w.db.SetDeploymentStatus(relay.ID, store.DeployPaused, detail, now)
+		w.reg.Failing(key, readiness.ReasonPaused, dur)
+	case verifyVersionMismatch:
+		_ = w.db.SetDeploymentStatus(relay.ID, store.DeployStale, detail, now)
+		w.reg.Failing(key, readiness.ReasonVersionFailed, dur)
+		if requeue {
+			return relay.ID
+		}
+	case verifyAuthFailed:
+		// The worker rejects its token: the deployment is current (the URL
+		// answers) but unusable — a fresh token heals it.
+		_ = w.db.SetDeploymentStatus(relay.ID, store.DeployActive, detail, now)
+		w.reg.Failing(key, readiness.ReasonAuthFailed, dur)
+		if requeue {
+			return relay.ID
+		}
+	case verifyProbeFailed:
+		_ = w.db.SetDeploymentStatus(relay.ID, store.DeployActive, detail, now)
+		w.reg.Failing(key, readiness.ReasonProbeFailed, dur)
+	}
+	return 0
+}
+
+// verifyLegacy proves one legacy (unmanaged, tokenless) relay's readiness:
+// it owns its URL, so the only gate that means anything is that a relay-spec
+// request forwarded back through that URL made the whole loop. Any answer
+// below 500 proves the forward path carried a request end-to-end; 5xx means
+// the round trip failed on the relay. No database writes — a legacy relay has
+// no deployment row to update.
+func (w *Worker) verifyLegacy(relay *store.RelayRow) {
+	key := relayKey(relay)
+	if !w.reg.Allow(key) {
+		return
+	}
+	w.reg.Enter(key, readiness.StateDiscovered, "")
+	start := time.Now()
+	fwd, err := deploy.ForwardProbe(w.ctx, w.probeHTTP, relay.URL, "")
+	if err != nil {
+		w.reg.Failing(key, readiness.ReasonUnreachable, time.Since(start))
+		w.log.Warn().Str("name", relay.Name).Msg("verify: legacy relay unreachable")
+		return
+	}
+	if fwd.Status >= 500 {
+		w.reg.Failing(key, readiness.ReasonProbeFailed, time.Since(start))
+		w.log.Warn().Str("name", relay.Name).Int("status", fwd.Status).
+			Msg("verify: legacy relay failed its forward probe")
+		return
+	}
+	w.reg.Ready(key, time.Since(start))
+}
+
+// verifyFleet re-proves every relay's readiness in parallel: staging and a
+// version answer for managed deployments, then an end-to-end forward probe
+// back through the relay's own origin. requeue true (startup, reconcile and
+// the always-on verify tick) returns the ids of relays whose deployment
+// demonstrably failed — a rejected key or drifted version — for redeployment;
+// a passive check only records verdicts. Transport failures never redeploy:
+// an unreachable relay may be a cold start, and one missed answer is not
+// evidence the worker is broken. Paused relays are the revival scan's job,
+// and a relay with a replacement mid-flight verifies itself rather than
+// chancing a demote of the old worker it still serves.
+func (w *Worker) verifyFleet(requeue bool) []int64 {
 	relays, err := w.db.Relays()
 	if err != nil {
 		w.log.Error().Err(err).Msg("reconcile: list relays")
 		return nil
 	}
-	now := time.Now().Unix()
 	stale := make([]int64, len(relays)) // indexed by slot: the closures below write disjoint cells
 	run(probeParallelism, len(relays), func(i int) {
 		relay := relays[i]
-		if relay.Origin != store.OriginManaged || relay.AccountID == nil {
-			return // legacy relays own their URLs; nothing to probe
+		if relay.Origin != store.OriginManaged {
+			w.verifyLegacy(&relay)
+			return
+		}
+		if relay.AccountID == nil {
+			// Managed but its account is gone: nothing can deploy for it, so
+			// it is announced as configured and stays out until it is
+			// adopted back onto an account.
+			w.reg.Enter(relayKey(&relay), readiness.StateConfigured, "")
+			return
 		}
 		dep, err := w.db.Deployment(relay.ID)
 		if errors.Is(err, store.ErrNoDeployment) {
-			return // managed but never deployed: the row URL serves tokenless
+			w.reg.Enter(relayKey(&relay), readiness.StateDiscovered, "")
+			if requeue {
+				stale[i] = relay.ID // first deploy is queued by the verify pass
+			}
+			return
 		}
 		if err != nil {
 			w.log.Error().Err(err).Int64("relay", relay.ID).Msg("reconcile: read deployment")
 			return
 		}
 		if dep.URL == "" {
-			return // a failed first deploy has no URL to probe
+			if requeue {
+				stale[i] = relay.ID // a failed first deploy retries on the next pass
+			}
+			return
 		}
 		if dep.Status == store.DeployPaused {
 			return // waiting on the platform, not on the fleet: revival scan's job
 		}
-		answer, err := deploy.Probe(w.ctx, w.probeHTTP, dep.URL)
-		switch {
-		case err != nil:
-			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployUnreachable, sanitize.ErrorString(err), now)
-		case answer.Version == "":
-			// The platform answered, our worker did not: a suspension page
-			// (quota exhausted), a deleted deployment, a stranger's app. A
-			// redeploy cannot lift a platform suspension, so the relay waits.
-			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployPaused, sanitize.ErrorString(answer.NotWorkerErr()), now)
-		case answer.Version != deploy.RelayVersion:
-			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployStale,
-				"gateway worker version "+deploy.RelayVersion+", relay reports "+answer.Version, now)
-			if requeue {
-				stale[i] = relay.ID
-			}
-		default:
-			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployActive, "", now)
+		if rec, ok := w.reg.StateOf(relayKey(&relay)); ok && rec.State == readiness.StateDeploying {
+			return // a replacement is mid-flight; the redeploy path verifies itself
 		}
+		stale[i] = w.verifyRelay(&relay, &dep, requeue)
 	})
 	nonZero := stale[:0]
 	for _, id := range stale {
@@ -359,10 +570,11 @@ func (w *Worker) probeFleet(requeue bool) []int64 {
 // revivePaused re-probes every paused deployment — the always-on background
 // wait for platforms to lift a suspension. A transport failure leaves the
 // pause standing (it is not evidence either way); a non-worker answer
-// refreshes the recorded reason; a worker answer revives the relay — back to
-// active on the current version, or stale with a queued redeploy when the
-// fleet moved on while the relay was dark. Returns the ids that need that
-// redeploy.
+// refreshes the recorded reason and keeps the registry failure streak
+// climbing so a suspended relay loses admission without operator action; a
+// worker answer revives the relay — back to active on the current verified
+// worker, or stale with a queued redeploy when the fleet moved on while the
+// relay was dark. Returns the ids that need that redeploy.
 func (w *Worker) revivePaused() []int64 {
 	ids, err := w.db.DeploymentRelayIDsByStatus(store.DeployPaused)
 	if err != nil {
@@ -372,26 +584,42 @@ func (w *Worker) revivePaused() []int64 {
 	if len(ids) == 0 {
 		return nil
 	}
-	now := time.Now().Unix()
 	stale := make([]int64, len(ids)) // indexed by slot: the closures below write disjoint cells
 	run(probeParallelism, len(ids), func(i int) {
-		dep, err := w.db.Deployment(ids[i])
+		relayID := ids[i]
+		dep, err := w.db.Deployment(relayID)
 		if err != nil {
 			return // deleted mid-scan; the next tick retries the rest
 		}
-		answer, err := deploy.Probe(w.ctx, w.probeHTTP, dep.URL)
-		switch {
-		case err != nil:
+		relay, err := w.db.Relay(relayID)
+		if err != nil {
+			return // deleted mid-scan
+		}
+		key := relayKey(&relay)
+		verdict, dur, detail := w.verifyDeployment(dep.URL, dep.AuthToken)
+		now := time.Now().Unix()
+		switch verdict {
+		case verifyUnreachable:
 			return // still dark; the pause stands
-		case answer.Version == "":
-			_ = w.db.SetDeploymentStatus(ids[i], store.DeployPaused, sanitize.ErrorString(answer.NotWorkerErr()), now)
-		case answer.Version != deploy.RelayVersion:
-			_ = w.db.SetDeploymentStatus(ids[i], store.DeployStale,
-				"gateway worker version "+deploy.RelayVersion+", relay reports "+answer.Version, now)
-			stale[i] = ids[i]
-		default:
-			_ = w.db.SetDeploymentStatus(ids[i], store.DeployActive, "", now)
-			w.log.Info().Int64("relay", ids[i]).Msg("revive: paused relay answers again")
+		case verifyNotWorker:
+			_ = w.db.SetDeploymentStatus(relayID, store.DeployPaused, detail, now)
+			w.reg.Failing(key, readiness.ReasonPaused, dur)
+		case verifyVersionMismatch:
+			_ = w.db.SetDeploymentStatus(relayID, store.DeployStale, detail, now)
+			w.reg.Failing(key, readiness.ReasonVersionFailed, dur)
+			stale[i] = relayID
+		case verifyAuthFailed:
+			_ = w.db.SetDeploymentStatus(relayID, store.DeployActive, detail, now)
+			w.reg.Failing(key, readiness.ReasonAuthFailed, dur)
+			stale[i] = relayID // a fresh token will clear the rejection
+		case verifyProbeFailed:
+			_ = w.db.SetDeploymentStatus(relayID, store.DeployActive, detail, now)
+			w.reg.Failing(key, readiness.ReasonProbeFailed, dur)
+			w.log.Warn().Int64("relay", relayID).Msg("revive: paused relay answers but fails its forward probe")
+		case verifiedOK:
+			_ = w.db.SetDeploymentStatus(relayID, store.DeployActive, "", now)
+			w.reg.Ready(key, dur)
+			w.log.Info().Int64("relay", relayID).Msg("revive: paused relay answers again")
 		}
 	})
 	nonZero := stale[:0]
@@ -413,10 +641,13 @@ func (w *Worker) runRedeploys(ids []int64) {
 
 // redeployRelay replaces one relay's worker: fresh token, current embedded
 // source, the same project and account as before (or a brand-new deployment
-// when the relay has none). Until the new worker answers its version
-// endpoint the old one keeps serving — a failed redeploy must never pull a
-// live relay out of rotation, so an active relay that fails to redeploy
-// stays active with the failure recorded.
+// when the relay has none). The replacement only gains admission after the
+// full end-to-end verification — version answer plus accepted key plus a
+// forward round trip. A platform-side deploy failure never pulls a live relay
+// out of rotation (the old worker keeps serving under its previous
+// verification); a deploy that succeeded but fails verification records the
+// new URL as the current truth but keeps it out of the pool until it
+// verifies.
 func (w *Worker) redeployRelay(relayID int64) {
 	relay, err := w.db.Relay(relayID)
 	if errors.Is(err, store.ErrNoRelay) {
@@ -434,6 +665,18 @@ func (w *Worker) redeployRelay(relayID int64) {
 		w.log.Warn().Int64("relay", relayID).Msg("redeploy: relay has no platform account")
 		return
 	}
+	key := relayKey(&relay)
+	release, ok := w.reg.Begin(key)
+	if !ok {
+		w.log.Debug().Int64("relay", relayID).Msg("redeploy: already in flight")
+		return
+	}
+	defer release()
+	// The deploying phase marks this a genuinely fresh attempt: it clears
+	// the failure streak and reopens the backoff gate, so a relay that was
+	// gated for failing gets its replacement attempt immediately.
+	w.reg.Enter(key, readiness.StateDeploying, "")
+
 	account, err := w.db.Account(*relay.AccountID)
 	if err != nil {
 		w.log.Error().Err(err).Int64("relay", relayID).Msg("redeploy: read account")
@@ -460,27 +703,53 @@ func (w *Worker) redeployRelay(relayID int64) {
 	}
 
 	result, err := w.deploy(w.ctx, client, account.Platform, project)
-	if err == nil {
-		err = w.verifyLive(result.URL)
-	}
 	if err != nil {
+		// Platform-side failure: the old worker still exists and keeps
+		// serving. The Failing streak accumulates anyway — a redeploy was
+		// queued because the served worker demonstrably failed, so it is
+		// broken in a way a fresh token or version can fix; the backoff gate
+		// it pushes out bounds the retry cadence. Past DemoteAfter failures
+		// the relay loses admission; the passive pool layer covers real
+		// traffic before that.
 		w.recordDeployFailure(relayID, &account, project, hadActive, prevErr == nil, err)
+		w.reg.Failing(key, readiness.ReasonDeployFailed, 0)
 		return
 	}
 
+	verdict, dur, detail := w.verifyDeployment(result.URL, result.token)
 	now := time.Now().Unix()
-	token := result.token
+	if verdict != verifiedOK {
+		// The platform succeeded and the new worker is live, but it cannot
+		// be trusted to serve: record the new URL as the current truth —
+		// with a status that carries why — and keep it out of the pool.
+		// Registry first, row second: any pool rebuild triggered by the row
+		// change already sees the admission revoked.
+		w.reg.Failing(key, reasonFor(verdict), dur)
+		if err := w.db.UpsertDeployment(store.DeploymentRow{
+			RelayID: relayID, AccountID: account.ID, Platform: account.Platform,
+			Project: result.Project, ExternalID: result.ExternalID, URL: result.URL,
+			Version: deploy.RelayVersion, AuthToken: result.token,
+			Status: statusFor(verdict), LastError: detail, LastCheckedAt: now, DeployedAt: now,
+		}); err != nil {
+			w.log.Error().Err(err).Int64("relay", relayID).Msg("redeploy: record deployment")
+		}
+		w.log.Error().Str("error", detail).Int64("relay", relayID).
+			Msg("redeploy: new worker failed verification; kept out of the pool")
+		return
+	}
+
+	w.reg.Ready(key, dur)
 	if err := w.db.UpsertDeployment(store.DeploymentRow{
 		RelayID: relayID, AccountID: account.ID, Platform: account.Platform,
 		Project: result.Project, ExternalID: result.ExternalID, URL: result.URL,
-		Version: deploy.RelayVersion, AuthToken: token, Status: store.DeployActive,
+		Version: deploy.RelayVersion, AuthToken: result.token, Status: store.DeployActive,
 		LastCheckedAt: now, DeployedAt: now,
 	}); err != nil {
 		w.log.Error().Err(err).Int64("relay", relayID).Msg("redeploy: record deployment")
 		return
 	}
 	w.log.Info().Str("project", result.Project).Str("platform", account.Platform).
-		Msg("redeploy: relay live")
+		Msg("redeploy: relay verified and live")
 }
 
 // recordDeployFailure stores a sanitized failure without disturbing a relay
@@ -509,9 +778,10 @@ func (w *Worker) recordDeployFailure(relayID int64, account *store.AccountRow, p
 }
 
 // adoptRelay moves a legacy relay onto an account: deploy the embedded
-// worker, verify it, then flip origin and land the deployment row in one
-// transaction. Every failure leaves the relay exactly as it was — legacy,
-// serving its own URL — and the log carries the reason.
+// worker, verify it end to end, then flip origin and land the deployment row
+// in one transaction. Every failure leaves the relay exactly as it was —
+// legacy, serving its own URL, its readiness untouched — and the log carries
+// the reason.
 func (w *Worker) adoptRelay(relayID, accountID int64) {
 	relay, err := w.db.Relay(relayID)
 	if errors.Is(err, store.ErrNoRelay) {
@@ -527,6 +797,15 @@ func (w *Worker) adoptRelay(relayID, accountID int64) {
 		w.log.Warn().Int64("relay", relayID).Msg("adopt: relay is already managed")
 		return
 	}
+	key := relayKey(&relay)
+	release, ok := w.reg.Begin(key)
+	if !ok {
+		w.log.Debug().Int64("relay", relayID).Msg("adopt: already in flight")
+		return
+	}
+	defer release()
+	w.reg.Enter(key, readiness.StateDeploying, "")
+
 	account, err := w.db.Account(accountID)
 	if err != nil {
 		w.log.Error().Err(err).Int64("relay", relayID).Msg("adopt: read account")
@@ -543,15 +822,24 @@ func (w *Worker) adoptRelay(relayID, accountID int64) {
 		w.log.Error().Err(err).Int64("relay", relayID).Msg("adopt: build client")
 		return
 	}
+
 	result, err := w.deploy(w.ctx, client, account.Platform, deploy.ProjectName(relay.Name))
-	if err == nil {
-		err = w.verifyLive(result.URL)
-	}
 	if err != nil {
 		w.log.Error().Str("error", sanitize.ErrorString(err)).Int64("relay", relayID).
 			Msg("adopt: failed; relay left unmanaged")
 		return
 	}
+	verdict, dur, detail := w.verifyDeployment(result.URL, result.token)
+	if verdict != verifiedOK {
+		// The remote worker is live but cannot be trusted; the relay stays
+		// legacy and serving its own URL. The failed adoption never gains
+		// admission and the old URL's readiness is untouched, so the
+		// registry is left exactly as it was.
+		w.log.Error().Str("error", detail).Int64("relay", relayID).
+			Msg("adopt: new worker failed verification; relay left unmanaged")
+		return
+	}
+
 	now := time.Now().Unix()
 	deployment := store.DeploymentRow{
 		RelayID: relayID, AccountID: accountID, Platform: account.Platform,
@@ -564,6 +852,7 @@ func (w *Worker) adoptRelay(relayID, accountID int64) {
 		w.log.Error().Err(err).Int64("relay", relayID).Msg("adopt: record deployment")
 		return
 	}
+	w.reg.Ready(key, dur)
 	w.log.Info().Str("project", result.Project).Str("platform", account.Platform).
 		Msg("adopt: relay managed")
 }
@@ -595,23 +884,6 @@ func (w *Worker) deploy(ctx context.Context, client deploy.Client, platform, pro
 		return deployResult{}, err
 	}
 	return deployResult{Result: result, token: token}, nil
-}
-
-// verifyLive confirms the just-deployed URL answers with the gateway's
-// version — the client already waited for it, but the record only becomes
-// serving truth once the gateway has seen the answer itself.
-func (w *Worker) verifyLive(url string) error {
-	answer, err := deploy.Probe(w.ctx, w.probeHTTP, url)
-	if err != nil {
-		return err
-	}
-	if answer.Version == "" {
-		return answer.NotWorkerErr()
-	}
-	if answer.Version != deploy.RelayVersion {
-		return fmt.Errorf("relay not live: reports version %s", answer.Version)
-	}
-	return nil
 }
 
 // clientFor builds a platform client from the account's stored credential.
