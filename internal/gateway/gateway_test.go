@@ -592,6 +592,95 @@ func TestHealthzBody(t *testing.T) {
 	}
 }
 
+func TestReadyzDistinctFromHealthz(t *testing.T) {
+	// Zero ready relays: the process is alive but serves nothing — /healthz
+	// must answer ok (orchestrator survival) while /readyz answers 503 (route
+	// around the gateway).
+	f := newFixture(t, func(in *pool.Input, _ *State) {
+		for i := range in.Relays {
+			in.Relays[i].Active = false
+		}
+	})
+	ts := httptest.NewServer(f.gateway)
+	t.Cleanup(ts.Close)
+
+	hz, err := ts.Client().Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hzBody, _ := io.ReadAll(hz.Body)
+	hz.Body.Close()
+	if hz.StatusCode != http.StatusOK || string(hzBody) != "ok\n" {
+		t.Fatalf("/healthz = %d %q, want 200 ok\\n under zero readiness", hz.StatusCode, hzBody)
+	}
+
+	rz, err := ts.Client().Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rz.Body.Close()
+	rzBody, _ := io.ReadAll(rz.Body)
+	if rz.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d, want 503 with zero ready relays", rz.StatusCode)
+	}
+	if !strings.Contains(string(rzBody), `"ready":false`) {
+		t.Fatalf("/readyz body wrong: %s", rzBody)
+	}
+}
+
+func TestReadyzFlipsWithAdmission(t *testing.T) {
+	f := newFixture(t, func(in *pool.Input, _ *State) {
+		for i := range in.Relays {
+			in.Relays[i].Active = i == 1 // only the live "good" relay admitted
+		}
+	})
+	ts := httptest.NewServer(f.gateway)
+	t.Cleanup(ts.Close)
+
+	rz, err := ts.Client().Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rz.Body.Close()
+	body, _ := io.ReadAll(rz.Body)
+	if rz.StatusCode != http.StatusOK {
+		t.Fatalf("/readyz = %d, want 200 with one ready relay", rz.StatusCode)
+	}
+	if !strings.Contains(string(body), `"ready":true`) ||
+		!strings.Contains(string(body), `"readyRelays":1`) {
+		t.Fatalf("/readyz body wrong: %s", body)
+	}
+}
+
+func TestStatsCarriesReadinessAndLifecycle(t *testing.T) {
+	f := newFixture(t, func(in *pool.Input, state *State) {
+		state.Lifecycle = []LifecycleRow{
+			{Name: "good", Provider: "vercel", State: "ready"},
+			{Name: "dead", Provider: "vercel", State: "unready", Reason: "probe_failed"},
+		}
+	})
+	ts := httptest.NewServer(f.gateway)
+	t.Cleanup(ts.Close)
+
+	res, err := ts.Client().Get(ts.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, _ := io.ReadAll(res.Body)
+	for _, want := range []string{
+		`"readiness":{"ready":true,"readyRelays":3}`,
+		`"lifecycle":[`,
+		`"state":"ready"`,
+		`"state":"unready"`,
+		`"reason":"probe_failed"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("/stats payload missing %s: %s", want, raw)
+		}
+	}
+}
+
 // proxyRequest serves one proxy-form request straight through the gateway
 // with an absolute-form request target, exactly as Go's server would parse
 // a client that speaks HTTP_PROXY.

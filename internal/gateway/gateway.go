@@ -65,6 +65,21 @@ type State struct {
 	// no gateway-side 413. 0 keeps every body buffered — the default, and
 	// the only retryable mode.
 	StreamThresholdBytes int64
+	// Lifecycle is the readiness state machine snapshot this generation was
+	// built from: one row per relay, verbatim from the registry. It renders
+	// on /stats and never carries URLs or tokens.
+	Lifecycle []LifecycleRow
+}
+
+// LifecycleRow is one relay's readiness phase as the registry saw it when
+// this generation was built — the operator-facing state machine view. It
+// never carries URLs or tokens: the registry snapshot is the only source,
+// and /stats renders it verbatim.
+type LifecycleRow struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // Gateway is the root http.Handler.
@@ -141,6 +156,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	case "/stats":
 		g.handleStats(w)
+	case "/readyz":
+		g.handleReadyz(w)
 	default:
 		g.handleRelay(w, r, g.log)
 	}
@@ -183,12 +200,33 @@ func targetOrigin(u *url.URL) string {
 
 func (g *Gateway) handleStats(w http.ResponseWriter) {
 	st := g.st.Load()
+	ready := st.Pool.ReadyCount()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"version":      g.version,
 		"relayVersion": g.relayVersion,
 		"relays":       st.Pool.Stats(),
+		"readiness":    map[string]any{"ready": ready > 0, "readyRelays": ready},
+		"lifecycle":    st.Lifecycle,
 	})
+}
+
+// handleReadyz is the readiness endpoint: ready only when at least one relay
+// is admitted to the serving pool. It is deliberately distinct from
+// /healthz — the process liveness probe — so an orchestrator can tell "the
+// process is alive" from "the process can actually serve". An alive gateway
+// with zero ready relays (nothing verified yet, or the whole fleet demoted)
+// answers 503.
+func (g *Gateway) handleReadyz(w http.ResponseWriter) {
+	st := g.st.Load()
+	ready := st.Pool.ReadyCount()
+	w.Header().Set("Content-Type", "application/json")
+	if ready == 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "readyRelays": 0})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"ready": true, "readyRelays": ready})
 }
 
 // handleRelay is the origin-form relay-spec entry: the pin comes from the
