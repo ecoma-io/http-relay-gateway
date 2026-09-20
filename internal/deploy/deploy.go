@@ -1,20 +1,28 @@
-// Package deploy owns the managed-relay lifecycle: the embedded worker
-// source, the per-platform clients that turn it into a live relay, and the
-// version/token contract between the gateway and its fleet.
+// Package deploy owns the relay fleet's platform half: the hard-coded
+// provider set, the per-provider clients that discover, deploy and remove
+// relay workers, and the version/key contract between the gateway and its
+// fleet.
 //
-// Version and token travel with the deployment, never inside the source: the
-// worker files are static, and each platform receives RELAY_VERSION and
-// RELAY_AUTH_TOKEN as deploy-time environment, so a live worker can only
-// report the pair its deployer injected.
+// Identity is (provider, name) — never a URL, a database row or a deployment
+// id. From identity plus the provider credential alone, every client can
+// discover the platform project and its stable URL, decide reuse versus
+// redeploy, and replace the worker in place. No persisted deployment state
+// exists anywhere: a restart re-derives everything from the desired
+// configuration plus secrets.
+//
+// Version and relay key travel with the deployment, never inside the
+// source: the worker files are static, and each platform receives
+// RELAY_VERSION and RELAY_AUTH_TOKEN as deploy-time environment, so a live
+// worker can only report the pair its deployer injected.
 package deploy
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,23 +39,100 @@ import (
 // until it redeploys.
 var RelayVersion = relayversion.Version
 
-// Platform names, matching the store's account/deployment platforms.
+// The hard-coded provider set. There is no runtime provider registry: a
+// relay's provider is one of these three, validated at config load.
 const (
 	PlatformVercel     = "vercel"
 	PlatformCloudflare = "cloudflare"
 	PlatformDeno       = "deno"
 )
 
-// Token returns a new relay auth token: 32 crypto/rand bytes, base64url
-// without padding — 43 URL-safe characters that survive headers, URLs and
-// database columns unchanged.
-func Token() (string, error) {
-	var buf [32]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", fmt.Errorf("generate token: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(buf[:]), nil
+// Platforms returns the hard-coded provider set in stable order.
+func Platforms() []string {
+	return []string{PlatformVercel, PlatformCloudflare, PlatformDeno}
 }
+
+// RelayKey is one relay's absolute identity: (provider, name). Reconcile,
+// single-flight, incarnation checks, metrics and pool membership all key on
+// this — never on a URL, a deployment id or a platform row.
+type RelayKey struct {
+	Provider string
+	Name     string
+}
+
+func (k RelayKey) String() string { return k.Provider + "/" + k.Name }
+
+// Credential is the provider management credential plus the optional scope
+// pins a provider needs to resolve (provider, name) to exactly one project.
+type Credential struct {
+	// Token is the provider management credential.
+	Token string
+	// Team pins the Vercel team scope; empty means the token's own user
+	// scope. Required in config when a token reaches several teams —
+	// discovery never guesses.
+	Team string
+	// Account pins the Cloudflare account; empty means "resolve from the
+	// token", which succeeds only when the token sees exactly one account.
+	Account string
+}
+
+// Discovery reports what provider discovery found for one project name.
+type Discovery struct {
+	// Exists reports whether the project is already on the platform.
+	Exists bool
+	// URL is the project's stable production URL — identical across
+	// redeploys — filled whenever the project exists.
+	URL string
+}
+
+// Spec is one deployment to create or replace. Source is the assembled
+// worker (workers.Assemble); Version and Token ride as platform environment.
+type Spec struct {
+	Project string
+	Source  string
+	Version string
+	Token   string
+}
+
+// Result reports a finished deployment. URL is the relay's stable public
+// URL — derived from the project name deterministically, so it is identical
+// across redeploys and identical to what Discover resolves.
+type Result struct {
+	Project    string
+	ExternalID string
+	URL        string
+}
+
+// Client discovers, deploys and removes the worker on one platform with one
+// credential. Implementations must be idempotent: Deploy creates the
+// project when missing and replaces its code otherwise, returning only once
+// the new worker is live; Delete reaches the same end state when the worker
+// is already gone.
+type Client interface {
+	Platform() string
+	// Discover locates the platform project this identity maps to. A
+	// missing project is a Discovery{Exists: false}, not an error; any other
+	// failure (credentials, API, ambiguous scope) is.
+	Discover(ctx context.Context, project string) (Discovery, error)
+	Deploy(ctx context.Context, spec Spec) (Result, error)
+	Delete(ctx context.Context, project string) error
+}
+
+// Factory builds a client for one credential. The reconciler uses it for
+// every platform call.
+type Factory interface {
+	For(platform string, cred Credential) (Client, error)
+}
+
+// ErrCredentials reports a platform rejecting the credential: the token is
+// wrong or expired, which is configuration data, not a gateway fault.
+var ErrCredentials = errors.New("platform rejected credentials")
+
+// ErrAmbiguousScope reports a credential that can reach several scopes
+// where the identity does not pin one: discovery refuses to guess which
+// project (or account) is meant, because silently deploying into the wrong
+// scope is unrecoverable.
+var ErrAmbiguousScope = errors.New("credential reaches several scopes; pin the scope in the relay config")
 
 // maxProjectName is the project-name length every platform accepts; the
 // shortest stick wins so one slug works everywhere.
@@ -55,9 +140,8 @@ const maxProjectName = 40
 
 // ProjectName turns a relay name into a platform-safe project slug:
 // lowercase letters, digits and single dashes, at most maxProjectName
-// characters. It is deterministic so every redeploy of a relay lands on the
-// same project; name collisions between relays are impossible because relay
-// names are unique.
+// characters. It is deterministic so every deploy of a relay — and its
+// discovery — lands on the same project.
 func ProjectName(name string) string {
 	var b strings.Builder
 	prevDash := true // swallows leading dashes
@@ -81,49 +165,31 @@ func ProjectName(name string) string {
 	return slug
 }
 
-// Spec is one deployment to create or replace. Source is the assembled
-// worker (workers.Assemble); Version and Token ride as platform environment.
-type Spec struct {
-	Project string
-	Source  string
-	Version string
-	Token   string
+// relayProbeTransport is the transport every readiness probe and live-check
+// uses. Proxy is deliberately nil: probes must model the production data
+// plane, which never routes through ambient proxies — a probe that succeeded
+// via HTTP_PROXY while production fails direct would make readiness lie.
+// Platform API calls (management plane) keep their own default transport.
+func relayProbeTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:               nil,
+		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        32,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
 }
 
-// Result reports a finished deployment. URL must be the relay's stable
-// public URL — identical across redeploys — because the pool keeps serving
-// it until the next verified deploy replaces it.
-type Result struct {
-	Project    string
-	ExternalID string
-	URL        string
-}
-
-// Client deploys and removes the worker on one platform with one account's
-// credentials. Implementations must be idempotent: Deploy creates the
-// project when missing, replaces its code, and returns only once the new
-// worker is live; Delete reaches the same end state when the worker is
-// already gone.
-type Client interface {
-	Platform() string
-	// Verify checks the credentials against the platform and returns the
-	// canonical account reference to store (username or account id).
-	Verify(ctx context.Context) (string, error)
-	Deploy(ctx context.Context, spec Spec) (Result, error)
-	Delete(ctx context.Context, project string) error
-}
-
-// Factory builds a client for one account's credentials. The admin plane
-// uses it for credential verification and remote deletes, the reconciler for
-// deploys.
-type Factory interface {
-	For(platform, token, accountRef string) (Client, error)
+// ProbeClient returns an HTTP client for probing relay workers: the data
+// plane's no-proxy transport with one overall timeout.
+func ProbeClient(timeout time.Duration) *http.Client {
+	return &http.Client{Transport: relayProbeTransport(), Timeout: timeout}
 }
 
 // Environment variable names that override platform API base URLs. They are
 // test-only knobs: the e2e suite points them at in-process fakes so the
-// black-box tests never touch a real platform. They never appear in the
-// database or the API.
+// black-box tests never touch a real platform. They never appear in logs.
 const (
 	VercelAPIBaseEnv     = "VERCEL_API_BASE"
 	CloudflareAPIBaseEnv = "CLOUDFLARE_API_BASE"
@@ -138,7 +204,7 @@ const probeTimeout = 5 * time.Second
 // its deployed version — Version non-empty, Status 200. Any other HTTP
 // answer (a platform pause page, a deleted deployment, a stranger's app on
 // the URL) is NOT a relay worker: Version empty, plus the status and the
-// best-effort platform marker so the admin can see why.
+// best-effort platform marker so /stats can show why.
 type ProbeAnswer struct {
 	Version string
 	Status  int
@@ -158,14 +224,26 @@ func (a ProbeAnswer) NotWorkerErr() error {
 	return fmt.Errorf("relay answered HTTP %d, not a relay worker", a.Status)
 }
 
+// Suspended reports whether the answer carries a platform suspension
+// signature — the quota-exhausted pages free tiers serve instead of the
+// worker (Vercel: HTTP 402, x-vercel-error DEPLOYMENT_DISABLED). Only these
+// classify as paused: any other non-worker answer is unreachable or missing
+// and must be treated on its own merits, never as a suspension to wait out.
+func (a ProbeAnswer) Suspended() bool {
+	if a.Marker != "" && strings.Contains(a.Marker, "DEPLOYMENT_DISABLED") {
+		return true
+	}
+	return a.Status == http.StatusPaymentRequired
+}
+
 // Probe asks a live relay for its deployed version via GET
 // <base>/__relay/version. Only a transport failure — timeout, TLS, refused
 // connection — is an error; every HTTP answer comes back classified, because
 // the probe is the one place that may conclude "the platform answered but
-// our worker is not behind this URL" (a pause) as opposed to "the relay
-// could not be reached at all". A pause must wait for revival; an
-// unreachable relay must never be redeployed on a hunch either — the
-// distinction between the two is this function's job, not the caller's.
+// our worker is not behind this URL" as opposed to "the relay could not be
+// reached at all". A suspension must wait for revival; an unreachable relay
+// must never be redeployed on a hunch either — the distinction between the
+// two is this function's job, not the caller's.
 func Probe(ctx context.Context, client *http.Client, base string) (ProbeAnswer, error) {
 	u, err := url.JoinPath(base, "__relay/version")
 	if err != nil {
@@ -209,8 +287,9 @@ func Probe(ctx context.Context, client *http.Client, base string) (ProbeAnswer, 
 const forwardProbeTimeout = 10 * time.Second
 
 // forwardProbePath is the relay-spec path every forwarding probe targets:
-// the worker's unauthenticated version route, which exists since the first
-// worker generation and answers a deterministic JSON body.
+// the worker's unauthenticated version route, which answers a deterministic
+// JSON body — a controlled upstream the relay itself serves, so the probe
+// never depends on random Internet weather.
 const forwardProbePath = "/__relay/version"
 
 // ForwardAnswer is what answered a forwarding probe.
@@ -224,23 +303,23 @@ type ForwardAnswer struct {
 
 // ForwardProbe drives one real relay-spec request through the relay itself:
 // the relay's own origin rides in X-Relay-Target, the version path in
-// X-Relay-Path, and the deployment's token (when non-empty) in
-// X-Relay-Token. The worker's normal ingress runs — token check included —
-// and then performs a genuine forwarding fetch back into its own version
-// route, so a passing probe is evidence that ingress, authentication and
-// the forwarding fetch all work, not merely that the URL answers. The
-// inner request hits the version route ahead of the token check, which the
-// worker answers unauthenticated — exactly what makes the loop close
-// without a second protocol.
+// X-Relay-Path, and the relay key in X-Relay-Token. The worker's normal
+// ingress runs — relay-key check included — and then performs a genuine
+// forwarding fetch back into its own version route, so a passing probe is
+// evidence that ingress, authentication and the forwarding fetch all work,
+// not merely that the URL answers. The inner request hits the version route
+// ahead of the key check, which the worker answers unauthenticated — exactly
+// what makes the loop close deterministically: the controlled upstream is
+// the relay itself, so readiness never depends on a third-party site being
+// up. (The documented limitation: a probe proves the relay forwards, not
+// that any particular upstream target is reachable from it.)
 //
 // A transport failure is an error; every HTTP answer comes back for the
-// caller to classify: 404 is the worker's wrong-token answer (an
+// caller to classify: 404 is the worker's wrong-key answer (an
 // unauthenticated request must be indistinguishable from an empty worker),
 // 502 its upstream-fetch-failed answer, and a 200 with a JSON object body a
-// completed round trip. token may be empty for relays that predate managed
-// tokens (legacy rows): such a probe proves only that the relay executes a
-// forwarding fetch, and any answer below 500 counts.
-func ForwardProbe(ctx context.Context, client *http.Client, base, token string) (ForwardAnswer, error) {
+// completed round trip.
+func ForwardProbe(ctx context.Context, client *http.Client, base, key string) (ForwardAnswer, error) {
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return ForwardAnswer{}, fmt.Errorf("forward probe URL: %w", err)
@@ -256,8 +335,8 @@ func ForwardProbe(ctx context.Context, client *http.Client, base, token string) 
 	}
 	req.Header.Set("X-Relay-Target", target)
 	req.Header.Set("X-Relay-Path", forwardProbePath)
-	if token != "" {
-		req.Header.Set("X-Relay-Token", token)
+	if key != "" {
+		req.Header.Set("X-Relay-Token", key)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

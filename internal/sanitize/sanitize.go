@@ -1,5 +1,5 @@
 // Package sanitize provides shared safe-diagnostics helpers for pool
-// snapshots, admin /status, and request logs. It redacts URL userinfo,
+// snapshots, /stats, and structured logs. It redacts URL userinfo,
 // neutralizes terminal controls and ANSI sequences, and bounds output.
 // Zero dependencies beyond the standard library.
 package sanitize

@@ -9,10 +9,10 @@ name: Analysis
 # specifically decided it must not (Semgrep), and what secrets leaked into
 # the tree (Gitleaks) — and a reader chasing "what analysis is in place?"
 # should find all of it in one file. For this repository the third analyser
-# is not ceremony: the SQLite database carries the private relay URLs the
-# gateway forwards through (and, later, platform tokens), and the relay
-# endpoint has deliberately no authentication, so a red Gitleaks run is the
-# loud version of the failure class SECURITY.md treats as a vulnerability.
+# is not ceremony: the desired-state file carries private relay identities
+# and references provider credentials, and the relay endpoint has
+# deliberately no authentication, so a red Gitleaks run is the loud version
+# of the failure class SECURITY.md treats as a vulnerability.
 #
 # Nothing is declared above the jobs except read permissions, and each job's
 # extra write stays at its own job level — a job-level `permissions` block
