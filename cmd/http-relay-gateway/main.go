@@ -142,7 +142,7 @@ func run() error {
 		PauseRetry:  settings.ReviveScanInterval,
 	})
 
-	g := gateway.New(buildState(reg, settings), version, deploy.RelayVersion, log)
+	g := gateway.New(buildState(reg, settings, log), version, deploy.RelayVersion, log)
 
 	// The apply loop is the only writer of the serving generation: registry
 	// notification (admission changed) or desired-state reload (settings
@@ -169,7 +169,7 @@ func run() error {
 		if cfg != nil {
 			s = cfg.Settings
 		}
-		g.Swap(buildState(reg, s))
+		g.Swap(buildState(reg, s, log))
 		zerolog.SetGlobalLevel(parseZerologLevel(s.LogLevel))
 		applyMu.Lock()
 		if seq > applied {
@@ -277,7 +277,7 @@ func run() error {
 // here means verified for the current incarnation, and the URL+key pair is
 // the exact one that passed verification. Everything the hot path would
 // otherwise re-derive is resolved here: body limits, transport timeouts.
-func buildState(reg *readiness.Registry, settings config.Settings) *gateway.State {
+func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.Logger) *gateway.State {
 	serving := reg.Serving()
 	in := pool.Input{
 		FailureThreshold: settings.FailureThreshold,
@@ -289,7 +289,12 @@ func buildState(reg *readiness.Registry, settings config.Settings) *gateway.Stat
 		u, err := url.Parse(s.URL)
 		if err != nil || u.Host == "" {
 			// A verified snapshot URL is always absolute; this cannot fire
-			// today. Skip rather than serve a broken entry if it ever does.
+			// today. Never serve a broken entry — but never fail the whole
+			// swap for one either: skip it loudly (name and provider only —
+			// never the URL) so a latent registry bug shows up in the log.
+			log.Warn().Str("provider", s.Key.Provider).Str("relay", s.Key.Name).
+				Str("error", sanitize.ErrorString(err)).
+				Msg("verified relay has a malformed URL; excluded from the serving pool")
 			continue
 		}
 		maxBody := pool.ProviderMaxBody(s.Key.Provider)

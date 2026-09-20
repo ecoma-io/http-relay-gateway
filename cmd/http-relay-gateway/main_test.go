@@ -61,7 +61,7 @@ func TestBuildStateServesOnlyVerified(t *testing.T) {
 	reg.Sync([]readiness.Key{a, b, c})
 	admit(t, reg, a, b)
 
-	st := buildState(reg, config.DefaultSettings())
+	st := buildState(reg, config.DefaultSettings(), zerolog.Nop())
 	if st.Pool.ReadyCount() != 2 {
 		t.Fatalf("pool serving %d relays, want exactly the 2 verified", st.Pool.ReadyCount())
 	}
@@ -128,7 +128,7 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 	settings := config.DefaultSettings()
 	settings.MaxRetries = 4
 	settings.StreamThresholdBytes = 1024
-	st := buildState(reg, settings)
+	st := buildState(reg, settings, zerolog.Nop())
 
 	// MaxBufferBytes is the largest serving provider limit: vercel's ~4.5MB
 	// loses to cloudflare's 100MB.
@@ -152,14 +152,14 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 			t.Fatal(err)
 		}
 		solo.Ready(k, gen, u, "key", time.Millisecond)
-		if got := buildState(solo, config.DefaultSettings()).MaxBufferBytes; got != pool.VercelMaxBody {
+		if got := buildState(solo, config.DefaultSettings(), zerolog.Nop()).MaxBufferBytes; got != pool.VercelMaxBody {
 			t.Fatalf("MaxBufferBytes = %d, want the vercel cap %d", got, pool.VercelMaxBody)
 		}
 	})
 
 	t.Run("zero serving leaves a live empty pool", func(t *testing.T) {
 		blank := readiness.New(readiness.Config{})
-		st := buildState(blank, config.DefaultSettings())
+		st := buildState(blank, config.DefaultSettings(), zerolog.Nop())
 		if st.Pool.ReadyCount() != 0 {
 			t.Fatalf("ReadyCount = %d, want 0", st.Pool.ReadyCount())
 		}
@@ -177,9 +177,18 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 		bad.Sync([]readiness.Key{k})
 		gen, _ := bad.GenerationOf(k)
 		bad.Ready(k, gen, "://not a url", "key", time.Millisecond)
-		st := buildState(bad, config.DefaultSettings())
+		var logs bytes.Buffer
+		st := buildState(bad, config.DefaultSettings(), zerolog.New(&logs))
 		if st.Pool == nil || st.Pool.ReadyCount() != 0 {
 			t.Fatalf("an unparseable verified URL must be skipped: %+v", st.Pool)
+		}
+		// The skip is loud — but names the relay, never its URL.
+		line := logs.String()
+		if !strings.Contains(line, "malformed URL") || !strings.Contains(line, `"relay":"bad"`) {
+			t.Fatalf("skip without a warning identifying the relay: %s", line)
+		}
+		if strings.Contains(line, "not a url") {
+			t.Fatalf("the malformed URL itself must never reach the log: %s", line)
 		}
 	})
 }

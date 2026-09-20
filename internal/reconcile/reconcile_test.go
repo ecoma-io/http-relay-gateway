@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/deploy/workers"
 	"http-relay-gateway/internal/readiness"
+
+	"github.com/rs/zerolog"
 )
 
 // --- first bring-up, reuse and drift ---
@@ -859,5 +862,35 @@ func TestShutdownSettleBarrierAbandonsTheDelete(t *testing.T) {
 	}
 	if _, ok := rig.reg.StateOf(key); ok {
 		t.Fatal("completed delete must purge the entry")
+	}
+}
+
+// A scope pin (team/account) change under a stable relay identity moves the
+// identity to a different platform scope: the pass deploys fresh there and
+// the old scope's deployment is unreachable from the desired state forever.
+// The operator gets a warning — once per actual change, not per pass.
+func TestScopePinChangeWarnsAboutTheOrphanedDeployment(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	var buf bytes.Buffer
+	rig.worker.log = zerolog.New(&buf)
+	rig.worker.pass()
+
+	if strings.Contains(buf.String(), "orphaned") {
+		t.Fatalf("first memo must not warn: %s", buf.String())
+	}
+	changed := relay("edge-a", deploy.PlatformVercel, testToken)
+	changed.Team = "team-b"
+	*rig.desired = config.Config{Relays: []config.Relay{changed}, Settings: config.DefaultSettings()}
+	rig.worker.pass()
+	if !strings.Contains(buf.String(), "orphaned") {
+		t.Fatalf("scope change without an orphan warning: %s", buf.String())
+	}
+
+	buf.Reset()
+	rig.worker.pass()
+	if buf.Len() != 0 {
+		t.Fatalf("an unchanged scope must stay silent, got: %s", buf.String())
 	}
 }

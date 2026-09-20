@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"http-relay-gateway/internal/config"
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/readiness"
@@ -36,7 +38,7 @@ func BenchmarkBuildState(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if st := buildState(reg, settings); st.Pool.ReadyCount() != n {
+		if st := buildState(reg, settings, zerolog.Nop()); st.Pool.ReadyCount() != n {
 			b.Fatalf("pool serves %d relays, want the %d verified", st.Pool.ReadyCount(), n)
 		}
 	}

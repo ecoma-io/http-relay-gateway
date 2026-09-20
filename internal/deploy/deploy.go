@@ -76,6 +76,15 @@ type Credential struct {
 	Account string
 }
 
+// SameScope reports whether two credentials address the same platform
+// scope — same pin (or same absence of one). A scope change under a stable
+// relay identity moves the identity to a different part of the platform
+// account; the deployment the old scope hosted is unreachable from the
+// desired state from then on.
+func (c Credential) SameScope(other Credential) bool {
+	return c.Team == other.Team && c.Account == other.Account
+}
+
 // Discovery reports what provider discovery found for one project name.
 type Discovery struct {
 	// Exists reports whether the project is already on the platform.

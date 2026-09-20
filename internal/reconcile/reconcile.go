@@ -47,12 +47,11 @@ import (
 )
 
 // Concurrency bounds. Probes are cheap and fan out wide; deploys serialize
-// per platform (an account's API rate limits are the constraint) with a
-// small overall width so a large fleet still heals quickly; deletes are
-// rare and bounded like deploys.
+// per platform (an account's API rate limits are the constraint) so a large
+// fleet still heals quickly without tripping those limits; deletes are rare
+// and bounded like deploys.
 const (
 	verifyParallelism = 4
-	deployParallelism = 2
 	deleteParallelism = 2
 	probeTimeout      = 10 * time.Second
 )
@@ -238,8 +237,17 @@ func (w *Worker) memoCredentials(cfg *config.Config) {
 		if err != nil {
 			continue // ensureRelay reports the credential problem for this relay
 		}
-		w.credentials[deploy.RelayKey{Provider: rel.Provider, Name: rel.Name}] =
-			deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account}
+		key := deploy.RelayKey{Provider: rel.Provider, Name: rel.Name}
+		cred := deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account}
+		if prev, ok := w.credentials[key]; ok && !prev.SameScope(cred) {
+			// The scope pin moved under a stable identity: this pass
+			// discovers and deploys in the NEW scope, and the deployment the
+			// old scope hosted is orphaned there — no later pass can ever
+			// reach or delete it again. The operator removes it by hand.
+			w.log.Warn().Str("provider", rel.Provider).Str("relay", rel.Name).
+				Msg("relay scope changed; the deployment in the previous scope is orphaned and must be removed manually")
+		}
+		w.credentials[key] = cred
 	}
 }
 
