@@ -1013,3 +1013,93 @@ func TestAwaitIdleExactness(t *testing.T) {
 		t.Fatal("identity must be idle after its request drained")
 	}
 }
+
+func TestPostSwapPickServesFromTheCurrentGeneration(t *testing.T) {
+	// A request that entered before a Swap but picks after it (body
+	// buffering can park it for seconds) must be served from the CURRENT
+	// pool. Picking from the entry snapshot would let Swap + AwaitIdle
+	// declare the old generation idle while the request was still to come,
+	// and the replacement would deploy beneath the in-flight request.
+	upA, hitsA, _ := newUpstream(t, http.StatusOK, "old-a", nil)
+	upB, hitsB, gotB := newUpstream(t, http.StatusOK, "new-b", nil)
+
+	g := newGateway(t, &State{
+		Pool: buildPool(t, []relaySpec{
+			{name: "a", provider: "vercel", rawURL: upA.URL, maxBody: 1 << 20},
+		}),
+		MaxBufferBytes: 1 << 20,
+	})
+	gwSrv := httptest.NewServer(g)
+	t.Cleanup(gwSrv.Close)
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", pr)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.ContentLength = 8
+	req.Header.Set("X-Relay-Target", "https://target.example")
+	req.Header.Set("X-Relay-Path", "/v1")
+
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		resp, err := gwSrv.Client().Do(req)
+		if err != nil {
+			t.Errorf("client do: %v", err)
+			respCh <- nil
+			return
+		}
+		respCh <- resp
+	}()
+
+	// Give the handler time to park in the body read; every assertion below
+	// holds no matter whether it has entered yet.
+	time.Sleep(50 * time.Millisecond)
+
+	client := NewClient(NewTransport(time.Second, time.Second))
+	g.Swap(&State{
+		Pool: buildPool(t, []relaySpec{
+			{name: "b", provider: "deno", rawURL: upB.URL, maxBody: 1 << 20},
+		}),
+		Client:         client,
+		MaxBufferBytes: 1 << 20,
+	})
+
+	// The replacement's drain concludes immediately: the parked request has
+	// not begun on the old generation, so nothing is holding it.
+	if !g.AwaitIdle("vercel", "a", 500*time.Millisecond) {
+		t.Fatal("AwaitIdle blocked on a request that never picked from the old generation")
+	}
+
+	if _, err := pw.Write([]byte("12345678")); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+
+	select {
+	case resp := <-respCh:
+		if resp == nil {
+			t.Fatal("no response")
+		}
+		defer resp.Body.Close()
+		got, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		if string(got) != "new-b" {
+			t.Fatalf("response = %q, want the current-generation relay's answer", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request never completed")
+	}
+	if hitsA.Load() != 0 {
+		t.Fatalf("drained generation still served traffic: relay A hit %d times", hitsA.Load())
+	}
+	readCapture(t, gotB) // the request reached relay B of the current generation
+	if hitsB.Load() == 0 {
+		t.Fatal("current-generation relay never received the request")
+	}
+}

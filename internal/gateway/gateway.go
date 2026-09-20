@@ -346,11 +346,17 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 	var lastErr error
 	skippedBySize := 0
 	for attempt := range attempts {
-		// Pick and register in flight under one lock: a relay picked here is
-		// visible to AwaitIdle before any later Swap returns, so a
-		// replacement never deploys under a request it cannot see.
+		// Pick and register in flight under one lock, from the CURRENT
+		// generation — not the snapshot taken at entry: a request that
+		// arrived before a Swap but picks after it (body buffering can hold
+		// it for seconds) must drain from the new pool, or Swap + AwaitIdle
+		// would conclude the old generation idle while this request was
+		// still to come, and the replacement would deploy beneath it.
+		// Serializing the load with Swap inside the same mutex that guards
+		// inflight keeps that window closed: every post-Swap pick is visible
+		// to AwaitIdle before the Swap returns.
 		g.mu.Lock()
-		relay := st.Pool.Pick(key)
+		relay := g.st.Load().Pool.Pick(key)
 		if relay != nil {
 			g.inflight.begin(relay.Provider, relay.Name)
 		}
