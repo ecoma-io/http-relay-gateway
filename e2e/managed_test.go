@@ -125,6 +125,14 @@ func (s *workerSim) setConfig(token, version string) {
 	s.token, s.version = token, version
 }
 
+// currentToken returns the token the sim is actually serving with — the
+// config a successful deploy landed, as opposed to the request history.
+func (s *workerSim) currentToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token
+}
+
 // setPaused flips the platform suspension: while paused, the sim answers
 // every path — version endpoint included — with the suspension page a
 // quota-exhausted Vercel deployment really serves, never the worker.

@@ -209,6 +209,10 @@ type RelaySeed struct {
 	Provider string
 	URL      string
 	Active   *bool
+	// AccountID makes the relay born managed: the reconciler deploys the
+	// embedded worker onto the platform and verifies it instead of marking
+	// the URL as a legacy edge.
+	AccountID *int64
 }
 
 func activePtr(v bool) *bool { return &v }
@@ -550,6 +554,9 @@ func (g *Gateway) CreateRelay(t testing.TB, seed RelaySeed) int64 {
 	t.Helper()
 	fields := map[string]any{
 		"name": seed.Name, "provider": seed.Provider, "url": seed.URL,
+	}
+	if seed.AccountID != nil {
+		fields["accountId"] = *seed.AccountID
 	}
 	if seed.Active != nil {
 		fields["active"] = *seed.Active

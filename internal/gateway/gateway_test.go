@@ -304,6 +304,23 @@ func TestUnknownProviderRejected(t *testing.T) {
 	}
 }
 
+func TestKnownPinEmptyPoolIs503(t *testing.T) {
+	f := newFixture(t, func(in *pool.Input, state *State) {
+		in.Relays = nil // nothing verified yet: the pool is empty
+	})
+
+	// A pinned provider with zero ready relays is retryable 503, not 404:
+	// configured-but-unready and never-configured are indistinguishable
+	// while the pool is empty.
+	res := relayRequest(t, f.gateway, "http://gateway/vercel", `{}`, map[string]string{
+		"X-Relay-Target": "https://api.example.com",
+		"X-Relay-Path":   "/v1/messages",
+	})
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a pin with an empty pool", res.StatusCode)
+	}
+}
+
 func TestBodySkipsToProviderThatAccepts(t *testing.T) {
 	f := newFixture(t, func(in *pool.Input, state *State) {
 		// vercel's real limit is 4.5MB; shrink it so the test body qualifies.

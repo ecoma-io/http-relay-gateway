@@ -247,6 +247,17 @@ func (g *Gateway) handleRelay(w http.ResponseWriter, r *http.Request, log zerolo
 func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logger, provider string) {
 	st := g.st.Load()
 
+	// Zero-ready short-circuit before body acquisition: with no verified
+	// relay the buffer cap is 0, so any body would 413 on the cap check —
+	// the honest answer is retryable 503, never 413.
+	key := provider
+	if key == "" {
+		key = pool.KeyAll
+	}
+	if st.Pool.ReadyCount() == 0 {
+		jsonError(w, http.StatusServiceUnavailable, "no relay configured for "+key)
+		return
+	}
 	// Body acquisition. Below StreamThresholdBytes (or with streaming off,
 	// the default) the body is buffered so failover can replay it; at or
 	// above the threshold it streams through untouched — a single attempt,
@@ -283,12 +294,8 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		}
 	}
 
-	key := provider
-	if key == "" {
-		key = pool.KeyAll
-	}
-
 	attempts := st.MaxRetries + 1
+
 	if streaming {
 		attempts = 1
 	}
@@ -418,7 +425,11 @@ func headerProvider(r *http.Request, p *pool.Pool) (provider string, ok, present
 	if unpinned(v) {
 		return "", true, true
 	}
-	if p.HasProvider(v) {
+	// An explicit but unknown provider is a 404 — except while the pool is
+	// entirely empty (nothing verified yet): configured-but-unready and
+	// never-configured are indistinguishable there, and 503 is the honest,
+	// retryable answer. /stats carries the operator's ground truth.
+	if p.HasProvider(v) || p.ReadyCount() == 0 {
 		return v, true, true
 	}
 	return "", false, true
@@ -442,7 +453,7 @@ func parseProvider(r *http.Request, p *pool.Pool) (provider string, ok bool) {
 	if unpinned(seg) {
 		return "", true
 	}
-	if p.HasProvider(seg) {
+	if p.HasProvider(seg) || p.ReadyCount() == 0 {
 		return seg, true
 	}
 	return "", false
