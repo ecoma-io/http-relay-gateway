@@ -330,11 +330,18 @@ rejects the load, so a credential never silently resolves to nothing. A
 `token_file` names a file whose trimmed content is the credential; both
 token files and the relay key file are **re-read every reconcile pass**, so
 rotating a secret is dropping a new file in place — no restart, no config
-touch. Scope pins: `team` (vercel only) names the team scope when the token
+touch. Write the new content atomically (to a temp file, then `rename` over
+the old one): the poller reads every second and a partially written secret
+reads as a corrupt credential and demotes the relay until the write
+completes. Scope pins: `team` (vercel only) names the team scope when the token
 can reach more than one; `account` (cloudflare only) pins the account id —
 a cloudflare token that sees exactly one account resolves it automatically,
 anything more ambiguous requires the explicit pin (deno is user-scoped and
-needs none).
+needs none). Changing a scope pin under an unchanged relay name moves the
+identity to a different platform scope: the gateway deploys fresh there,
+and the deployment the old scope hosted is **orphaned** — no later pass can
+reach or delete it, so the log warns and the old project must be removed
+manually.
 
 The poller re-reads the file every second and compares content hashes — a
 design, not a gap: no inotify, and unlike a watcher it cannot miss events
@@ -428,6 +435,12 @@ the same compose network.
   never committed.
 - Provider credentials travel to the platform management APIs only; relay
   legs and probes ride a no-proxy transport.
+- Known limitation: the readiness probes are **not** authenticated against
+  the platform — a man-in-the-middle on the relay leg can answer the probes
+  itself and pass verification without ever being a real worker. The threat
+  this design accepts is network-level: the gateway runs on a trusted
+  internal network and reaches the platforms over TLS; if that path is
+  compromised, probe fidelity is compromised with it.
 - Anything security-shaped goes through [SECURITY.md](SECURITY.md) — a
   private advisory, never a public issue.
 
