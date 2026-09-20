@@ -321,8 +321,11 @@ type ForwardAnswer struct {
 // completed round trip.
 func ForwardProbe(ctx context.Context, client *http.Client, base, key string) (ForwardAnswer, error) {
 	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	if err != nil {
 		return ForwardAnswer{}, fmt.Errorf("forward probe URL: %w", err)
+	}
+	if u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ForwardAnswer{}, fmt.Errorf("forward probe URL %q: missing host or scheme", base)
 	}
 	// The target is the relay's own origin — the path travels separately in
 	// X-Relay-Path and must never widen the target beyond its origin.

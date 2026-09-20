@@ -133,7 +133,7 @@ func (c *cloudflareClient) Discover(ctx context.Context, project string) (Discov
 		}
 		return Discovery{}, fmt.Errorf("cloudflare discover: %w", answer.err())
 	}
-	subdomain, err := c.workersDevSubdomain(ctx)
+	subdomain, err := c.workersDevSubdomain(ctx, account)
 	if err != nil {
 		return Discovery{}, err
 	}
@@ -214,7 +214,7 @@ func (c *cloudflareClient) Deploy(ctx context.Context, spec Spec) (Result, error
 		return Result{}, fmt.Errorf("cloudflare deploy: enable subdomain: %w", err)
 	}
 
-	subdomain, err := c.workersDevSubdomain(ctx)
+	subdomain, err := c.workersDevSubdomain(ctx, account)
 	if err != nil {
 		return Result{}, err
 	}
@@ -230,19 +230,17 @@ func (c *cloudflareClient) Deploy(ctx context.Context, spec Spec) (Result, error
 }
 
 // workersDevSubdomain resolves the account's workers.dev subdomain — it is
-// per account and must be fetched, never guessed.
-func (c *cloudflareClient) workersDevSubdomain(ctx context.Context) (string, error) {
-	account, err := c.resolveAccount(ctx)
-	if err != nil {
-		return "", err
-	}
+// per account and must be fetched, never guessed. The account arrives
+// resolved: both callers resolved it for their first platform call already,
+// and resolving twice would double the /accounts traffic per operation.
+func (c *cloudflareClient) workersDevSubdomain(ctx context.Context, account string) (string, error) {
 	var answer struct {
 		cloudflareAnswer
 		Result struct {
 			Subdomain string `json:"subdomain"`
 		} `json:"result"`
 	}
-	err = platformCall(ctx, c.http, http.MethodGet,
+	err := platformCall(ctx, c.http, http.MethodGet,
 		c.base+"/accounts/"+url.PathEscape(account)+"/workers/subdomain",
 		c.cred.Token, "", nil, &answer)
 	if err != nil {
