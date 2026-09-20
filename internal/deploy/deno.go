@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -46,6 +47,16 @@ func newDenoClient(base string, cred Credential, hc *http.Client) *denoClient {
 
 func (c *denoClient) Platform() string { return PlatformDeno }
 
+// denoStableURL is the project's *.deno.dev domain. The test-only
+// DENO_URL_BASE override replaces the origin so the e2e suite can answer
+// for the platform.
+func denoStableURL(project string) string {
+	if base := strings.TrimRight(os.Getenv(DenoURLBaseEnv), "/"); base != "" {
+		return base + "/" + project
+	}
+	return "https://" + project + ".deno.dev"
+}
+
 // Discover resolves the project's existence and stable URL in the
 // credential's user scope.
 func (c *denoClient) Discover(ctx context.Context, project string) (Discovery, error) {
@@ -53,7 +64,7 @@ func (c *denoClient) Discover(ctx context.Context, project string) (Discovery, e
 		c.base+"/v1/projects/"+url.PathEscape(project), c.cred.Token, "", nil, nil)
 	switch {
 	case err == nil:
-		return Discovery{Exists: true, URL: "https://" + project + ".deno.dev"}, nil
+		return Discovery{Exists: true, URL: denoStableURL(project)}, nil
 	case notFound(err):
 		return Discovery{Exists: false}, nil
 	case credentialsRejected(err):
@@ -144,7 +155,7 @@ func (c *denoClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 	result := Result{
 		Project:    spec.Project,
 		ExternalID: created.ID,
-		URL:        "https://" + spec.Project + ".deno.dev",
+		URL:        denoStableURL(spec.Project),
 	}
 	if err := awaitLive(ctx, result.URL, spec.Version, denoLiveTimeout); err != nil {
 		return Result{}, fmt.Errorf("deno deploy: %w", err)
