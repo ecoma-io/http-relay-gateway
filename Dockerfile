@@ -4,9 +4,18 @@
 # healthcheck` is a binary subcommand of the entrypoint itself.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+# Dependencies resolve before source lands: only go.mod / go.sum bust this
+# layer, so a source edit re-downloads nothing. Cache-mount contents are not
+# part of any layer, so the build step re-mounts the module cache (to see the
+# downloaded modules) plus the compile cache — a source edit then rebuilds in
+# seconds instead of recompiling every package from scratch.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 ARG VERSION=0.1.0-dev
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/http-relay-gateway ./cmd/http-relay-gateway
 
