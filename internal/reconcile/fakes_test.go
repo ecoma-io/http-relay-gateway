@@ -293,12 +293,6 @@ func (d *fakeDrainer) AwaitIdle(provider, name string, timeout time.Duration) bo
 	return idle
 }
 
-func (d *fakeDrainer) callCount() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.calls)
-}
-
 // testRig assembles one synchronous worker plus everything needed to
 // observe it. desired and relayKey stay mutable so later passes model
 // configuration and secret rotation.
