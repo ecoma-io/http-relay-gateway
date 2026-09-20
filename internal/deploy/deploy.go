@@ -19,15 +19,17 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"http-relay-gateway/internal/relayversion"
 )
 
-// RelayVersion is the generation of the embedded worker source. It rides
-// every deployment as RELAY_VERSION and every live worker reports it from
-// GET /__relay/version; the reconciler compares the two to detect drift — a
-// gateway upgrade or downgrade leaves the whole fleet stale until it
-// redeploys. Bump it whenever any file under internal/deploy/workers changes
-// behavior.
-const RelayVersion = "1"
+// RelayVersion is the generation of the embedded worker source: the
+// release-managed artifact from internal/relayversion, not a hand-edited
+// constant. It rides every deployment as RELAY_VERSION and every live worker
+// reports it from GET /__relay/version; the reconciler compares the two to
+// detect drift — a gateway upgrade or downgrade leaves the whole fleet stale
+// until it redeploys.
+var RelayVersion = relayversion.Version
 
 // Platform names, matching the store's account/deployment platforms.
 const (
