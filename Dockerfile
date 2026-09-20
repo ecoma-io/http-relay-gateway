@@ -26,10 +26,17 @@ ARG VERSION=0.1.0-dev
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/http-relay-gateway ./cmd/http-relay-gateway
+# The runtime image must carry /app/data owned by the runtime uid: when a
+# NAMED volume is first mounted, Docker copies the image directory's content
+# AND ownership into the volume — but only if the directory exists in the
+# image. Without it the volume is created root-owned and the nonroot process
+# cannot create its database (SQLITE_CANTOPEN, crash loop at boot).
+RUN install -d -o 65532 -g 65532 /out/data
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/http-relay-gateway /app/http-relay-gateway
+COPY --from=build --chown=65532:65532 /out/data /app/data
 # scratch has no WORKDIR; pin the database path to the image layout so a
 # bare `docker run` works (compose sets DATA_FILE explicitly anyway).
 ENV DATA_FILE=/app/data/gateway.db
