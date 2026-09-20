@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,13 +19,15 @@ import (
 
 // versionServer is a stand-in live relay: it answers the version endpoint
 // with whatever the test last set, can be switched off (a transport failure,
-// as far as the prober is concerned), and counts who came asking.
+// as far as the prober is concerned), can answer like a platform-paused
+// deployment instead of a worker, and counts who came asking.
 type versionServer struct {
-	srv  *httptest.Server
-	mu   sync.Mutex
-	ver  string
-	dn   bool
-	hits int
+	srv    *httptest.Server
+	mu     sync.Mutex
+	ver    string
+	dn     bool
+	paused bool
+	hits   int
 }
 
 func newVersionServer(version string) *versionServer {
@@ -33,10 +36,18 @@ func newVersionServer(version string) *versionServer {
 	mux.HandleFunc("/__relay/version", func(w http.ResponseWriter, _ *http.Request) {
 		vs.mu.Lock()
 		vs.hits++
-		down := vs.dn
+		down, paused := vs.dn, vs.paused
 		vs.mu.Unlock()
 		if down {
 			panic(http.ErrAbortHandler) // the connection dies before any byte
+		}
+		if paused {
+			// The shape a quota-suspended Vercel deployment answers with:
+			// the platform's page, never the worker's JSON.
+			w.Header().Set("X-Vercel-Error", "DEPLOYMENT_DISABLED")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte("Payment required\n\nDEPLOYMENT_DISABLED\n\n"))
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"version":%q}`, vs.ver)
@@ -55,6 +66,12 @@ func (v *versionServer) setDown(down bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.dn = down
+}
+
+func (v *versionServer) setPaused(paused bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.paused = paused
 }
 
 func (v *versionServer) hitCount() int {
@@ -166,6 +183,20 @@ func newLoopWorker(t *testing.T, client deploy.Client) *Worker {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	w := Start(db, fakeFactory{client: client}, logging.Nop(), func() int64 { return 0 })
+	t.Cleanup(w.Stop)
+	return w
+}
+
+// newRevivingLoopWorker is a Start-launched worker whose revival scan runs
+// at test-scale cadence instead of the production ten minutes.
+func newRevivingLoopWorker(t *testing.T, client deploy.Client, reviveEvery time.Duration) *Worker {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	w := startWorker(db, fakeFactory{client: client}, logging.Nop(), func() int64 { return 0 }, reviveEvery)
 	t.Cleanup(w.Stop)
 	return w
 }
@@ -455,6 +486,184 @@ func TestUnreachableRecoversOnNextProbe(t *testing.T) {
 	dep, err = w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployActive || dep.LastError != "" {
 		t.Fatalf("recovered probe = %+v, %v; want active with the error cleared", dep, err)
+	}
+}
+
+// TestPausedProbeClassifiesAndWaits pins the pause verdict: an HTTP answer
+// that is not the worker marks the deployment paused with the platform's
+// marker recorded, queues no redeploy — a deploy cannot lift a suspension —
+// and later fleet passes leave the paused relay alone for the revival scan.
+func TestPausedProbeClassifiesAndWaits(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	live.setPaused(true)
+	if stale := w.probeFleet(true); len(stale) != 0 {
+		t.Fatalf("paused relay queued for redeploy: %v", stale)
+	}
+	if got := live.hitCount(); got != 1 {
+		t.Fatalf("probes = %d, want 1", got)
+	}
+	dep, err := w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployPaused {
+		t.Fatalf("paused probe = %+v, %v", dep, err)
+	}
+	if dep.LastError == "" || !strings.Contains(dep.LastError, "DEPLOYMENT_DISABLED") {
+		t.Fatalf("pause reason not recorded: %q", dep.LastError)
+	}
+
+	// The revival scan owns paused relays: a fleet pass must not re-probe
+	// (and risk flipping the pause to unreachable on a transport blip).
+	w.probeFleet(true)
+	if got := live.hitCount(); got != 1 {
+		t.Fatalf("fleet pass re-probed a paused relay: %d hits", got)
+	}
+	dep, _ = w.db.Deployment(relayID)
+	if dep.Status != store.DeployPaused || client.deployCount() != 0 {
+		t.Fatalf("paused relay disturbed: %+v deploys=%d", dep, client.deployCount())
+	}
+}
+
+// TestReviveScanWaitsWhilePaused pins the waiting half of the revival scan:
+// while the platform still answers instead of the worker, the deployment
+// stays paused — the reason refreshed, no deploy — and nothing comes back
+// for redeployment.
+func TestReviveScanWaitsWhilePaused(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	live.setPaused(true)
+	w.probeFleet(false)
+	dep, _ := w.db.Deployment(relayID)
+	if dep.Status != store.DeployPaused {
+		t.Fatalf("setup: status = %q, want paused", dep.Status)
+	}
+
+	if redeploys := w.revivePaused(); len(redeploys) != 0 {
+		t.Fatalf("still-paused relay queued for redeploy: %v", redeploys)
+	}
+	if got := live.hitCount(); got != 2 { // classify + one revive scan
+		t.Fatalf("revive scan probes = %d, want 1 more", got)
+	}
+	dep, err := w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployPaused || dep.LastError == "" {
+		t.Fatalf("after revive scan = %+v, %v; want still paused with its reason", dep, err)
+	}
+	if client.deployCount() != 0 {
+		t.Fatal("revive scan deployed against a paused platform")
+	}
+}
+
+// TestReviveScanRevivesPaused pins the revival half: the pause lifts, the
+// worker answers the current version again, and one scan returns the
+// deployment to active with a clean error — no redeploy, same token.
+func TestReviveScanRevivesPaused(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	live.setPaused(true)
+	w.probeFleet(false)
+	live.setPaused(false)
+
+	if redeploys := w.revivePaused(); len(redeploys) != 0 {
+		t.Fatalf("same-version revival queued a redeploy: %v", redeploys)
+	}
+	dep, err := w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployActive || dep.LastError != "" {
+		t.Fatalf("revived deployment = %+v, %v", dep, err)
+	}
+	if dep.AuthToken != "old-relay-token" {
+		t.Fatalf("revival rotated the token: %q", dep.AuthToken)
+	}
+	if client.deployCount() != 0 {
+		t.Fatal("revival deployed")
+	}
+	// The pool must see it again.
+	rows, err := w.db.Relays()
+	if err != nil || len(rows) != 1 || rows[0].Deployment == nil {
+		t.Fatalf("Relays = %+v, %v", rows, err)
+	}
+}
+
+// TestReviveScanRedeploysStaleAfterRevival pins the catch-up path: the
+// platform lifts the pause but the worker that answers is an old version —
+// the scan marks it stale and a full revive batch redeploys it to current.
+func TestReviveScanRedeploysStaleAfterRevival(t *testing.T) {
+	current := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(current.srv.Close)
+	client := &fakeClient{platform: "vercel", url: current.srv.URL}
+	w := newIdleWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	live.setPaused(true)
+	w.probeFleet(false)
+	live.setPaused(false)
+	live.set("0") // revived, but the platform brought back an old deployment
+
+	w.run([]job{{kind: jobRevive}})
+	dep, err := w.db.Deployment(relayID)
+	if err != nil {
+		t.Fatalf("Deployment: %v", err)
+	}
+	if dep.Status != store.DeployActive || dep.Version != deploy.RelayVersion || dep.URL != current.srv.URL {
+		t.Fatalf("after revive batch = %+v", dep)
+	}
+	if got := client.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want the catch-up redeploy", got)
+	}
+}
+
+// TestLoopRevivesPausedAutomatically covers the always-on scanner end to
+// end: a deployment paused while the loop runs — without any operator
+// action, and with the reconcile interval off — comes back active once the
+// platform lifts the suspension, on the scanner's own cadence.
+func TestLoopRevivesPausedAutomatically(t *testing.T) {
+	current := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(current.srv.Close)
+	client := &fakeClient{platform: "vercel", url: current.srv.URL}
+	w := newRevivingLoopWorker(t, client, 30*time.Millisecond)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	// The startup pass ran against a healthy relay; the pause lands after,
+	// so classification goes through an explicit fleet pass — the same path
+	// an operator's dashboard check or a restart's startup pass would take.
+	live.setPaused(true)
+	w.CheckAll()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		dep, err := w.db.Deployment(relayID)
+		if err != nil {
+			t.Fatalf("Deployment: %v", err)
+		}
+		if dep.Status == store.DeployPaused {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("loop never classified the pause: %+v", dep)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	live.setPaused(false)
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		dep, err := w.db.Deployment(relayID)
+		if err != nil {
+			t.Fatalf("Deployment: %v", err)
+		}
+		if dep.Status == store.DeployActive && dep.LastError == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("loop never revived the relay: %+v", dep)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.deployCount() != 0 {
+		t.Fatalf("revival deployed %d times; want none on a same-version revival", client.deployCount())
 	}
 }
 

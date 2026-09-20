@@ -310,13 +310,20 @@ func buildGeneration(db *store.Store) (generation, error) {
 // managed relay serves from its own URL until a deployment exists — that is
 // what an admin-created relay is before its first deploy — and once its
 // verified active deployment joins, that deployment's stable URL and token
-// take over and the relay is unconditionally active. The bool is false when
+// take over and the relay is unconditionally active. Once a deployment
+// exists but is not active — stale, unreachable, paused by its platform,
+// failed — the deployment owns the relay's serving and it is not serving, so
+// the row contributes nothing: neither an unverified deployment URL nor the
+// tokenless relay-row placeholder may answer clients. The bool is false when
 // the row contributes no pool entry.
 func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPolicies map[string]*pool.HeaderPolicy) (pool.RelayInput, bool, error) {
 	switch row.Origin {
 	case store.OriginLegacy:
 		// active flag passes through verbatim.
 	case store.OriginManaged:
+		if row.InactiveDeployment {
+			return pool.RelayInput{}, false, nil
+		}
 		if row.Deployment != nil {
 			row.URL = row.Deployment.URL
 			row.Active = true

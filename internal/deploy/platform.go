@@ -111,13 +111,16 @@ func awaitLive(ctx context.Context, hc *http.Client, url, version string, deadli
 	defer ticker.Stop()
 	var lastErr error
 	for {
-		if v, err := ProbeVersion(deadlineCtx, hc, url); err == nil {
-			if v == version {
-				return nil
-			}
-			lastErr = fmt.Errorf("relay answers version %q, deployed %q", v, version)
-		} else {
+		answer, err := Probe(deadlineCtx, hc, url)
+		switch {
+		case err != nil:
 			lastErr = err
+		case answer.Version == version:
+			return nil
+		case answer.Version == "":
+			lastErr = answer.NotWorkerErr()
+		default:
+			lastErr = fmt.Errorf("relay answers version %q, deployed %q", answer.Version, version)
 		}
 		select {
 		case <-deadlineCtx.Done():

@@ -12,6 +12,9 @@ const (
 
 // Deployment lifecycle statuses. active is the only status whose relay
 // serves traffic and the only one whose deployment row joins into Relays().
+// paused means the platform answered a probe but no relay worker is behind
+// the URL (a free-tier suspension above all) — the relay waits for revival
+// and is never redeployed, because a redeploy cannot lift the suspension.
 const (
 	DeployPending     = "pending"
 	DeployDeploying   = "deploying"
@@ -19,6 +22,7 @@ const (
 	DeployStale       = "stale"
 	DeployUnreachable = "unreachable"
 	DeployError       = "error"
+	DeployPaused      = "paused"
 )
 
 // Platforms lists the edge platforms a relay can be deployed to.
@@ -82,6 +86,11 @@ type RelayRow struct {
 	// Deployment is non-nil only while the deployment status is active —
 	// a relay that is not verifiably serving contributes nothing to the pool.
 	Deployment *DeploymentRow
-	CreatedAt  int64
-	UpdatedAt  int64
+	// InactiveDeployment reports that a deployment row exists but is not
+	// active (stale, unreachable, paused, error, deploying). The deployment
+	// owns the managed relay's serving, so the relay row's own URL must not
+	// serve either — the generation builder drops such relays entirely.
+	InactiveDeployment bool
+	CreatedAt          int64
+	UpdatedAt          int64
 }

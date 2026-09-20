@@ -144,6 +144,25 @@ func (s *Store) AdoptRelay(relayID, accountID int64, deployment DeploymentRow) e
 	return nil
 }
 
+// DeploymentRelayIDsByStatus lists the relay ids whose deployment row is in
+// the given status — the revival scan's way to find the paused fleet.
+func (s *Store) DeploymentRelayIDsByStatus(status string) ([]int64, error) {
+	rows, err := s.db.Query(`SELECT relay_id FROM deployments WHERE status = ? ORDER BY relay_id`, status)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	ids := make([]int64, 0, 8)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // PlatformCounts returns the deployment status distribution — the fleet
 // view's drift summary. Statuses absent from the table are omitted.
 func (s *Store) PlatformCounts() (map[string]int, error) {

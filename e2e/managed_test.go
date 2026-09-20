@@ -32,13 +32,16 @@ func relayPath(id int64) string {
 
 // workerSim is a stand-in deployed relay: mutable version + token config
 // (the platform "writes" it on every deploy), token-enforced relay path,
-// and an unauthenticated version endpoint.
+// an unauthenticated version endpoint, and a paused mode in which the
+// platform answers every path with its suspension page instead of the
+// worker.
 type workerSim struct {
 	srv *httptest.Server
 
 	mu       sync.Mutex
 	token    string
 	version  string
+	paused   bool
 	requests []simRequest
 }
 
@@ -56,6 +59,10 @@ func newWorkerSim(t *testing.T, token, version string) *workerSim {
 	mux.HandleFunc("/__relay/version", func(w http.ResponseWriter, _ *http.Request) {
 		sim.mu.Lock()
 		defer sim.mu.Unlock()
+		if sim.paused {
+			sim.writePausePage(w)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(`{"version":"` + sim.version + `"}`))
@@ -79,7 +86,12 @@ func newWorkerSim(t *testing.T, token, version string) *workerSim {
 		sim.requests = append(sim.requests, simRequest{
 			Path: relayPath, AuthToken: auth, Target: r.Header.Get("X-Relay-Target"), Body: string(raw),
 		})
+		paused := sim.paused
 		sim.mu.Unlock()
+		if paused {
+			sim.writePausePage(w)
+			return
+		}
 		if expected == "" || auth != expected {
 			// A locked relay is indistinguishable from an empty one.
 			w.Header().Set("Content-Type", "application/json")
@@ -100,6 +112,23 @@ func (s *workerSim) setConfig(token, version string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.token, s.version = token, version
+}
+
+// setPaused flips the platform suspension: while paused, the sim answers
+// every path — version endpoint included — with the suspension page a
+// quota-exhausted Vercel deployment really serves, never the worker.
+func (s *workerSim) setPaused(paused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.paused = paused
+}
+
+// writePausePage answers like a real suspended Vercel deployment: HTTP 402,
+// the x-vercel-error marker, and the platform's page — on any path.
+func (s *workerSim) writePausePage(w http.ResponseWriter) {
+	w.Header().Set("X-Vercel-Error", "DEPLOYMENT_DISABLED")
+	w.WriteHeader(http.StatusPaymentRequired)
+	_, _ = w.Write([]byte("Payment required\n\nDEPLOYMENT_DISABLED\n\n"))
 }
 
 // tokens returns every X-Relay-Token value the sim has ever seen — exactly
@@ -401,6 +430,128 @@ func TestE2E_ManagedLifecycle(t *testing.T) {
 
 	// No relay token ever reached the logs — neither the deploy-time secrets
 	// nor anything the worker sim actually observed on the wire.
+	logs := g.Logs()
+	for _, token := range append(platform.deployedTokens(), sim.tokens()...) {
+		if strings.Contains(logs, token) {
+			t.Fatalf("relay token %q… leaked into logs", token[:6])
+		}
+	}
+}
+
+// TestE2E_PlatformPauseWaitsForRevival drives the suspension lifecycle free
+// tiers produce: the platform starts answering its pause page instead of the
+// worker, the gateway classifies the deployment paused — never redeploying,
+// because no deploy can lift a platform suspension — and pulls the relay
+// from the pool so no client ever sees the pause page. The always-on
+// revival scan then returns it to active serving when the platform lifts
+// the suspension, on the same deployment, token untouched.
+func TestE2E_PlatformPauseWaitsForRevival(t *testing.T) {
+	sim := newWorkerSim(t, "", "uninitialized")
+	platform := newFakePlatform(t, sim)
+	certFile, _ := trustMaterial(t, sim)
+	g := NewGatewayWithEnv(t,
+		deploy.VercelAPIBaseEnv+"="+platform.srv.URL,
+		"RELAY_REVIVE_SCAN_INTERVAL=200ms",
+		"SSL_CERT_FILE="+certFile,
+	)
+	g.Setup(t, adminPassword)
+	if code := g.Login(t, adminPassword); code != http.StatusOK {
+		t.Fatalf("login = %d", code)
+	}
+
+	code, _, body := g.AdminDo(t, http.MethodPost, "/api/v1/accounts", map[string]string{
+		"name": "main", "platform": "vercel", "token": "e2e-fake-vercel-platform-token",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("account create = %d: %s", code, body)
+	}
+	var account struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(body), &account); err != nil {
+		t.Fatal(err)
+	}
+	code, _, body = g.AdminDo(t, http.MethodPost, "/api/v1/relays", map[string]any{
+		"name": "paused-one", "provider": "vercel",
+		"url": "https://placeholder.example", "accountId": account.ID,
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("relay create = %d: %s", code, body)
+	}
+	var relay struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(body), &relay); err != nil {
+		t.Fatal(err)
+	}
+	code, _, _ = g.AdminDo(t, http.MethodPost, relayPath(relay.ID)+"/redeploy", nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("redeploy = %d", code)
+	}
+	waitForDeployment(t, g, relay.ID, "active", 30*time.Second)
+	tokens := platform.deployedTokens()
+	if len(tokens) != 1 {
+		t.Fatalf("setup deploys = %d, want 1", len(tokens))
+	}
+
+	// The platform suspends the deployment; every path answers its page.
+	sim.setPaused(true)
+	code, _, _ = g.AdminDo(t, http.MethodPost, "/api/v1/fleet/check", nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("fleet check = %d", code)
+	}
+	paused := waitForDeployment(t, g, relay.ID, "paused", 30*time.Second)
+	if !strings.Contains(paused.LastError, "DEPLOYMENT_DISABLED") {
+		t.Fatalf("paused lastError = %q, want the platform's marker", paused.LastError)
+	}
+	// The classification is relay-side, not upstream-side: the probe only
+	// ever touched the relay's own version endpoint, and it never deployed.
+	if got := len(platform.deployedTokens()); got != 1 {
+		t.Fatalf("deploys after pause = %d, want 1 — a pause is not redeployed", got)
+	}
+
+	// The relay left the pool: whatever the gateway answers with, the client
+	// must never see the platform's pause page through it.
+	g.WaitForCondition(applySettle, "paused relay out of pool", func(st *StatsView) bool {
+		_, ok := st.relay("paused-one")
+		return !ok
+	})
+	code, _, body = relayDo(t, g.Addr, "/", "{}", map[string]string{
+		"X-Relay-Target": "https://anywhere.example",
+	})
+	if code < 400 {
+		t.Fatalf("request with everything paused = %d %q, want an error", code, body)
+	}
+	if strings.Contains(body, "DEPLOYMENT_DISABLED") || strings.Contains(body, "Payment required") {
+		t.Fatalf("the platform's pause page leaked to a client: %d %q", code, body)
+	}
+
+	// The platform lifts the suspension; the same worker answers again and
+	// the scanner revives the deployment with a clean error.
+	sim.setPaused(false)
+	dep := waitForDeployment(t, g, relay.ID, "active", 30*time.Second)
+	if dep.LastError != "" {
+		t.Fatalf("revived deployment carries an error: %+v", dep)
+	}
+	g.WaitForCondition(applySettle, "revived relay back in pool", func(st *StatsView) bool {
+		row, ok := st.relay("paused-one")
+		return ok && row.Active && row.Healthy
+	})
+	code, _, body = relayDo(t, g.Addr, "/", "{}", map[string]string{
+		"X-Relay-Target": sim.srv.URL, "X-Relay-Path": "/revived",
+	})
+	if code != http.StatusOK || !strings.Contains(body, `"served":true`) {
+		t.Fatalf("post-revival relay = %d %q", code, body)
+	}
+	last, _ := sim.lastRequest()
+	if last.AuthToken != tokens[0] {
+		t.Fatalf("revival rotated the token: auth %q…, want the original %q…",
+			last.AuthToken[:6], tokens[0][:6])
+	}
+	if got := len(platform.deployedTokens()); got != 1 {
+		t.Fatalf("deploys after revival = %d, want 1 — revival is not a redeploy", got)
+	}
+
 	logs := g.Logs()
 	for _, token := range append(platform.deployedTokens(), sim.tokens()...) {
 		if strings.Contains(logs, token) {

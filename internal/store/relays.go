@@ -167,8 +167,11 @@ func (s *Store) DeleteRelay(id int64) error {
 }
 
 // Relays returns every relay ordered by id — insertion order, which the pool
-// uses as its round-robin order. The active deployment (if any) is joined in;
-// relays whose deployment is pending, stale or failed come back without one.
+// uses as its round-robin order. The deployment joins in regardless of
+// status, but the Deployment field is filled only while it is active; any
+// other status sets InactiveDeployment instead, so a managed relay with a
+// stale, unreachable, paused or failed deployment is recognizably NOT its
+// relay row's own URL to serve from.
 func (s *Store) Relays() ([]RelayRow, error) {
 	rows, err := s.db.Query(`
 		SELECT r.id, r.name, r.provider, r.url, r.active, r.origin, r.account_id,
@@ -177,7 +180,7 @@ func (s *Store) Relays() ([]RelayRow, error) {
 		       d.version, d.auth_token, d.status, d.last_error,
 		       d.last_checked_at, d.deployed_at, d.created_at, d.updated_at
 		FROM relays r
-		LEFT JOIN deployments d ON d.relay_id = r.id AND d.status = 'active'
+		LEFT JOIN deployments d ON d.relay_id = r.id
 		ORDER BY r.id`)
 	if err != nil {
 		return nil, err
@@ -223,22 +226,26 @@ func (s *Store) Relays() ([]RelayRow, error) {
 			row.HeaderPolicy = &policy.String
 		}
 		if dID.Valid {
-			row.Deployment = &DeploymentRow{
-				ID:            dID.Int64,
-				RelayID:       row.ID,
-				AccountID:     dAccountID.Int64,
-				Platform:      dPlatform.String,
-				Project:       dProject.String,
-				ExternalID:    dExternalID.String,
-				URL:           dURL.String,
-				Version:       dVersion.String,
-				AuthToken:     dToken.String,
-				Status:        dStatus.String,
-				LastError:     dLastError.String,
-				LastCheckedAt: dCheckedAt.Int64,
-				DeployedAt:    dDeployedAt.Int64,
-				CreatedAt:     dCreatedAt.Int64,
-				UpdatedAt:     dUpdatedAt.Int64,
+			if dStatus.String != DeployActive {
+				row.InactiveDeployment = true
+			} else {
+				row.Deployment = &DeploymentRow{
+					ID:            dID.Int64,
+					RelayID:       row.ID,
+					AccountID:     dAccountID.Int64,
+					Platform:      dPlatform.String,
+					Project:       dProject.String,
+					ExternalID:    dExternalID.String,
+					URL:           dURL.String,
+					Version:       dVersion.String,
+					AuthToken:     dToken.String,
+					Status:        dStatus.String,
+					LastError:     dLastError.String,
+					LastCheckedAt: dCheckedAt.Int64,
+					DeployedAt:    dDeployedAt.Int64,
+					CreatedAt:     dCreatedAt.Int64,
+					UpdatedAt:     dUpdatedAt.Int64,
+				}
 			}
 		}
 		out = append(out, row)

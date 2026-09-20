@@ -73,6 +73,12 @@ func TestRelayInputSkips(t *testing.T) {
 		"unknown origin": {ID: 1, Name: "x", Provider: "vercel", URL: "https://x.example", Origin: "bogus"},
 		"no host":        {ID: 1, Name: "x", Provider: "vercel", URL: "not-a-url", Origin: store.OriginLegacy},
 		"ftp scheme":     {ID: 1, Name: "x", Provider: "vercel", URL: "ftp://x.example", Origin: store.OriginLegacy},
+		// A deployment that exists but is not active — paused by its
+		// platform, stale, unreachable, failed — owns the relay's serving
+		// and is not serving: neither its URL nor the row's placeholder may
+		// reach the pool.
+		"paused deployment": {ID: 1, Name: "x", Provider: "vercel", URL: "https://row.example",
+			Origin: store.OriginManaged, InactiveDeployment: true},
 	}
 	for name, row := range cases {
 		if _, ok, _ := relayInput(row, nil, nil); ok {

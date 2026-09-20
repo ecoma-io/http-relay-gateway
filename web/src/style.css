@@ -187,10 +187,18 @@ tbody tr:last-child td {
   background: color-mix(in srgb, var(--ok) 8%, transparent);
 }
 
-.badge.off {
+/* Amber: a distinct waiting state, not a failure — a platform has paused
+   the deployment and the gateway is probing for its revival. */
+.badge.warn {
   border-color: color-mix(in srgb, var(--warn) 35%, transparent);
   color: var(--warn);
   background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+
+.badge.off {
+  border-color: color-mix(in srgb, var(--muted) 35%, transparent);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 8%, transparent);
 }
 
 .btn {

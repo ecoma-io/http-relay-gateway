@@ -140,7 +140,7 @@ relay endpoint and **127.0.0.1:20131** for the admin plane, keeps
 - `internal/store` — SQLite persistence: embedded migrations, relays/settings/providers/accounts/deployments rows, coalesced change channel, credential-isolating `Tokens` reads
 - `internal/admin` — admin plane: setup-once + login auth (bcrypt, JWT cookie, limiter), the `/api/v1` REST surface, SPA hosting
 - `internal/deploy` — platform deployers (vercel/cloudflare/deno clients), the embedded clean-room relay workers, deploy-time token/version injection
-- `internal/reconcile` — the fleet worker: coalesced job queue, version probes, redeploys, adoptions (a probe failure never redeploys; a failed redeploy never pulls a serving relay out of rotation)
+- `internal/reconcile` — the fleet worker: coalesced job queue, version probes, redeploys, adoptions (a probe failure never redeploys; a failed redeploy never pulls a serving relay out of rotation), plus the always-on revival scan that waits out platform suspensions (`paused` deployments are probed on their own cadence and rejoin automatically when the worker answers again — no deploy is ever fired at a suspension)
 - `internal/gateway` — HTTP data plane: pinning, bounded failover, streaming pass-through, `/healthz` + `/stats`
 - `internal/pool` — per-selector round-robin cursors, passive health, header policies, stats snapshots
 - `internal/logging`, `internal/sanitize` — zerolog setup and redaction helpers shared by all log/error paths

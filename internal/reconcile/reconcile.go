@@ -8,12 +8,21 @@
 // small, per-platform-serialized pool. Probes never trigger deploys on
 // transport failures: an unreachable relay may be a cold start or a network
 // blip, and one missed answer is never evidence the worker is outdated.
+//
+// An HTTP answer that is not the worker at all is the platform speaking —
+// typically a suspension page after free-quota exhaustion. No deploy can
+// lift that, so such relays are marked paused and pulled from the pool, and
+// an always-on revival scan re-probes them on its own cadence until the
+// worker answers again; only then do they rejoin (or queue a catch-up
+// redeploy if the fleet version moved on while they were dark).
 package reconcile
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -28,9 +37,13 @@ import (
 
 // probeParallelism bounds concurrent version probes; redeploys run two at a
 // time so a large fleet heals quickly without hammering one platform's API.
+// reviveScanInterval is how often the revival scan re-probes paused relays —
+// independent of the reconcile interval, which defaults to off, so a relay
+// parked by its platform comes back on its own without any operator action.
 const (
-	probeParallelism  = 4
-	deployParallelism = 2
+	probeParallelism   = 4
+	deployParallelism  = 2
+	reviveScanInterval = 10 * time.Minute
 )
 
 // jobKind names one unit of fleet work on the queue.
@@ -40,6 +53,7 @@ const (
 	jobCheck     jobKind = "check"     // probe everything, update statuses
 	jobStartup   jobKind = "startup"   // probe, then queue redeploys for drift
 	jobReconcile jobKind = "reconcile" // probe, then redeploy drift in-batch
+	jobRevive    jobKind = "revive"    // re-probe paused relays, rejoin or redeploy
 	jobRedeploy  jobKind = "redeploy"  // one relay
 	jobAdopt     jobKind = "adopt"     // one relay onto one account
 )
@@ -91,7 +105,7 @@ func (q *queue) drain() []job {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	jobs := make([]job, 0, len(q.pending))
-	for _, kind := range []jobKind{jobStartup, jobCheck, jobReconcile} {
+	for _, kind := range []jobKind{jobStartup, jobCheck, jobReconcile, jobRevive} {
 		if j, ok := q.pending[string(kind)]; ok {
 			jobs = append(jobs, j)
 			delete(q.pending, string(kind))
@@ -106,12 +120,13 @@ func (q *queue) drain() []job {
 
 // Worker owns the fleet loop. Start runs it; Stop cancels it.
 type Worker struct {
-	db        *store.Store
-	factory   deploy.Factory
-	probeHTTP *http.Client
-	log       zerolog.Logger
-	queue     *queue
-	interval  func() int64 // seconds until the next automatic reconcile; 0 = off
+	db          *store.Store
+	factory     deploy.Factory
+	probeHTTP   *http.Client
+	log         zerolog.Logger
+	queue       *queue
+	interval    func() int64  // seconds until the next automatic reconcile; 0 = off
+	reviveEvery time.Duration // cadence of the paused-relay revival scan; 0 = off
 
 	platformLocks map[string]*sync.Mutex
 	ctx           context.Context
@@ -123,18 +138,38 @@ type Worker struct {
 // cycle so a settings change takes effect without a restart.
 type intervalFn func() int64
 
+// ReviveScanIntervalEnv overrides the revival scan cadence. Like the
+// platform base-override variables in internal/deploy it is a test-only
+// knob — the black-box suite shrinks the ten-minute default so a paused
+// relay's revival is observable in seconds — and it never appears in the
+// API or the database.
+const ReviveScanIntervalEnv = "RELAY_REVIVE_SCAN_INTERVAL"
+
 // Start launches the fleet worker. It does no work on the hot path of
 // serving — the pool is already live from the database — and returns
 // immediately.
 func Start(db *store.Store, factory deploy.Factory, log zerolog.Logger, interval intervalFn) *Worker {
+	reviveEvery := reviveScanInterval
+	if v := os.Getenv(ReviveScanIntervalEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			reviveEvery = d
+		}
+	}
+	return startWorker(db, factory, log, interval, reviveEvery)
+}
+
+// startWorker is Start with the revival cadence as a parameter — tests run
+// the scanner at test-scale intervals by calling it directly.
+func startWorker(db *store.Store, factory deploy.Factory, log zerolog.Logger, interval intervalFn, reviveEvery time.Duration) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Worker{
-		db:        db,
-		factory:   factory,
-		probeHTTP: &http.Client{Timeout: 10 * time.Second},
-		log:       log,
-		queue:     newQueue(),
-		interval:  interval,
+		db:          db,
+		factory:     factory,
+		probeHTTP:   &http.Client{Timeout: 10 * time.Second},
+		log:         log,
+		queue:       newQueue(),
+		interval:    interval,
+		reviveEvery: reviveEvery,
 		platformLocks: map[string]*sync.Mutex{
 			deploy.PlatformVercel:     {},
 			deploy.PlatformCloudflare: {},
@@ -188,15 +223,25 @@ func (w *Worker) Stop() {
 }
 
 // loop drains the queue until stopped, inserting an automatic reconcile
-// between batches when the interval setting is non-zero.
+// between batches when the interval setting is non-zero and a paused-relay
+// revival scan on its own always-on cadence.
 func (w *Worker) loop() {
 	defer close(w.done)
+	var revive *time.Ticker
+	if w.reviveEvery > 0 {
+		revive = time.NewTicker(w.reviveEvery)
+		defer revive.Stop()
+	}
 	for {
 		var timer *time.Timer
 		var timeout <-chan time.Time
 		if seconds := w.interval(); seconds > 0 {
 			timer = time.NewTimer(time.Duration(seconds) * time.Second)
 			timeout = timer.C
+		}
+		var reviveC <-chan time.Time
+		if revive != nil {
+			reviveC = revive.C
 		}
 		select {
 		case <-w.queue.wake:
@@ -206,6 +251,9 @@ func (w *Worker) loop() {
 			w.run(w.queue.drain())
 		case <-timeout:
 			w.queue.push(job{kind: jobReconcile})
+			w.run(w.queue.drain())
+		case <-reviveC:
+			w.queue.push(job{kind: jobRevive})
 			w.run(w.queue.drain())
 		case <-w.ctx.Done():
 			if timer != nil {
@@ -233,6 +281,8 @@ func (w *Worker) run(jobs []job) {
 			w.probeFleet(false)
 		case jobReconcile:
 			redeploys = append(redeploys, w.probeFleet(true)...)
+		case jobRevive:
+			redeploys = append(redeploys, w.revivePaused()...)
 		case jobRedeploy:
 			redeploys = append(redeploys, j.relayID)
 		case jobAdopt:
@@ -247,7 +297,10 @@ func (w *Worker) run(jobs []job) {
 // probeFleet versions every managed deployment in parallel. When requeue is
 // true (startup and reconcile) the ids of relays found stale come back for
 // redeployment; a passive check just records the verdicts. Probe transport
-// failures mark unreachable and never redeploy.
+// failures mark unreachable and never redeploy; an HTTP answer that is not
+// the worker marks paused and never redeploys either — the revival scan owns
+// paused relays from there, so a fleet pass skips them rather than flipping
+// the pause to unreachable on one transport blip.
 func (w *Worker) probeFleet(requeue bool) []int64 {
 	relays, err := w.db.Relays()
 	if err != nil {
@@ -255,7 +308,7 @@ func (w *Worker) probeFleet(requeue bool) []int64 {
 		return nil
 	}
 	now := time.Now().Unix()
-	stale := make([]int64, 0)
+	stale := make([]int64, len(relays)) // indexed by slot: the closures below write disjoint cells
 	run(probeParallelism, len(relays), func(i int) {
 		relay := relays[i]
 		if relay.Origin != store.OriginManaged || relay.AccountID == nil {
@@ -272,21 +325,82 @@ func (w *Worker) probeFleet(requeue bool) []int64 {
 		if dep.URL == "" {
 			return // a failed first deploy has no URL to probe
 		}
-		reported, err := deploy.ProbeVersion(w.ctx, w.probeHTTP, dep.URL)
+		if dep.Status == store.DeployPaused {
+			return // waiting on the platform, not on the fleet: revival scan's job
+		}
+		answer, err := deploy.Probe(w.ctx, w.probeHTTP, dep.URL)
 		switch {
 		case err != nil:
 			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployUnreachable, sanitize.ErrorString(err), now)
-		case reported != deploy.RelayVersion:
+		case answer.Version == "":
+			// The platform answered, our worker did not: a suspension page
+			// (quota exhausted), a deleted deployment, a stranger's app. A
+			// redeploy cannot lift a platform suspension, so the relay waits.
+			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployPaused, sanitize.ErrorString(answer.NotWorkerErr()), now)
+		case answer.Version != deploy.RelayVersion:
 			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployStale,
-				"gateway worker version "+deploy.RelayVersion+", relay reports "+reported, now)
+				"gateway worker version "+deploy.RelayVersion+", relay reports "+answer.Version, now)
 			if requeue {
-				stale = append(stale, relay.ID)
+				stale[i] = relay.ID
 			}
 		default:
 			_ = w.db.SetDeploymentStatus(relay.ID, store.DeployActive, "", now)
 		}
 	})
-	return stale
+	nonZero := stale[:0]
+	for _, id := range stale {
+		if id != 0 {
+			nonZero = append(nonZero, id)
+		}
+	}
+	return nonZero
+}
+
+// revivePaused re-probes every paused deployment — the always-on background
+// wait for platforms to lift a suspension. A transport failure leaves the
+// pause standing (it is not evidence either way); a non-worker answer
+// refreshes the recorded reason; a worker answer revives the relay — back to
+// active on the current version, or stale with a queued redeploy when the
+// fleet moved on while the relay was dark. Returns the ids that need that
+// redeploy.
+func (w *Worker) revivePaused() []int64 {
+	ids, err := w.db.DeploymentRelayIDsByStatus(store.DeployPaused)
+	if err != nil {
+		w.log.Error().Err(err).Msg("revive: list paused")
+		return nil
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	stale := make([]int64, len(ids)) // indexed by slot: the closures below write disjoint cells
+	run(probeParallelism, len(ids), func(i int) {
+		dep, err := w.db.Deployment(ids[i])
+		if err != nil {
+			return // deleted mid-scan; the next tick retries the rest
+		}
+		answer, err := deploy.Probe(w.ctx, w.probeHTTP, dep.URL)
+		switch {
+		case err != nil:
+			return // still dark; the pause stands
+		case answer.Version == "":
+			_ = w.db.SetDeploymentStatus(ids[i], store.DeployPaused, sanitize.ErrorString(answer.NotWorkerErr()), now)
+		case answer.Version != deploy.RelayVersion:
+			_ = w.db.SetDeploymentStatus(ids[i], store.DeployStale,
+				"gateway worker version "+deploy.RelayVersion+", relay reports "+answer.Version, now)
+			stale[i] = ids[i]
+		default:
+			_ = w.db.SetDeploymentStatus(ids[i], store.DeployActive, "", now)
+			w.log.Info().Int64("relay", ids[i]).Msg("revive: paused relay answers again")
+		}
+	})
+	nonZero := stale[:0]
+	for _, id := range stale {
+		if id != 0 {
+			nonZero = append(nonZero, id)
+		}
+	}
+	return nonZero
 }
 
 // runRedeploys deploys the given relays deployParallelism at a time; two
@@ -487,12 +601,15 @@ func (w *Worker) deploy(ctx context.Context, client deploy.Client, platform, pro
 // version — the client already waited for it, but the record only becomes
 // serving truth once the gateway has seen the answer itself.
 func (w *Worker) verifyLive(url string) error {
-	reported, err := deploy.ProbeVersion(w.ctx, w.probeHTTP, url)
+	answer, err := deploy.Probe(w.ctx, w.probeHTTP, url)
 	if err != nil {
 		return err
 	}
-	if reported != deploy.RelayVersion {
-		return errors.New("relay not live: reports version " + reported)
+	if answer.Version == "" {
+		return answer.NotWorkerErr()
+	}
+	if answer.Version != deploy.RelayVersion {
+		return fmt.Errorf("relay not live: reports version %s", answer.Version)
 	}
 	return nil
 }

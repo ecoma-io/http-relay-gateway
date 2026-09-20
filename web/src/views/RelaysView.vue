@@ -53,6 +53,16 @@ const form = reactive<RelayForm>({
 
 const urlShown = (relay: Relay): string => relay.deployment?.url ?? relay.url;
 
+// Deployment badge color: green only for a verified active worker, amber
+// while a platform has paused the deployment (waiting on revival), grey for
+// everything else. The tooltip carries the reason either way.
+const deploymentBadgeClass = (relay: Relay): string => {
+  const status = relay.deployment?.status;
+  if (status === "active") return "ok";
+  if (status === "paused") return "warn";
+  return "off";
+};
+
 const sorted = computed(() => [...relays.value].sort((a, b) => a.id - b.id));
 
 // A managed relay rides on a platform account whose platform must equal the
@@ -328,7 +338,7 @@ onUnmounted(() => window.clearInterval(pollTimer));
             {{ relay.origin }}
             <span
               v-if="relay.origin === 'legacy'"
-              class="badge off"
+              class="badge warn"
               title="This relay has a public URL and no authentication token."
               >unprotected</span
             >
@@ -337,7 +347,7 @@ onUnmounted(() => window.clearInterval(pollTimer));
             <template v-if="relay.deployment">
               <span
                 class="badge"
-                :class="relay.deployment.status === 'active' ? 'ok' : 'off'"
+                :class="deploymentBadgeClass(relay)"
                 :title="relay.deployment.lastError || relay.deployment.status"
                 >{{ relay.deployment.status }}</span
               >

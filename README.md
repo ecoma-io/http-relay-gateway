@@ -109,6 +109,18 @@ unauthenticated; the admin plane is not.
   deployments whose reported version differs from the gateway's — how the
   fleet upgrades (or downgrades) with the gateway. Startup probes run
   automatically; an unreachable relay is never redeployed on a hunch.
+- **Platform pauses**: when a platform answers a probe but the relay worker
+  does not — the suspension page free tiers serve after quota exhaustion
+  (Vercel: HTTP 402, `x-vercel-error: DEPLOYMENT_DISABLED`) — the deployment
+  is marked `paused` and the relay leaves the pool: no deploy could lift a
+  platform suspension, and no client is ever served the platform's page.
+  This verdict is relay-side by construction: the probe only ever contacts
+  the relay's own `/__relay/version` endpoint, so it can never mistake an
+  upstream error for a pause. An always-on revival scan re-probes paused
+  deployments roughly every 10 minutes, independent of the reconcile
+  interval; when the worker answers again the relay rejoins automatically
+  (or queues a catch-up redeploy if the fleet version moved on while it was
+  dark). While paused, the relay's row shows the platform's marker.
 - **Settings**: `GET`/`PATCH /api/v1/settings` — log level, retry/cooldown
   knobs, streaming threshold, transport timeouts, reconcile interval. Unknown
   keys are rejected.

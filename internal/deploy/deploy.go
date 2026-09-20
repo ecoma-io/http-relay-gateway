@@ -132,38 +132,71 @@ const (
 // mismatched.
 const probeTimeout = 5 * time.Second
 
-// ProbeVersion asks a live relay for its deployed version via
-// GET <base>/__relay/version. Any transport failure — timeout, TLS, 5xx,
-// unparseable body — is an error; callers treat that as unreachable and must
-// never conclude version mismatch from it.
-func ProbeVersion(ctx context.Context, client *http.Client, base string) (string, error) {
+// ProbeAnswer is what answered a version probe. A relay worker answers with
+// its deployed version — Version non-empty, Status 200. Any other HTTP
+// answer (a platform pause page, a deleted deployment, a stranger's app on
+// the URL) is NOT a relay worker: Version empty, plus the status and the
+// best-effort platform marker so the admin can see why.
+type ProbeAnswer struct {
+	Version string
+	Status  int
+	Marker  string
+}
+
+// NotWorkerErr describes a non-worker HTTP answer as an error, so probe
+// verdicts flow through the same sanitize-and-record path as transport
+// failures. Nil for a worker answer.
+func (a ProbeAnswer) NotWorkerErr() error {
+	if a.Version != "" {
+		return nil
+	}
+	if a.Marker != "" {
+		return fmt.Errorf("relay answered HTTP %d, not a relay worker (%s)", a.Status, a.Marker)
+	}
+	return fmt.Errorf("relay answered HTTP %d, not a relay worker", a.Status)
+}
+
+// Probe asks a live relay for its deployed version via GET
+// <base>/__relay/version. Only a transport failure — timeout, TLS, refused
+// connection — is an error; every HTTP answer comes back classified, because
+// the probe is the one place that may conclude "the platform answered but
+// our worker is not behind this URL" (a pause) as opposed to "the relay
+// could not be reached at all". A pause must wait for revival; an
+// unreachable relay must never be redeployed on a hunch either — the
+// distinction between the two is this function's job, not the caller's.
+func Probe(ctx context.Context, client *http.Client, base string) (ProbeAnswer, error) {
 	u, err := url.JoinPath(base, "__relay/version")
 	if err != nil {
-		return "", fmt.Errorf("probe URL: %w", err)
+		return ProbeAnswer{}, fmt.Errorf("probe URL: %w", err)
 	}
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", fmt.Errorf("probe request: %w", err)
+		return ProbeAnswer{}, fmt.Errorf("probe request: %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("probe: %w", err)
+		return ProbeAnswer{}, fmt.Errorf("probe: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	answer := ProbeAnswer{
+		Status: resp.StatusCode,
+		Marker: strings.TrimSpace(resp.Header.Get("X-Vercel-Error")),
+	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("probe: status %d", resp.StatusCode)
+		return answer, nil
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
-		return "", fmt.Errorf("probe: read answer: %w", err)
+		return ProbeAnswer{}, fmt.Errorf("probe: read answer: %w", err)
 	}
 	var parsed struct {
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil || parsed.Version == "" {
-		return "", fmt.Errorf("probe: unreadable version answer")
+		return answer, nil
 	}
-	return parsed.Version, nil
+	answer.Version = parsed.Version
+	return answer, nil
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // openTestStore opens a store on a fresh file in a per-test directory.
@@ -40,8 +41,8 @@ func TestMigrateFreshAndIdempotent(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Fatalf("schema version = %d, want 1 after fresh migrate", version)
+	if version != 2 {
+		t.Fatalf("schema version = %d, want 2 after fresh migrate", version)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -51,8 +52,8 @@ func TestMigrateFreshAndIdempotent(t *testing.T) {
 	if err := reopened.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Fatalf("schema version = %d after reopen, want still 1", version)
+	if version != 2 {
+		t.Fatalf("schema version = %d after reopen, want still 2", version)
 	}
 }
 
@@ -222,8 +223,40 @@ func TestRelaysJoinsOnlyActiveDeployment(t *testing.T) {
 	if relays[0].Name != "live" || relays[0].Deployment == nil || relays[0].Deployment.URL != "https://db-url.example" {
 		t.Fatalf("active relay row = %+v", relays[0])
 	}
-	if relays[1].Name != "pending" || relays[1].Deployment != nil {
-		t.Fatalf("non-active relay must have no deployment: %+v", relays[1])
+	if relays[0].InactiveDeployment {
+		t.Fatalf("active deployment must not set InactiveDeployment: %+v", relays[0])
+	}
+	if relays[1].Name != "pending" || relays[1].Deployment != nil || !relays[1].InactiveDeployment {
+		t.Fatalf("non-active relay must have no deployment pointer but the inactive flag: %+v", relays[1])
+	}
+}
+
+// TestPausedDeploymentRoundTrip pins the v2 status end to end: a paused row
+// satisfies the CHECK, comes back verbatim, and is findable by the revival
+// scan's status query.
+func TestPausedDeploymentRoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	if err := insertManagedRelayForTest(s, "paused-1", "https://p.example", "tok-paused"); err != nil {
+		t.Fatal(err)
+	}
+	var relayID int64
+	if err := s.db.QueryRow(`SELECT id FROM relays WHERE name = 'paused-1'`).Scan(&relayID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if err := s.SetDeploymentStatus(relayID, DeployPaused, "relay answered HTTP 402, not a relay worker (DEPLOYMENT_DISABLED)", now); err != nil {
+		t.Fatalf("SetDeploymentStatus paused: %v", err)
+	}
+	dep, err := s.Deployment(relayID)
+	if err != nil || dep.Status != DeployPaused || dep.LastError == "" {
+		t.Fatalf("paused row = %+v, %v", dep, err)
+	}
+	ids, err := s.DeploymentRelayIDsByStatus(DeployPaused)
+	if err != nil || len(ids) != 1 || ids[0] != relayID {
+		t.Fatalf("DeploymentRelayIDsByStatus(paused) = %v, %v", ids, err)
+	}
+	if ids, err := s.DeploymentRelayIDsByStatus(DeployActive); err != nil || len(ids) != 0 {
+		t.Fatalf("DeploymentRelayIDsByStatus(active) = %v, %v; the relay just paused", ids, err)
 	}
 }
 
