@@ -205,6 +205,18 @@ const (
 	DenoAPIBaseEnv       = "DENO_API_BASE"
 )
 
+// Environment variable names that override the stable relay URL each client
+// derives from the project name. Like the API base overrides they are
+// test-only knobs: in-process worker sims answer for the platform, and the
+// suite has no way to route <project>.vercel.app and friends to them.
+// Production leaves them unset and every relay keeps its real platform
+// origin. They never appear in logs.
+const (
+	VercelURLBaseEnv     = "VERCEL_URL_BASE"
+	CloudflareURLBaseEnv = "CLOUDFLARE_URL_BASE"
+	DenoURLBaseEnv       = "DENO_URL_BASE"
+)
+
 // probeTimeout bounds one version probe; a slower relay is unreachable, not
 // mismatched.
 const probeTimeout = 5 * time.Second

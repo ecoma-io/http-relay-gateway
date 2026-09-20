@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -47,7 +48,12 @@ func (c *vercelClient) Platform() string { return PlatformVercel }
 // stableURL is the project's default production domain. Vercel serves every
 // project at <name>.vercel.app unless the operator deleted that domain; the
 // slug charset (lowercase letters, digits, dashes) needs no domain-encoding.
+// The test-only VERCEL_URL_BASE override replaces the origin so the e2e
+// suite can answer for the platform.
 func vercelStableURL(project string) string {
+	if base := strings.TrimRight(os.Getenv(VercelURLBaseEnv), "/"); base != "" {
+		return base + "/" + project
+	}
 	return "https://" + project + ".vercel.app"
 }
 

@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -45,6 +46,16 @@ func newCloudflareClient(base string, cred Credential, hc *http.Client) *cloudfl
 }
 
 func (c *cloudflareClient) Platform() string { return PlatformCloudflare }
+
+// cloudflareStableURL is the script's workers.dev host. The test-only
+// CLOUDFLARE_URL_BASE override replaces the origin so the e2e suite can
+// answer for the platform.
+func cloudflareStableURL(project, subdomain string) string {
+	if base := strings.TrimRight(os.Getenv(CloudflareURLBaseEnv), "/"); base != "" {
+		return base + "/" + project
+	}
+	return "https://" + project + "." + subdomain + ".workers.dev"
+}
 
 // cloudflareAnswer is the envelope every Cloudflare API answer wraps.
 type cloudflareAnswer struct {
@@ -137,7 +148,7 @@ func (c *cloudflareClient) Discover(ctx context.Context, project string) (Discov
 	if err != nil {
 		return Discovery{}, err
 	}
-	return Discovery{Exists: true, URL: "https://" + project + "." + subdomain + ".workers.dev"}, nil
+	return Discovery{Exists: true, URL: cloudflareStableURL(project, subdomain)}, nil
 }
 
 // isCloudflareNotFound reports the envelope form of "no such script".
@@ -221,7 +232,7 @@ func (c *cloudflareClient) Deploy(ctx context.Context, spec Spec) (Result, error
 	result := Result{
 		Project:    spec.Project,
 		ExternalID: spec.Project,
-		URL:        fmt.Sprintf("https://%s.%s.workers.dev", spec.Project, subdomain),
+		URL:        cloudflareStableURL(spec.Project, subdomain),
 	}
 	if err := awaitLive(ctx, result.URL, spec.Version, cloudflareLiveTimeout); err != nil {
 		return Result{}, fmt.Errorf("cloudflare deploy: %w", err)
