@@ -16,6 +16,11 @@ gofmt -w . && go vet ./... && go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/http-relay-gateway ./cmd/http-relay-gateway
 ```
 
+Benchmarks cover the new hot paths — `go test -bench=. -run=^$ ./internal/pool/
+./internal/readiness/ ./internal/gateway/ ./cmd/http-relay-gateway/`: pool
+admission counting, registry `IsReady` / `Snapshot`, the data-plane forward
+path, and `buildGeneration`.
+
 Go ≥ 1.26 (`go.mod` owns the floor). SQLite is `modernc.org/sqlite` (pure
 Go, no CGO — the image is `scratch`); the store runs a single connection,
 so a query on the pool while a transaction is open deadlocks — transaction
@@ -41,13 +46,18 @@ ADMIN_ADDR=127.0.0.1:20131 \
 
 Environment variables are bootstrap-only and require restart:
 
-| Env                   |           Default | Meaning                                            |
-| --------------------- | ----------------: | -------------------------------------------------- |
-| `LISTEN_ADDR`         |           `:8080` | Relay endpoint; also serves `/healthz`, `/stats`   |
-| `ADMIN_ADDR`          | `127.0.0.1:20131` | Admin plane listener (REST + UI); keep it loopback |
-| `DATA_FILE`           | `data/gateway.db` | SQLite database — the source of truth              |
-| `SHUTDOWN_GRACE`      |             `20s` | Whole-process drain budget for shutdown            |
-| `ADMIN_COOKIE_SECURE` |           `false` | `Secure` cookie attribute, for HTTPS termination   |
+| Env                   |           Default | Meaning                                                     |
+| --------------------- | ----------------: | ----------------------------------------------------------- |
+| `LISTEN_ADDR`         |           `:8080` | Relay endpoint; also serves `/healthz`, `/readyz`, `/stats` |
+| `ADMIN_ADDR`          | `127.0.0.1:20131` | Admin plane listener (REST + UI); keep it loopback          |
+| `DATA_FILE`           | `data/gateway.db` | SQLite database — the source of truth                       |
+| `SHUTDOWN_GRACE`      |             `20s` | Whole-process drain budget for shutdown                     |
+| `ADMIN_COOKIE_SECURE` |           `false` | `Secure` cookie attribute, for HTTPS termination            |
+
+Readiness knobs (also bootstrap-only): `RELAY_VERIFY_INTERVAL` (`60s`),
+`RELAY_REVIVE_SCAN_INTERVAL` (`10m`), `RELAY_VERIFY_BACKOFF_BASE` (`5s`),
+`RELAY_VERIFY_BACKOFF_MAX` (`5m`), `RELAY_VERIFY_RECOVER_MAX` (`15s`),
+`RELAY_VERIFY_DEMOTE_AFTER` (`3`).
 
 Runtime state lives in the SQLite database (`internal/store`): relays,
 settings, providers, platform accounts, deployments, admin credentials.
@@ -66,7 +76,19 @@ Read [`README.md`](README.md) before changing the wire contract.
   provider; empty / `none` / `auto` / `all` round-robins every provider.
   Round-robin cursors are per selector key; with all relays healthy the
   served sequence is exactly the config order — deterministic, so tests pin
-  exact sequences. An unknown pin is a `404`.
+  exact sequences. An unknown pin is a `404` — except while the ready set is
+  empty (nothing verified yet), where any explicit pin is a retryable `503`.
+- Only **ready** relays serve. A relay is admitted after a verified
+  readiness gate (`internal/readiness` + `internal/reconcile`): deployment
+  reachable + expected `deploy.RelayVersion` + relay key accepted + a
+  forwarded probe through the relay's own URL. Lifecycle states
+  (configured / discovered / deploying / verifying / ready / unready /
+  failed / removing) render on `/stats`; `/readyz` is `503` while nothing is
+  ready (data plane too) and `/healthz` stays `ok` — readiness is
+  admission-based, not liveness. The registry is in-memory and re-verifies
+  from scratch after a restart; the database `active` flag is deployment
+  currency, independent of admission. Probe failures demote and back off
+  (never redeploy); version mismatch or a wrong relay key queues a redeploy.
 - Forward-proxy inbound: an absolute-form request target (or `CONNECT`)
   routes through the proxy branch, which derives `X-Relay-Target` /
   `X-Relay-Path` from the URL and overwrites client-supplied values
@@ -146,9 +168,10 @@ relay endpoint and **127.0.0.1:20131** for the admin plane, keeps
 - `internal/store` — SQLite persistence: embedded migrations, relays/settings/providers/accounts/deployments rows, coalesced change channel, credential-isolating `Tokens` reads
 - `internal/admin` — admin plane: setup-once + login auth (bcrypt, JWT cookie, limiter), the `/api/v1` REST surface, SPA hosting
 - `internal/deploy` — platform deployers (vercel/cloudflare/deno clients), the embedded clean-room relay workers, deploy-time token/version injection
-- `internal/reconcile` — the fleet worker: coalesced job queue, version probes, redeploys, adoptions (a probe failure never redeploys; a failed redeploy never pulls a serving relay out of rotation), plus the always-on revival scan that waits out platform suspensions (`paused` deployments are probed on their own cadence and rejoin automatically when the worker answers again — no deploy is ever fired at a suspension)
-- `internal/gateway` — HTTP data plane: pinning, bounded failover, streaming pass-through, `/healthz` + `/stats`
+- `internal/reconcile` — the fleet worker: coalesced job queue, readiness verification passes, version probes, redeploys, adoptions (a probe failure never redeploys; a failed redeploy never pulls a serving relay out of rotation), plus the always-on revival scan that waits out platform suspensions (`paused` deployments are probed on their own cadence and rejoin automatically when the worker answers again — no deploy is ever fired at a suspension)
+- `internal/gateway` — HTTP data plane: pinning, bounded failover, streaming pass-through, `/healthz` + `/readyz` + `/stats`
 - `internal/pool` — per-selector round-robin cursors, passive health, header policies, stats snapshots
+- `internal/readiness` — in-memory relay lifecycle registry: states, per-relay single-flight deploys, backoff-gated verification, admission counters for `/readyz`
 - `internal/logging`, `internal/sanitize` — zerolog setup and redaction helpers shared by all log/error paths
 - `e2e` — black-box tests and sims driving the real binary as a subprocess
   with in-process fake edge relays; `go test ./e2e/` (skip with `-short`)

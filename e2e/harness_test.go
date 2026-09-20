@@ -47,8 +47,27 @@ const applySettle = 5 * time.Second
 
 // StatsView is the decoded /stats body.
 type StatsView struct {
-	Version string      `json:"version"`
-	Relays  []RelayView `json:"relays"`
+	Version   string         `json:"version"`
+	Relays    []RelayView    `json:"relays"`
+	Readiness ReadinessView  `json:"readiness"`
+	Lifecycle []LifecycleRow `json:"lifecycle"`
+}
+
+// ReadinessView is the /stats readiness summary: whether at least one relay
+// was admitted to the pool after verified readiness.
+type ReadinessView struct {
+	Ready       bool `json:"ready"`
+	ReadyRelays int  `json:"readyRelays"`
+}
+
+// LifecycleRow is one configured relay's readiness phase as seen by the
+// coordinating registry — every row appears here whether or not it earned
+// pool admission.
+type LifecycleRow struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // RelayView is one per-relay row from /stats.
@@ -74,12 +93,59 @@ func (s *StatsView) relay(name string) (RelayView, bool) {
 	return RelayView{}, false
 }
 
+func (s *StatsView) lifecycle(name string) (LifecycleRow, bool) {
+	for _, r := range s.Lifecycle {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return LifecycleRow{}, false
+}
+
 func relayNames(st *StatsView) []string {
 	out := make([]string, 0, len(st.Relays))
 	for _, r := range st.Relays {
 		out = append(out, r.Name)
 	}
 	return out
+}
+
+// fastVerifyEnv shrinks every readiness-gate bound from its production
+// default so the gate is observable inside test windows: a 60s verify
+// cadence would make every "relay becomes ready" assertion outlast the
+// suite. Tests that need production-like timing pass their own entries —
+// extraEnv always wins because entries are merged without duplicating a
+// name already present.
+func fastVerifyEnv() []string {
+	return []string{
+		"RELAY_VERIFY_INTERVAL=300ms",
+		"RELAY_REVIVE_SCAN_INTERVAL=300ms",
+		"RELAY_VERIFY_BACKOFF_BASE=100ms",
+		"RELAY_VERIFY_BACKOFF_MAX=2s",
+		"RELAY_VERIFY_RECOVER_MAX=200ms",
+		"RELAY_VERIFY_DEMOTE_AFTER=1000",
+	}
+}
+
+// mergeEnv puts extraEnv first, then every fastVerifyEnv entry whose name
+// extraEnv did not already supply — the caller's value wins by construction.
+func mergeEnv(extraEnv []string) []string {
+	merged := make([]string, 0, len(extraEnv)+len(fastVerifyEnv()))
+	merged = append(merged, extraEnv...)
+	for _, kv := range fastVerifyEnv() {
+		name := kv[:strings.Index(kv, "=")]
+		dup := false
+		for _, have := range merged {
+			if strings.HasPrefix(have, name+"=") {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			merged = append(merged, kv)
+		}
+	}
+	return merged
 }
 
 // Gateway is one real gateway subprocess with its own data file and ports.
@@ -143,6 +209,10 @@ type RelaySeed struct {
 	Provider string
 	URL      string
 	Active   *bool
+	// AccountID makes the relay born managed: the reconciler deploys the
+	// embedded worker onto the platform and verifies it instead of marking
+	// the URL as a legacy edge.
+	AccountID *int64
 }
 
 func activePtr(v bool) *bool { return &v }
@@ -211,7 +281,7 @@ func newGateway(t testing.TB, extraEnv []string) *Gateway {
 		admin:     admin,
 		adminPass: adminPassword,
 	}
-	g.start(extraEnv)
+	g.start(mergeEnv(extraEnv))
 	t.Cleanup(g.stop)
 	g.waitHealthy(10 * time.Second)
 	g.waitAdminReady(10 * time.Second)
@@ -288,6 +358,27 @@ func (g *Gateway) waitAdminReady(timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	g.t.Fatalf("admin plane never became ready; output:\n%s", g.output.String())
+}
+
+// WaitForReady polls /stats until exactly want relays were admitted to the
+// pool — the readiness gate completing end to end, not just rows existing.
+func (g *Gateway) WaitForReady(want int, timeout time.Duration) *StatsView {
+	g.t.Helper()
+	return g.WaitForCondition(timeout, fmt.Sprintf("readyRelays == %d", want), func(st *StatsView) bool {
+		return st.Readiness.ReadyRelays == want
+	})
+}
+
+// readyzDo returns the /readyz status and body verbatim.
+func readyzDo(t testing.TB, addr string) (int, string) {
+	t.Helper()
+	resp, err := http.Get("http://" + addr + "/readyz")
+	if err != nil {
+		t.Fatalf("readyz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(raw)
 }
 
 // WaitForRelays polls /stats until the relay list reports exactly want in order.
@@ -464,6 +555,9 @@ func (g *Gateway) CreateRelay(t testing.TB, seed RelaySeed) int64 {
 	fields := map[string]any{
 		"name": seed.Name, "provider": seed.Provider, "url": seed.URL,
 	}
+	if seed.AccountID != nil {
+		fields["accountId"] = *seed.AccountID
+	}
 	if seed.Active != nil {
 		fields["active"] = *seed.Active
 	}
@@ -541,22 +635,29 @@ func (g *Gateway) AdminStatus(t testing.TB) bool {
 		SetupRequired bool `json:"setupRequired"`
 	}
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		t.Fatalf("decode admin status: %v (%s)", err, raw)
+		t.Fatal(err)
 	}
 	return parsed.SetupRequired
 }
 
 // edgeSim is one fake edge relay (the Vercel/Deno/Cloudflare deployment the
 // gateway forwards into). It records the last request and answers with its
-// own name, so assertions can tell which relay served.
+// own name, so assertions can tell which relay served. It also behaves like
+// the embedded worker for the readiness gate: the unauthenticated version
+// route answers direct version probes and, as the inner origin, end-to-end
+// forward probes — a probe counts separately from relay traffic, and the
+// forward path can be broken at will to exercise probe failures.
 type edgeSim struct {
 	name string
 	URL  string
+	srv  *httptest.Server
 
-	mu      sync.Mutex
-	headers http.Header
-	body    []byte
-	hits    int
+	mu            sync.Mutex
+	headers       http.Header
+	body          []byte
+	hits          int
+	forwardProbes int
+	forwardBroken bool
 }
 
 func (s *edgeSim) header(name string) string {
@@ -582,6 +683,22 @@ func (s *edgeSim) hitCount() int {
 
 func (s *edgeSim) servedBody() string { return s.name + "\n" }
 
+// setForwardBroken flips the origin path of the end-to-end forward probe to
+// 502 — the worker answers, but the forwarded request fails, which the gate
+// classifies as probe_failed (no redeploy, no admission).
+func (s *edgeSim) setForwardBroken(broken bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardBroken = broken
+}
+
+// shutdown kills the server, turning the URL into a refused connection — the
+func (s *edgeSim) shutdown() {
+	if s.srv != nil {
+		s.srv.Close()
+	}
+}
+
 // NewEdgeSim starts one fake edge relay. The response body is the sim's name
 // so tests can identify which relay answered.
 func NewEdgeSim(t testing.TB, name string) *edgeSim {
@@ -589,6 +706,33 @@ func NewEdgeSim(t testing.TB, name string) *edgeSim {
 	s := &edgeSim{name: name}
 	srv := httptestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
+
+		// Both the direct version probe and the inner origin of a forward
+		// probe land on the worker's unauthenticated version route. The
+		// forward probe is the readmission gate for a legacy relay, so it
+		// must never count as relay traffic.
+		relayPath := r.Header.Get("X-Relay-Path")
+		if relayPath == "" {
+			relayPath = r.URL.Path
+		}
+		if r.URL.Path == "/__relay/version" || relayPath == "/__relay/version" {
+			s.mu.Lock()
+			broken := s.forwardBroken
+			s.forwardProbes++
+			s.mu.Unlock()
+			if broken {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":"origin unreachable"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write([]byte(`{"version":"1"}`))
+			return
+		}
+
+		// Ordinary relay traffic.
 		s.mu.Lock()
 		s.headers = r.Header.Clone()
 		s.body = raw
@@ -599,6 +743,7 @@ func NewEdgeSim(t testing.TB, name string) *edgeSim {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(s.servedBody()))
 	}))
+	s.srv = srv
 	s.URL = srv.URL
 	return s
 }

@@ -304,6 +304,23 @@ func TestUnknownProviderRejected(t *testing.T) {
 	}
 }
 
+func TestKnownPinEmptyPoolIs503(t *testing.T) {
+	f := newFixture(t, func(in *pool.Input, state *State) {
+		in.Relays = nil // nothing verified yet: the pool is empty
+	})
+
+	// A pinned provider with zero ready relays is retryable 503, not 404:
+	// configured-but-unready and never-configured are indistinguishable
+	// while the pool is empty.
+	res := relayRequest(t, f.gateway, "http://gateway/vercel", `{}`, map[string]string{
+		"X-Relay-Target": "https://api.example.com",
+		"X-Relay-Path":   "/v1/messages",
+	})
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a pin with an empty pool", res.StatusCode)
+	}
+}
+
 func TestBodySkipsToProviderThatAccepts(t *testing.T) {
 	f := newFixture(t, func(in *pool.Input, state *State) {
 		// vercel's real limit is 4.5MB; shrink it so the test body qualifies.
@@ -589,6 +606,95 @@ func TestHealthzBody(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	if res.StatusCode != http.StatusOK || string(body) != "ok\n" {
 		t.Fatalf("healthz = %d %q, want 200 %q", res.StatusCode, body, "ok\n")
+	}
+}
+
+func TestReadyzDistinctFromHealthz(t *testing.T) {
+	// Zero ready relays: the process is alive but serves nothing — /healthz
+	// must answer ok (orchestrator survival) while /readyz answers 503 (route
+	// around the gateway).
+	f := newFixture(t, func(in *pool.Input, _ *State) {
+		for i := range in.Relays {
+			in.Relays[i].Active = false
+		}
+	})
+	ts := httptest.NewServer(f.gateway)
+	t.Cleanup(ts.Close)
+
+	hz, err := ts.Client().Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hzBody, _ := io.ReadAll(hz.Body)
+	_ = hz.Body.Close()
+	if hz.StatusCode != http.StatusOK || string(hzBody) != "ok\n" {
+		t.Fatalf("/healthz = %d %q, want 200 ok\\n under zero readiness", hz.StatusCode, hzBody)
+	}
+
+	rz, err := ts.Client().Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rzBody, _ := io.ReadAll(rz.Body)
+	_ = rz.Body.Close()
+	if rz.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d, want 503 with zero ready relays", rz.StatusCode)
+	}
+	if !strings.Contains(string(rzBody), `"ready":false`) {
+		t.Fatalf("/readyz body wrong: %s", rzBody)
+	}
+}
+
+func TestReadyzFlipsWithAdmission(t *testing.T) {
+	f := newFixture(t, func(in *pool.Input, _ *State) {
+		for i := range in.Relays {
+			in.Relays[i].Active = i == 1 // only the live "good" relay admitted
+		}
+	})
+	ts := httptest.NewServer(f.gateway)
+	t.Cleanup(ts.Close)
+
+	rz, err := ts.Client().Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(rz.Body)
+	_ = rz.Body.Close()
+	if rz.StatusCode != http.StatusOK {
+		t.Fatalf("/readyz = %d, want 200 with one ready relay", rz.StatusCode)
+	}
+	if !strings.Contains(string(body), `"ready":true`) ||
+		!strings.Contains(string(body), `"readyRelays":1`) {
+		t.Fatalf("/readyz body wrong: %s", body)
+	}
+}
+
+func TestStatsCarriesReadinessAndLifecycle(t *testing.T) {
+	f := newFixture(t, func(in *pool.Input, state *State) {
+		state.Lifecycle = []LifecycleRow{
+			{Name: "good", Provider: "vercel", State: "ready"},
+			{Name: "dead", Provider: "vercel", State: "unready", Reason: "probe_failed"},
+		}
+	})
+	ts := httptest.NewServer(f.gateway)
+	t.Cleanup(ts.Close)
+
+	res, err := ts.Client().Get(ts.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, _ := io.ReadAll(res.Body)
+	for _, want := range []string{
+		`"readiness":{"ready":true,"readyRelays":3}`,
+		`"lifecycle":[`,
+		`"state":"ready"`,
+		`"state":"unready"`,
+		`"reason":"probe_failed"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("/stats payload missing %s: %s", want, raw)
+		}
 	}
 }
 

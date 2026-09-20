@@ -26,6 +26,16 @@ func newStreamingSim(t *testing.T) *streamingSim {
 	t.Helper()
 	s := &streamingSim{release: make(chan struct{})}
 	s.srv = httptestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The readiness gate's end-to-end forward probe targets this relay
+		// with X-Relay-Path=/__relay/version. It must answer immediately
+		// like the worker's unauthenticated version route — parking it on
+		// the release gate would stall the probe until the 10s timeout and
+		// the relay could never earn admission.
+		if r.Header.Get("X-Relay-Path") == "/__relay/version" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"version":"1"}`))
+			return
+		}
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -157,10 +167,16 @@ func TestE2E_ShutdownDrainsInFlightStream(t *testing.T) {
 // every relay dead the gateway still attempts the candidates (best effort,
 // never an instant 503) and only then answers 502 with the sanitized error.
 func TestE2E_AllRelaysDownIsBestEffort502(t *testing.T) {
+	one := NewEdgeSim(t, "down-1")
+	two := NewEdgeSim(t, "down-2")
 	g := NewGatewayWithRelays(t,
-		RelaySeed{Name: "down-1", Provider: "vercel", URL: deadRelayURL(t)},
-		RelaySeed{Name: "down-2", Provider: "vercel", URL: deadRelayURL(t)},
+		RelaySeed{Name: "down-1", Provider: "vercel", URL: one.URL},
+		RelaySeed{Name: "down-2", Provider: "vercel", URL: two.URL},
 	)
+	// Both verified and admitted, then both die: best-effort Pick still
+	// attempts each candidate and only exhausts into 502.
+	one.shutdown()
+	two.shutdown()
 
 	status, _, body := relayDo(t, g.Addr, "/vercel", `{}`, nil)
 	if status != http.StatusBadGateway {

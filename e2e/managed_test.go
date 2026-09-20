@@ -38,11 +38,12 @@ func relayPath(id int64) string {
 type workerSim struct {
 	srv *httptest.Server
 
-	mu       sync.Mutex
-	token    string
-	version  string
-	paused   bool
-	requests []simRequest
+	mu            sync.Mutex
+	token         string
+	version       string
+	paused        bool
+	forwardBroken bool
+	requests      []simRequest
 }
 
 type simRequest struct {
@@ -87,6 +88,7 @@ func newWorkerSim(t *testing.T, token, version string) *workerSim {
 			Path: relayPath, AuthToken: auth, Target: r.Header.Get("X-Relay-Target"), Body: string(raw),
 		})
 		paused := sim.paused
+		broken := sim.forwardBroken
 		sim.mu.Unlock()
 		if paused {
 			sim.writePausePage(w)
@@ -97,6 +99,15 @@ func newWorkerSim(t *testing.T, token, version string) *workerSim {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":"not found"}`))
+			return
+		}
+		// The end-to-end forward probe walks the same route as real traffic;
+		// breaking it simulates a worker whose origin answers nothing — the
+		// gate classifies that as probe_failed: not ready, never redeployed.
+		if relayPath == "/__relay/version" && broken {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"origin unreachable"}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -114,6 +125,14 @@ func (s *workerSim) setConfig(token, version string) {
 	s.token, s.version = token, version
 }
 
+// currentToken returns the token the sim is actually serving with — the
+// config a successful deploy landed, as opposed to the request history.
+func (s *workerSim) currentToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token
+}
+
 // setPaused flips the platform suspension: while paused, the sim answers
 // every path — version endpoint included — with the suspension page a
 // quota-exhausted Vercel deployment really serves, never the worker.
@@ -129,6 +148,12 @@ func (s *workerSim) writePausePage(w http.ResponseWriter) {
 	w.Header().Set("X-Vercel-Error", "DEPLOYMENT_DISABLED")
 	w.WriteHeader(http.StatusPaymentRequired)
 	_, _ = w.Write([]byte("Payment required\n\nDEPLOYMENT_DISABLED\n\n"))
+}
+
+func (s *workerSim) setForwardBroken(broken bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardBroken = broken
 }
 
 // tokens returns every X-Relay-Token value the sim has ever seen — exactly
@@ -182,6 +207,13 @@ type fakePlatform struct {
 	projects        []string
 	deletedProjects []string
 	verifyCalls     int
+	deployFail      bool
+}
+
+func (f *fakePlatform) setDeployFail(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deployFail = fail
 }
 
 func newFakePlatform(t *testing.T, sim *workerSim) *fakePlatform {
@@ -223,9 +255,19 @@ func newFakePlatform(t *testing.T, sim *workerSim) *fakePlatform {
 			return
 		}
 		f.mu.Lock()
+		fail := f.deployFail
 		f.projects = append(f.projects, body.Name)
 		f.tokens = append(f.tokens, token)
 		f.mu.Unlock()
+		if fail {
+			// A platform reject: no new worker config lands, the old
+			// deployment keeps answering. The deployer records the error
+			// and the relay stays on whatever is serving.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"deploy failed"}`))
+			return
+		}
 		// The platform runs the worker with the deploy-time environment;
 		// the sim starts answering before the deployer's live check.
 		f.sim.setConfig(token, version)

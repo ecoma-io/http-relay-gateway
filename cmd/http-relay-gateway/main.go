@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"http-relay-gateway/internal/gateway"
 	"http-relay-gateway/internal/logging"
 	"http-relay-gateway/internal/pool"
+	"http-relay-gateway/internal/readiness"
 	"http-relay-gateway/internal/reconcile"
 	"http-relay-gateway/internal/sanitize"
 	"http-relay-gateway/internal/store"
@@ -101,9 +103,10 @@ func healthcheckURL(addr string) string {
 // the fully resolved gateway state (pool, client, knobs) plus the values the
 // apply loop reads outside the hot path.
 type generation struct {
-	state    *gateway.State
-	logLevel string
-	relays   int
+	state      *gateway.State
+	logLevel   string
+	relays     int
+	configured int // database relay rows, ready or not — drives the startup warning
 }
 
 func run() error {
@@ -119,15 +122,27 @@ func run() error {
 
 	log := setupDynamicLogger(initialLogLevel(db))
 
+	// The readiness registry is the admissions gate for the data plane: a
+	// relay joins the serving pool only after the reconciler has verified it
+	// end to end. Seeded from the rows already in the database, then fed by
+	// the reconciler's verify pass.
+	reg := readiness.New(readiness.Config{
+		BackoffBase: envDuration("RELAY_VERIFY_BACKOFF_BASE", 5*time.Second),
+		BackoffMax:  envDuration("RELAY_VERIFY_BACKOFF_MAX", 5*time.Minute),
+		RecoverMax:  envDuration("RELAY_VERIFY_RECOVER_MAX", 15*time.Second),
+		DemoteAfter: envInt("RELAY_VERIFY_DEMOTE_AFTER", 3),
+	})
 	// An empty database is a legal first boot: the admin plane serves the
 	// setup flow while the data plane answers 503 until the first relay
 	// exists. Only an unreadable database is fatal.
-	gen, err := buildGeneration(db)
+	gen, err := buildGeneration(db, reg)
 	if err != nil {
 		return err
 	}
-	if gen.relays == 0 {
+	if gen.configured == 0 {
 		log.Warn().Msg("no relays configured; data plane returns 503 until a relay is created")
+	} else if gen.relays == 0 {
+		log.Warn().Msg("no relays ready; data plane returns 503 until a relay verifies end to end")
 	}
 	g := gateway.New(gen.state, version, deploy.RelayVersion, log)
 
@@ -141,9 +156,8 @@ func run() error {
 			return store.DefaultReconcileIntervalSeconds
 		}
 		return settings.ReconcileIntervalSeconds
-	})
+	}, reg)
 	defer rec.Stop()
-
 	spa, err := web.Handler()
 	if err != nil {
 		return fmt.Errorf("load management UI: %w", err)
@@ -152,7 +166,7 @@ func run() error {
 	if bootstrap.AdminCookieSecure {
 		adminOpts = append(adminOpts, admin.WithSecureCookie())
 	}
-	adminOpts = append(adminOpts, admin.WithFleet(rec, factory))
+	adminOpts = append(adminOpts, admin.WithFleet(rec, factory), admin.WithReadiness(reg))
 	adminHandler := admin.New(db, version, log, spa, adminOpts...)
 
 	ln, err := net.Listen("tcp", bootstrap.ListenAddr)
@@ -198,7 +212,7 @@ func run() error {
 	// converges on this one apply path: rebuild the generation from the
 	// database and swap it atomically.
 	apply := func(source string) {
-		next, err := buildGeneration(db)
+		next, err := buildGeneration(db, reg)
 		if err != nil {
 			log.Warn().Str("source", source).Str("error", sanitize.ErrorString(err)).
 				Msg("generation build failed; keeping previous configuration")
@@ -237,6 +251,8 @@ func run() error {
 			return nil
 		case <-db.Changes():
 			apply("database")
+		case <-reg.Changes():
+			apply("readiness")
 		}
 	}
 }
@@ -245,7 +261,7 @@ func run() error {
 // generation — the single place pool state is ever built from. Everything
 // the hot path would otherwise re-derive is resolved here: body limits,
 // inherited header policies, tokens, transport timeouts.
-func buildGeneration(db *store.Store) (generation, error) {
+func buildGeneration(db *store.Store, reg *readiness.Registry) (generation, error) {
 	settings, err := db.Settings()
 	if err != nil {
 		return generation{}, fmt.Errorf("read settings: %w", err)
@@ -258,6 +274,17 @@ func buildGeneration(db *store.Store) (generation, error) {
 	if err != nil {
 		return generation{}, fmt.Errorf("read relays: %w", err)
 	}
+
+	// Announce the current relay set to the registry: rows that appear here
+	// (fresh database, deleted relay re-added, first boot) enter the mirror
+	// as configured-but-unverified; a serving row that disappeared is
+	// dropped, which revokes its admission and does notify — that removal is
+	// a real transition. Rebuilds only happen on state transitions.
+	present := make([]readiness.Key, 0, len(rows))
+	for _, row := range rows {
+		present = append(present, readiness.Key{Provider: row.Provider, Name: row.Name})
+	}
+	reg.Sync(present)
 
 	providerLimits := make(map[string]int64, len(providers))
 	providerPolicies := make(map[string]*pool.HeaderPolicy, len(providers))
@@ -277,7 +304,8 @@ func buildGeneration(db *store.Store) (generation, error) {
 	}
 	maxBuffer := int64(0)
 	for _, row := range rows {
-		relay, ok, err := relayInput(row, providerLimits, providerPolicies)
+		ready := reg.IsReady(readiness.Key{Provider: row.Provider, Name: row.Name})
+		relay, ok, err := relayInput(row, providerLimits, providerPolicies, ready)
 		if err != nil {
 			return generation{}, err
 		}
@@ -293,6 +321,19 @@ func buildGeneration(db *store.Store) (generation, error) {
 	if err != nil {
 		return generation{}, err
 	}
+
+	// The lifecycle snapshot rides every generation so /stats renders the
+	// readiness state machine without reading the registry on the hot path.
+	snapshot := reg.Snapshot()
+	lifecycle := make([]gateway.LifecycleRow, 0, len(snapshot))
+	for _, record := range snapshot {
+		lifecycle = append(lifecycle, gateway.LifecycleRow{
+			Name:     record.Key.Name,
+			Provider: record.Key.Provider,
+			State:    string(record.State),
+			Reason:   record.Reason,
+		})
+	}
 	state := &gateway.State{
 		Pool: p,
 		Client: gateway.NewClient(gateway.NewTransport(
@@ -301,8 +342,9 @@ func buildGeneration(db *store.Store) (generation, error) {
 		MaxRetries:           settings.MaxRetries,
 		MaxBufferBytes:       maxBuffer,
 		StreamThresholdBytes: settings.StreamThresholdBytes,
+		Lifecycle:            lifecycle,
 	}
-	return generation{state: state, logLevel: settings.LogLevel, relays: len(in.Relays)}, nil
+	return generation{state: state, logLevel: settings.LogLevel, relays: len(in.Relays), configured: len(rows)}, nil
 }
 
 // relayInput maps a database relay row into a resolved pool input. Legacy
@@ -316,10 +358,19 @@ func buildGeneration(db *store.Store) (generation, error) {
 // the row contributes nothing: neither an unverified deployment URL nor the
 // tokenless relay-row placeholder may answer clients. The bool is false when
 // the row contributes no pool entry.
-func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPolicies map[string]*pool.HeaderPolicy) (pool.RelayInput, bool, error) {
+func relayInput(row store.RelayRow, providerLimits map[string]int64, providerPolicies map[string]*pool.HeaderPolicy, ready bool) (pool.RelayInput, bool, error) {
+	// The readiness gate is the admission authority: a relay serves only
+	// after the reconciler verified it end to end. Everything below assumes
+	// an admitted relay, so an unverified one contributes no pool entry —
+	// neither a stale deployment URL nor the tokenless relay-row placeholder
+	// may answer clients.
+	if !ready {
+		return pool.RelayInput{}, false, nil
+	}
 	switch row.Origin {
 	case store.OriginLegacy:
-		// active flag passes through verbatim.
+		// active flag passes through verbatim; the registry only marks a
+		// legacy relay ready after a forward probe proved it serves.
 	case store.OriginManaged:
 		if row.InactiveDeployment {
 			return pool.RelayInput{}, false, nil
@@ -404,4 +455,25 @@ func parseZerologLevel(level string) zerolog.Level {
 func setupDynamicLogger(level string) zerolog.Logger {
 	zerolog.SetGlobalLevel(parseZerologLevel(level))
 	return logging.New(os.Stdout)
+}
+
+// envDuration and envInt are test-only knobs for the readiness registry:
+// env vars that tune verification cadence without touching the database or
+// the API. Invalid values silently fall back to the default.
+func envDuration(name string, def time.Duration) time.Duration {
+	if v := os.Getenv(name); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return def
+}
+
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }

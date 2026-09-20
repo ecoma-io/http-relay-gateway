@@ -24,6 +24,7 @@ import (
 	"http-relay-gateway/internal/admin/auth"
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/pool"
+	"http-relay-gateway/internal/readiness"
 	"http-relay-gateway/internal/sanitize"
 	"http-relay-gateway/internal/store"
 
@@ -57,6 +58,9 @@ type Server struct {
 	// reconciler wired) means those endpoints answer 501.
 	fleet   Fleet
 	factory deploy.Factory
+	// reg is the readiness registry: nil (not wired) leaves relay views
+	// without the lifecycle phase.
+	reg *readiness.Registry
 	// secureCookie sets the Secure attribute on session cookies (opt-in for
 	// HTTPS-fronted deployments; loopback HTTP defaults off).
 	secureCookie bool
@@ -67,6 +71,11 @@ type Option func(*Server)
 
 // WithSecureCookie marks session cookies Secure (for HTTPS-fronted admin).
 func WithSecureCookie() Option { return func(s *Server) { s.secureCookie = true } }
+
+// WithReadiness wires the readiness registry into the management plane so
+// every relay view exposes its lifecycle phase. Without it the optional
+// readiness field is simply absent.
+func WithReadiness(reg *readiness.Registry) Option { return func(s *Server) { s.reg = reg } }
 
 // New builds the admin server. spa serves the management UI for every
 // non-API path (history-mode routing).
@@ -366,6 +375,13 @@ type deploymentJSON struct {
 	DeployedAt int64  `json:"deployedAt"`
 }
 
+type readinessJSON struct {
+	State       string `json:"state"`
+	Reason      string `json:"reason,omitempty"`
+	Since       int64  `json:"since"`
+	LastAttempt int64  `json:"lastAttempt,omitempty"`
+}
+
 type relayJSON struct {
 	ID           int64           `json:"id"`
 	Name         string          `json:"name"`
@@ -376,6 +392,7 @@ type relayJSON struct {
 	AccountID    *int64          `json:"accountId"`
 	HeaderPolicy *string         `json:"headerPolicy"`
 	Deployment   *deploymentJSON `json:"deployment,omitempty"`
+	Readiness    *readinessJSON  `json:"readiness,omitempty"`
 	CreatedAt    int64           `json:"createdAt"`
 	UpdatedAt    int64           `json:"updatedAt"`
 }
@@ -391,7 +408,18 @@ func (s *Server) relayView(row store.RelayRow) relayJSON {
 			d = &dep
 		}
 	}
-	return renderRelay(row, d)
+	view := renderRelay(row, d)
+	if s.reg != nil {
+		if rec, ok := s.reg.StateOf(readiness.Key{Provider: row.Provider, Name: row.Name}); ok {
+			view.Readiness = &readinessJSON{
+				State:       string(rec.State),
+				Reason:      rec.Reason,
+				Since:       rec.Since.Unix(),
+				LastAttempt: rec.LastAttempt.Unix(),
+			}
+		}
+	}
+	return view
 }
 
 func renderRelay(row store.RelayRow, d *store.DeploymentRow) relayJSON {

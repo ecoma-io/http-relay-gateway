@@ -200,3 +200,77 @@ func Probe(ctx context.Context, client *http.Client, base string) (ProbeAnswer, 
 	answer.Version = parsed.Version
 	return answer, nil
 }
+
+// forwardProbeTimeout bounds one end-to-end forwarding probe. The probe
+// costs the relay two fetch legs — ingress, then the forwarding fetch back
+// into its own version path — so it gets twice the version probe's budget.
+const forwardProbeTimeout = 10 * time.Second
+
+// forwardProbePath is the relay-spec path every forwarding probe targets:
+// the worker's unauthenticated version route, which exists since the first
+// worker generation and answers a deterministic JSON body.
+const forwardProbePath = "/__relay/version"
+
+// ForwardAnswer is what answered a forwarding probe.
+type ForwardAnswer struct {
+	Status int
+	// JSON reports a 200 whose body parsed as a JSON object — the shape the
+	// worker's version route answers after a completed forwarding round
+	// trip, and the shape the e2e worker sims answer for the same request.
+	JSON bool
+}
+
+// ForwardProbe drives one real relay-spec request through the relay itself:
+// the relay's own origin rides in X-Relay-Target, the version path in
+// X-Relay-Path, and the deployment's token (when non-empty) in
+// X-Relay-Token. The worker's normal ingress runs — token check included —
+// and then performs a genuine forwarding fetch back into its own version
+// route, so a passing probe is evidence that ingress, authentication and
+// the forwarding fetch all work, not merely that the URL answers. The
+// inner request hits the version route ahead of the token check, which the
+// worker answers unauthenticated — exactly what makes the loop close
+// without a second protocol.
+//
+// A transport failure is an error; every HTTP answer comes back for the
+// caller to classify: 404 is the worker's wrong-token answer (an
+// unauthenticated request must be indistinguishable from an empty worker),
+// 502 its upstream-fetch-failed answer, and a 200 with a JSON object body a
+// completed round trip. token may be empty for relays that predate managed
+// tokens (legacy rows): such a probe proves only that the relay executes a
+// forwarding fetch, and any answer below 500 counts.
+func ForwardProbe(ctx context.Context, client *http.Client, base, token string) (ForwardAnswer, error) {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ForwardAnswer{}, fmt.Errorf("forward probe URL: %w", err)
+	}
+	// The target is the relay's own origin — the path travels separately in
+	// X-Relay-Path and must never widen the target beyond its origin.
+	target := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	cctx, cancel := context.WithTimeout(ctx, forwardProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, base, nil)
+	if err != nil {
+		return ForwardAnswer{}, fmt.Errorf("forward probe request: %w", err)
+	}
+	req.Header.Set("X-Relay-Target", target)
+	req.Header.Set("X-Relay-Path", forwardProbePath)
+	if token != "" {
+		req.Header.Set("X-Relay-Token", token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ForwardAnswer{}, fmt.Errorf("forward probe: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	answer := ForwardAnswer{Status: resp.StatusCode}
+	if resp.StatusCode != http.StatusOK {
+		return answer, nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ForwardAnswer{}, fmt.Errorf("forward probe: read answer: %w", err)
+	}
+	var parsed map[string]any
+	answer.JSON = json.Unmarshal(raw, &parsed) == nil
+	return answer, nil
+}

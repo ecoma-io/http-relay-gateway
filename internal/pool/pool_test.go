@@ -207,3 +207,26 @@ func TestStatsRowsExposeOriginAndManaged(t *testing.T) {
 		}
 	}
 }
+
+func TestReadyCount(t *testing.T) {
+	p := testPool(t, func(in *Input) {
+		in.Relays[0].Active = false
+	})
+	if got := p.ReadyCount(); got != 2 {
+		t.Fatalf("ReadyCount = %d, want 2 (one inactive relay)", got)
+	}
+
+	all := testPool(t, nil)
+	if got := all.ReadyCount(); got != 3 {
+		t.Fatalf("ReadyCount = %d, want 3 with every relay active", got)
+	}
+
+	none := testPool(t, func(in *Input) {
+		for i := range in.Relays {
+			in.Relays[i].Active = false
+		}
+	})
+	if got := none.ReadyCount(); got != 0 {
+		t.Fatalf("ReadyCount = %d, want 0 with no active relays", got)
+	}
+}

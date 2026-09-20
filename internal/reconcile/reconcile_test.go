@@ -14,29 +14,45 @@ import (
 
 	"http-relay-gateway/internal/deploy"
 	"http-relay-gateway/internal/logging"
+	"http-relay-gateway/internal/readiness"
 	"http-relay-gateway/internal/store"
 )
 
 // versionServer is a stand-in live relay: it answers the version endpoint
 // with whatever the test last set, can be switched off (a transport failure,
 // as far as the prober is concerned), can answer like a platform-paused
-// deployment instead of a worker, and counts who came asking.
+// deployment instead of a worker, and counts who came asking. It also stands
+// in for the worker's relay-spec ingress: a request carrying X-Relay-Target
+// is the outer leg of an end-to-end forward probe, which the real worker
+// answers by checking the token and then fetching back into its own version
+// route — this fake produces the same observable answers (404 wrong token,
+// 502 broken fetch, version JSON round trip).
 type versionServer struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	ver    string
-	dn     bool
-	paused bool
-	hits   int
+	srv         *httptest.Server
+	mu          sync.Mutex
+	ver         string
+	dn          bool
+	paused      bool
+	token       string // non-empty: relay-spec forward probes must carry it
+	fwdBroken   bool   // worker answers but its own fetch fails: 502
+	hits        int
+	forwardHits int
+	versionHits int
 }
 
 func newVersionServer(version string) *versionServer {
 	vs := &versionServer{ver: version}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/__relay/version", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		vs.mu.Lock()
 		vs.hits++
-		down, paused := vs.dn, vs.paused
+		down, paused, ver, wantToken, broken := vs.dn, vs.paused, vs.ver, vs.token, vs.fwdBroken
+		outer := r.Header.Get("X-Relay-Target") != ""
+		if outer {
+			vs.forwardHits++
+		} else if r.URL.Path == "/__relay/version" {
+			vs.versionHits++
+		}
 		vs.mu.Unlock()
 		if down {
 			panic(http.ErrAbortHandler) // the connection dies before any byte
@@ -49,8 +65,30 @@ func newVersionServer(version string) *versionServer {
 			_, _ = w.Write([]byte("Payment required\n\nDEPLOYMENT_DISABLED\n\n"))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"version":%q}`, vs.ver)
+		if outer {
+			// Outer leg of a relay-spec forward: token check, then the
+			// forwarding fetch back into the worker's own version route.
+			if wantToken != "" && r.Header.Get("X-Relay-Token") != wantToken {
+				w.WriteHeader(http.StatusNotFound) // the worker's key rejection
+				return
+			}
+			if broken {
+				w.WriteHeader(http.StatusBadGateway) // the worker's fetch failed
+				_, _ = w.Write([]byte("Fetch to the relay target failed"))
+				return
+			}
+			// The forwarded inner request lands on the version route, which
+			// answers unauthenticated — a completed round trip.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"version":%q}`, ver)
+			return
+		}
+		if r.URL.Path == "/__relay/version" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"version":%q}`, ver)
+			return
+		}
+		http.NotFound(w, r)
 	})
 	vs.srv = httptest.NewServer(mux)
 	return vs
@@ -74,6 +112,18 @@ func (v *versionServer) setPaused(paused bool) {
 	v.paused = paused
 }
 
+func (v *versionServer) setToken(token string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.token = token
+}
+
+func (v *versionServer) setForwardBroken(broken bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.fwdBroken = broken
+}
+
 func (v *versionServer) hitCount() int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -81,7 +131,9 @@ func (v *versionServer) hitCount() int {
 }
 
 // fakeClient is the deploy.Client the tests hand the worker; it counts
-// deploys and returns a canned result or failure.
+// deploys and returns a canned result or failure. A non-nil deployGate
+// blocks every deploy until closed — the single-flight tests hold a deploy
+// open to prove a second request refuses to start.
 type fakeClient struct {
 	mu         sync.Mutex
 	platform   string
@@ -89,6 +141,7 @@ type fakeClient struct {
 	lastSpec   deploy.Spec
 	failDeploy error
 	url        string
+	deployGate chan struct{}
 }
 
 func (f *fakeClient) Platform() string { return f.platform }
@@ -97,13 +150,17 @@ func (f *fakeClient) Verify(_ context.Context) (string, error) { return "acc-ref
 
 func (f *fakeClient) Deploy(_ context.Context, spec deploy.Spec) (deploy.Result, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.deploys++
 	f.lastSpec = spec
-	if f.failDeploy != nil {
-		return deploy.Result{}, f.failDeploy
+	fail, url, gate := f.failDeploy, f.url, f.deployGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
 	}
-	return deploy.Result{Project: spec.Project, ExternalID: fmt.Sprintf("ext-%d", f.deploys), URL: f.url}, nil
+	if fail != nil {
+		return deploy.Result{}, fail
+	}
+	return deploy.Result{Project: spec.Project, ExternalID: fmt.Sprintf("ext-%d", f.deploys), URL: url}, nil
 }
 
 func (f *fakeClient) Delete(_ context.Context, _ string) error { return nil }
@@ -119,7 +176,8 @@ type fakeFactory struct{ client deploy.Client }
 func (f fakeFactory) For(_, _, _ string) (deploy.Client, error) { return f.client, nil }
 
 // seedManaged plants one managed relay with one active deployment answering
-// oldVersion from its own server.
+// oldVersion from its own server. The server expects the deployment's token,
+// so the end-to-end forward probe passes for relays that verify current.
 func seedManaged(t *testing.T, db *store.Store, oldVersion string) (int64, int64, *versionServer) {
 	t.Helper()
 	accountID, err := db.CreateAccount("main", "vercel", "platform-token", "acc-ref", 1)
@@ -131,6 +189,7 @@ func seedManaged(t *testing.T, db *store.Store, oldVersion string) (int64, int64
 		t.Fatalf("CreateRelay: %v", err)
 	}
 	old := newVersionServer(oldVersion)
+	old.setToken("old-relay-token")
 	t.Cleanup(old.srv.Close)
 	if err := db.UpsertDeployment(store.DeploymentRow{
 		RelayID: relayID, AccountID: accountID, Platform: "vercel", Project: "web-relay",
@@ -149,6 +208,13 @@ func seedManaged(t *testing.T, db *store.Store, oldVersion string) (int64, int64
 // mechanics themselves — wake, drain, orderly stop — are covered in
 // TestLoopRunsQueuedJobs and by the e2e fleet endpoints.
 func newIdleWorker(t *testing.T, client deploy.Client) *Worker {
+	return newIdleWorkerReg(t, client, readiness.New(readiness.Config{}))
+}
+
+// newIdleWorkerReg is newIdleWorker with a tuned readiness registry — tests
+// that need immediate re-verification or a shorter demote threshold drive
+// backoff and demotion deterministically instead of waiting out the defaults.
+func newIdleWorkerReg(t *testing.T, client deploy.Client, reg *readiness.Registry) *Worker {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -162,6 +228,7 @@ func newIdleWorker(t *testing.T, client deploy.Client) *Worker {
 		log:       logging.Nop(),
 		queue:     newQueue(),
 		interval:  func() int64 { return 0 },
+		reg:       reg,
 		platformLocks: map[string]*sync.Mutex{
 			deploy.PlatformVercel:     {},
 			deploy.PlatformCloudflare: {},
@@ -182,7 +249,7 @@ func newLoopWorker(t *testing.T, client deploy.Client) *Worker {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	w := Start(db, fakeFactory{client: client}, logging.Nop(), func() int64 { return 0 })
+	w := Start(db, fakeFactory{client: client}, logging.Nop(), func() int64 { return 0 }, readiness.New(readiness.Config{}))
 	t.Cleanup(w.Stop)
 	return w
 }
@@ -196,7 +263,7 @@ func newRevivingLoopWorker(t *testing.T, client deploy.Client, reviveEvery time.
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	w := startWorker(db, fakeFactory{client: client}, logging.Nop(), func() int64 { return 0 }, reviveEvery)
+	w := startWorker(db, fakeFactory{client: client}, logging.Nop(), func() int64 { return 0 }, readiness.New(readiness.Config{}), reviveEvery, 0)
 	t.Cleanup(w.Stop)
 	return w
 }
@@ -209,13 +276,13 @@ func TestStartupRedeploysDrift(t *testing.T) {
 	relayID, accountID, old := seedManaged(t, w.db, "0")
 	old.set("0")
 
-	stale := w.probeFleet(true)
+	stale := w.verifyFleet(true)
 	if len(stale) != 1 || stale[0] != relayID {
-		t.Fatalf("probeFleet stale = %v", stale)
+		t.Fatalf("verifyFleet stale = %v", stale)
 	}
 	dep, err := w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployStale || dep.AuthToken != "old-relay-token" {
-		t.Fatalf("after probe: %+v, %v", dep, err)
+		t.Fatalf("after verify: %+v, %v", dep, err)
 	}
 
 	w.redeployRelay(relayID)
@@ -240,8 +307,12 @@ func TestStartupRedeploysDrift(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].Deployment == nil || rows[0].Deployment.URL != live.srv.URL {
 		t.Fatalf("Relays = %+v, %v", rows, err)
 	}
-	// And a follow-up probe agrees: active, no error.
-	w.probeFleet(false)
+	// After the redeploy the registry admits the relay, and a follow-up
+	// verify agrees: active, no error.
+	if !w.reg.IsReady(readiness.Key{Provider: "vercel", Name: "web-relay"}) {
+		t.Fatal("redeployed relay not admitted to the pool")
+	}
+	w.verifyFleet(false)
 	dep, _ = w.db.Deployment(relayID)
 	if dep.Status != store.DeployActive || dep.LastError != "" {
 		t.Fatalf("post-check: %+v", dep)
@@ -254,13 +325,13 @@ func TestStartupNeverRedeploysUnreachable(t *testing.T) {
 	relayID, _, old := seedManaged(t, w.db, deploy.RelayVersion)
 	old.srv.Close() // the relay stopped answering
 
-	stale := w.probeFleet(true)
+	stale := w.verifyFleet(true)
 	if len(stale) != 0 {
 		t.Fatalf("unreachable relay queued for redeploy: %v", stale)
 	}
 	dep, err := w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployUnreachable || dep.LastError == "" {
-		t.Fatalf("after probe: %+v, %v", dep, err)
+		t.Fatalf("after verify: %+v, %v", dep, err)
 	}
 	if client.deployCount() != 0 {
 		t.Fatal("unreachable relay was redeployed")
@@ -272,7 +343,7 @@ func TestCheckIsPassive(t *testing.T) {
 	w := newIdleWorker(t, client)
 	relayID, _, _ := seedManaged(t, w.db, "0")
 
-	stale := w.probeFleet(false)
+	stale := w.verifyFleet(false)
 	if len(stale) != 0 {
 		t.Fatalf("passive check returned redeploys: %v", stale)
 	}
@@ -383,6 +454,10 @@ func TestAdoptHappyAndMismatch(t *testing.T) {
 	if client.lastSpec.Project != "imported" {
 		t.Fatalf("project = %q", client.lastSpec.Project)
 	}
+	// A successful adoption admits the relay to the pool.
+	if !w.reg.IsReady(readiness.Key{Provider: "vercel", Name: "imported"}) {
+		t.Fatal("adopted relay not admitted")
+	}
 }
 
 // TestAdoptFailureLeavesRelayAdoptable pins the adoption failure contract:
@@ -432,10 +507,12 @@ func TestAdoptFailureLeavesRelayAdoptable(t *testing.T) {
 	}
 }
 
-// TestProbeNeverTouchesLegacyRelays pins the probe boundary: legacy relays
-// own their URLs, so no fleet pass may ever contact them — only managed
-// deployments with accounts get probed.
-func TestProbeNeverTouchesLegacyRelays(t *testing.T) {
+// TestLegacyProbedForwardOnly pins the readiness boundary for legacy relays:
+// they own their URLs, so a fleet pass may never version-probe or redeploy
+// them — but their readiness IS proven, by a relay-spec request forwarded
+// back through their own URL and answered below 500. Managed deployments get
+// the version probe and the forward leg.
+func TestLegacyProbedForwardOnly(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
 	w := newIdleWorker(t, client)
 	quiet := newVersionServer(deploy.RelayVersion)
@@ -449,57 +526,277 @@ func TestProbeNeverTouchesLegacyRelays(t *testing.T) {
 	}
 	managedID, _, managed := seedManaged(t, w.db, deploy.RelayVersion)
 
-	if stale := w.probeFleet(true); len(stale) != 0 {
+	if stale := w.verifyFleet(true); len(stale) != 0 {
 		t.Fatalf("healthy fleet queued redeploys: %v", stale)
 	}
-	if got := quiet.hitCount(); got != 0 {
-		t.Fatalf("legacy relay was probed %d times", got)
+	if got := quiet.forwardHits; got != 1 {
+		t.Fatalf("legacy forward probes = %d, want exactly one", got)
 	}
-	if got := managed.hitCount(); got != 1 {
-		t.Fatalf("managed relay probed %d times, want exactly once", got)
+	if got := quiet.versionHits; got != 0 {
+		t.Fatalf("legacy was version-probed %d times; only forward probes apply", got)
+	}
+	if client.deployCount() != 0 {
+		t.Fatal("legacy relay was redeployed")
+	}
+	// The forward round trip admits the legacy relay to the pool.
+	if !w.reg.IsReady(readiness.Key{Provider: "vercel", Name: "imported"}) {
+		t.Fatal("legacy relay with a passing forward probe not admitted")
+	}
+	if got := managed.hitCount(); got != 2 {
+		t.Fatalf("managed relay hit %d times, want version probe + forward probe", got)
 	}
 	row, err := w.db.Relay(managedID)
 	if err != nil || row.Deployment == nil || row.Deployment.Status != store.DeployActive {
-		t.Fatalf("managed relay after probe = %+v, %v", row, err)
+		t.Fatalf("managed relay after verify = %+v, %v", row, err)
 	}
 }
 
-// TestUnreachableRecoversOnNextProbe pins the unreachable lifecycle: a probe
-// transport failure marks unreachable (and never redeploys); the next pass
-// that gets an answer returns the deployment to active with a clean error.
-func TestUnreachableRecoversOnNextProbe(t *testing.T) {
+// TestManagedNotAdmittedBeforeVerification pins the gate: a configured
+// managed relay serves nothing until a fleet pass proves it end to end.
+func TestManagedNotAdmittedBeforeVerification(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
 	w := newIdleWorker(t, client)
+	seedManaged(t, w.db, deploy.RelayVersion)
+	key := readiness.Key{Provider: "vercel", Name: "web-relay"}
+
+	if w.reg.IsReady(key) || w.reg.ReadyCount() != 0 {
+		t.Fatal("unverified relay must not hold admission")
+	}
+
+	// First healthy pass admits it; a re-verify agrees without churn.
+	w.verifyFleet(false)
+	if !w.reg.IsReady(key) || w.reg.ReadyCount() != 1 {
+		t.Fatalf("healthy relay not admitted: ready=%v count=%d", w.reg.IsReady(key), w.reg.ReadyCount())
+	}
+	w.verifyFleet(false)
+	if !w.reg.IsReady(key) {
+		t.Fatal("re-verified relay lost admission")
+	}
+}
+
+// TestLegacyGateClosedUntilProbePasses pins the same gate for legacy rows: a
+// relay whose forward probe does not round-trip stays out; one that answers
+// is admitted — recovery on the next scan, no operator action.
+func TestLegacyGateClosedUntilProbePasses(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorkerReg(t, client, readiness.New(readiness.Config{BackoffBase: time.Millisecond}))
+	legacy := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(legacy.srv.Close)
+	if _, err := w.db.SyncLegacy(
+		store.RuntimeValues{LogLevel: "info", MaxRetries: 2, FailureThreshold: 3, CooldownMs: 30000},
+		nil,
+		[]store.LegacyRelay{{Name: "imported", Provider: "vercel", URL: legacy.srv.URL, Active: true}},
+	); err != nil {
+		t.Fatalf("SyncLegacy: %v", err)
+	}
+	key := readiness.Key{Provider: "vercel", Name: "imported"}
+
+	legacy.srv.Close() // the relay dropped off
+	w.verifyFleet(false)
+	if w.reg.IsReady(key) {
+		t.Fatal("unreachable legacy relay admitted")
+	}
+	rec, ok := w.reg.StateOf(key)
+	if !ok || rec.State != readiness.StateFailed {
+		t.Fatalf("unreachable legacy record = %+v, %v; want failed", rec, ok)
+	}
+
+	// A fresh server stands where the relay was; the next scan admits it.
+	up := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(up.srv.Close)
+	if err := updateRelayURL(w.db, "imported", up.srv.URL); err != nil {
+		t.Fatalf("update relay URL: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	w.verifyFleet(false)
+	if !w.reg.IsReady(key) {
+		t.Fatal("legacy relay with a passing forward probe not admitted")
+	}
+}
+
+func TestUnreachableRecoversOnNextVerify(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorkerReg(t, client, readiness.New(readiness.Config{BackoffBase: time.Millisecond}))
 	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
 
 	live.setDown(true)
-	if stale := w.probeFleet(false); len(stale) != 0 {
+	if stale := w.verifyFleet(false); len(stale) != 0 {
 		t.Fatalf("unreachable relay queued for redeploy: %v", stale)
 	}
 	dep, err := w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployUnreachable || dep.LastError == "" {
-		t.Fatalf("down probe = %+v, %v", dep, err)
+		t.Fatalf("down verify = %+v, %v", dep, err)
 	}
 
+	time.Sleep(2 * time.Millisecond) // let the failure backoff elapse
 	live.setDown(false)
-	w.probeFleet(false)
+	w.verifyFleet(false)
 	dep, err = w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployActive || dep.LastError != "" {
-		t.Fatalf("recovered probe = %+v, %v; want active with the error cleared", dep, err)
+		t.Fatalf("recovered verify = %+v, %v; want active with the error cleared", dep, err)
 	}
 }
 
-// TestPausedProbeClassifiesAndWaits pins the pause verdict: an HTTP answer
-// that is not the worker marks the deployment paused with the platform's
-// marker recorded, queues no redeploy — a deploy cannot lift a suspension —
-// and later fleet passes leave the paused relay alone for the revival scan.
+// TestBackoffGatesRepeatedFailingVerifies pins the bounded retry: a relay
+// that just failed is not re-probed until its backoff elapses, so a broken
+// relay is never hot-looped by the always-on verify tick.
+func TestBackoffGatesRepeatedFailingVerifies(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorkerReg(t, client, readiness.New(readiness.Config{BackoffBase: time.Hour}))
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+	live.setDown(true)
+
+	w.verifyFleet(false)
+	hits := live.hitCount()
+	if hits != 1 {
+		t.Fatalf("first failing verify = %d hits, want 1", hits)
+	}
+	w.verifyFleet(true) // an hour of backoff: the gate must skip the relay
+	if got := live.hitCount(); got != hits {
+		t.Fatalf("gated relay probed again: %d hits", got)
+	}
+	if dep, _ := w.db.Deployment(relayID); client.deployCount() != 0 {
+		t.Fatalf("gated relay redeployed: %+v", dep)
+	}
+}
+
+// TestDemotedAfterConsecutiveFailures pins the demote threshold: a verified
+// relay rides out transient blips (passive health is the fast layer), and
+// only a run of consecutive failed verifications pulls it out of the pool.
+func TestDemotedAfterConsecutiveFailures(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorkerReg(t, client, readiness.New(readiness.Config{BackoffBase: time.Millisecond, DemoteAfter: 2}))
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+	key := readiness.Key{Provider: "vercel", Name: "web-relay"}
+
+	w.verifyFleet(false) // baseline: admitted
+	if !w.reg.IsReady(key) {
+		t.Fatal("precondition: healthy relay not admitted")
+	}
+
+	live.setDown(true)
+	w.verifyFleet(false) // first blip: below the threshold, still serving
+	if !w.reg.IsReady(key) {
+		t.Fatal("one transient failure demoted the relay")
+	}
+	time.Sleep(2 * time.Millisecond)
+	w.verifyFleet(false) // second consecutive failure: at the threshold, out
+	if w.reg.IsReady(key) || w.reg.ReadyCount() != 0 {
+		t.Fatalf("relay not demoted after %d failures: ready=%v count=%d", 2, w.reg.IsReady(key), w.reg.ReadyCount())
+	}
+	rec, _ := w.reg.StateOf(key)
+	if rec.State != readiness.StateUnready || rec.FailStreak != 2 {
+		t.Fatalf("demoted record = %+v; want unready with streak 2", rec)
+	}
+	if dep, _ := w.db.Deployment(relayID); dep.Status != store.DeployUnreachable {
+		t.Fatalf("demoted deployment status = %q", dep.Status)
+	}
+}
+
+// TestAuthRejectedQueuesRedeployAndHeals pins the auth-failed lifecycle: a
+// worker that rejects its relay key stays current (the URL answers) but
+// loses the end-to-end check and queues a redeploy; the redeploy's fresh
+// token heals it and returns it to the pool.
+func TestAuthRejectedQueuesRedeployAndHeals(t *testing.T) {
+	current := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(current.srv.Close)
+	client := &fakeClient{platform: "vercel", url: current.srv.URL}
+	w := newIdleWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+	key := readiness.Key{Provider: "vercel", Name: "web-relay"}
+
+	w.verifyFleet(false) // baseline: the deployment's own server accepts it
+	if !w.reg.IsReady(key) {
+		t.Fatal("precondition: healthy relay not admitted")
+	}
+
+	live.setToken("tampered") // the worker now rejects the stored key
+	stale := w.verifyFleet(true)
+	if len(stale) != 1 || stale[0] != relayID {
+		t.Fatalf("auth failure queued %v, want the relay", stale)
+	}
+	dep, err := w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployActive || !strings.Contains(dep.LastError, "key") {
+		t.Fatalf("auth-failed deployment = %+v, %v; want active with a key error", dep, err)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	w.run([]job{{kind: jobRedeploy, relayID: relayID}})
+	dep, err = w.db.Deployment(relayID)
+	if err != nil {
+		t.Fatalf("Deployment: %v", err)
+	}
+	if dep.Status != store.DeployActive || dep.URL != current.srv.URL || dep.AuthToken == "old-relay-token" {
+		t.Fatalf("healed deployment = %+v", dep)
+	}
+	if !w.reg.IsReady(key) {
+		t.Fatal("healed relay not admitted")
+	}
+}
+
+// TestSingleFlightRedeploy pins the single-flight hold: while one redeploy
+// of a relay is in flight, a second request refuses to start — a concurrent
+// reconcile and operator action can never launch duplicate deploys.
+func TestSingleFlightRedeploy(t *testing.T) {
+	live := newVersionServer(deploy.RelayVersion)
+	t.Cleanup(live.srv.Close)
+	client := &fakeClient{platform: "vercel", url: live.srv.URL}
+	w := newIdleWorker(t, client)
+	relayID, _, _ := seedManaged(t, w.db, deploy.RelayVersion)
+
+	gate := make(chan struct{})
+	client.deployGate = gate
+	first := make(chan struct{})
+	go func() {
+		w.redeployRelay(relayID)
+		close(first)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for client.deployCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("first redeploy never reached the platform")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	w.redeployRelay(relayID) // in flight: must refuse without deploying
+	close(gate)
+	<-first
+	if got := client.deployCount(); got != 1 {
+		t.Fatalf("single-flight violated: %d deploys for one relay", got)
+	}
+}
+
+// TestProbeFailedKeepsWorkerButPullsAdmission pins the probe-failed verdict:
+// the worker answers and accepts the key, but the forwarding round trip
+// fails on its side — the deployment stays current (no redeploy) while the
+// relay's admission is withdrawn after the demote run.
+func TestProbeFailedKeepsWorkerButPullsAdmission(t *testing.T) {
+	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
+	w := newIdleWorker(t, client)
+	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
+
+	w.verifyFleet(false) // baseline: admitted
+	live.setForwardBroken(true)
+	stale := w.verifyFleet(true)
+	if len(stale) != 0 {
+		t.Fatalf("probe-failed relay queued for redeploy: %v; the worker is current", stale)
+	}
+	dep, err := w.db.Deployment(relayID)
+	if err != nil || dep.Status != store.DeployActive || !strings.Contains(dep.LastError, "502") {
+		t.Fatalf("probe-failed deployment = %+v, %v; want active with the round-trip error", dep, err)
+	}
+	if client.deployCount() != 0 {
+		t.Fatal("probe-failed relay was redeployed")
+	}
+}
+
 func TestPausedProbeClassifiesAndWaits(t *testing.T) {
 	client := &fakeClient{platform: "vercel", url: "https://unused.example"}
 	w := newIdleWorker(t, client)
 	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
 
 	live.setPaused(true)
-	if stale := w.probeFleet(true); len(stale) != 0 {
+	if stale := w.verifyFleet(true); len(stale) != 0 {
 		t.Fatalf("paused relay queued for redeploy: %v", stale)
 	}
 	if got := live.hitCount(); got != 1 {
@@ -507,7 +804,7 @@ func TestPausedProbeClassifiesAndWaits(t *testing.T) {
 	}
 	dep, err := w.db.Deployment(relayID)
 	if err != nil || dep.Status != store.DeployPaused {
-		t.Fatalf("paused probe = %+v, %v", dep, err)
+		t.Fatalf("paused verify = %+v, %v", dep, err)
 	}
 	if dep.LastError == "" || !strings.Contains(dep.LastError, "DEPLOYMENT_DISABLED") {
 		t.Fatalf("pause reason not recorded: %q", dep.LastError)
@@ -515,7 +812,7 @@ func TestPausedProbeClassifiesAndWaits(t *testing.T) {
 
 	// The revival scan owns paused relays: a fleet pass must not re-probe
 	// (and risk flipping the pause to unreachable on a transport blip).
-	w.probeFleet(true)
+	w.verifyFleet(true)
 	if got := live.hitCount(); got != 1 {
 		t.Fatalf("fleet pass re-probed a paused relay: %d hits", got)
 	}
@@ -535,7 +832,7 @@ func TestReviveScanWaitsWhilePaused(t *testing.T) {
 	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
 
 	live.setPaused(true)
-	w.probeFleet(false)
+	w.verifyFleet(false)
 	dep, _ := w.db.Deployment(relayID)
 	if dep.Status != store.DeployPaused {
 		t.Fatalf("setup: status = %q, want paused", dep.Status)
@@ -565,7 +862,7 @@ func TestReviveScanRevivesPaused(t *testing.T) {
 	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
 
 	live.setPaused(true)
-	w.probeFleet(false)
+	w.verifyFleet(false)
 	live.setPaused(false)
 
 	if redeploys := w.revivePaused(); len(redeploys) != 0 {
@@ -599,7 +896,7 @@ func TestReviveScanRedeploysStaleAfterRevival(t *testing.T) {
 	relayID, _, live := seedManaged(t, w.db, deploy.RelayVersion)
 
 	live.setPaused(true)
-	w.probeFleet(false)
+	w.verifyFleet(false)
 	live.setPaused(false)
 	live.set("0") // revived, but the platform brought back an old deployment
 
@@ -744,4 +1041,19 @@ func TestRunWidthBoundsConcurrency(t *testing.T) {
 	if maxInFlight > 3 {
 		t.Fatalf("max in flight = %d", maxInFlight)
 	}
+}
+
+// updateRelayURL rewrites a relay's own URL — the test equivalent of an
+// operator editing the row.
+func updateRelayURL(db *store.Store, name, url string) error {
+	rows, err := db.Relays()
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.Name == name {
+			return db.UpdateRelay(row.ID, store.RelayPatch{URL: &url})
+		}
+	}
+	return fmt.Errorf("relay %q not found", name)
 }
