@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,15 @@ const HeaderProvider = "X-Relay-Provider"
 // token may ever authenticate, and only when the relay leg is built (the
 // engine sends it once managed relays exist).
 const HeaderToken = "X-Relay-Token"
+
+// HeaderTarget and HeaderPath carry the relay spec's origin and real path.
+// In spec mode they arrive from the client and ride to the worker verbatim;
+// in proxy mode the gateway derives both from the absolute-form request
+// target, so client-supplied values are overwritten, never trusted.
+const (
+	HeaderTarget = "X-Relay-Target"
+	HeaderPath   = "X-Relay-Path"
+)
 
 func unpinned(v string) bool { return v == "" || v == "none" || v == "auto" || v == "all" }
 
@@ -115,8 +125,16 @@ func (g *Gateway) Swap(st *State) {
 	}
 }
 
-// ServeHTTP routes the control endpoints; everything else is the relay path.
+// ServeHTTP dispatches by request shape: proxy-form inbound (absolute-form
+// target or CONNECT) goes to the proxy adapter; the control endpoints
+// answer origin-form only — an absolute-form /healthz targets some other
+// host and must relay, not answer this process; everything else is the
+// relay-spec path.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect || r.URL.Host != "" {
+		g.handleProxy(w, r, g.log)
+		return
+	}
 	switch r.URL.Path {
 	case "/healthz":
 		w.WriteHeader(http.StatusOK)
@@ -126,6 +144,41 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		g.handleRelay(w, r, g.log)
 	}
+}
+
+// handleProxy adapts forward-proxy inbound onto the relay pipeline. An
+// absolute-form request target (GET http://api.example.com/v1 HTTP/1.1 —
+// what every HTTP client sends through HTTP_PROXY) already carries the
+// origin and path the relay spec otherwise reads from HeaderTarget /
+// HeaderPath, so the adapter derives both from the URL — overwriting
+// whatever the client supplied — and hands the request to the same buffered
+// failover / streaming path. The pin is header-only here: the target's path
+// belongs to the target, never to the gateway. CONNECT would need a raw TCP
+// tunnel the edge relays cannot carry (and its MITM variant is TLS
+// termination), so it is a documented 501.
+func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request, log zerolog.Logger) {
+	if r.Method == http.MethodConnect {
+		log.Info().Str("method", r.Method).Msg("CONNECT rejected: tunneling unsupported")
+		jsonError(w, http.StatusNotImplemented,
+			"CONNECT tunneling is not supported; send absolute-form http(s) requests")
+		return
+	}
+	provider, ok, _ := headerProvider(r, g.st.Load().Pool)
+	if !ok {
+		jsonError(w, http.StatusNotFound,
+			"unknown provider: "+HeaderProvider+" header (no header = round-robin all)")
+		return
+	}
+	pr := r.Clone(r.Context())
+	pr.Header.Set(HeaderTarget, targetOrigin(r.URL))
+	pr.Header.Set(HeaderPath, r.URL.RequestURI())
+	g.relay(w, pr, log, provider)
+}
+
+// targetOrigin renders the origin (scheme, userinfo, host) of an
+// absolute-form request target as the relay spec's target value.
+func targetOrigin(u *url.URL) string {
+	return (&url.URL{Scheme: u.Scheme, User: u.User, Host: u.Host}).String()
 }
 
 func (g *Gateway) handleStats(w http.ResponseWriter) {
@@ -138,15 +191,23 @@ func (g *Gateway) handleStats(w http.ResponseWriter) {
 	})
 }
 
+// handleRelay is the origin-form relay-spec entry: the pin comes from the
+// X-Relay-Provider header or the /{provider} path prefix.
 func (g *Gateway) handleRelay(w http.ResponseWriter, r *http.Request, log zerolog.Logger) {
-	st := g.st.Load()
-
-	provider, ok := parseProvider(r, st.Pool)
+	provider, ok := parseProvider(r, g.st.Load().Pool)
 	if !ok {
 		jsonError(w, http.StatusNotFound,
 			"unknown provider: use /{provider} prefix or "+HeaderProvider+" header (root / = round-robin all)")
 		return
 	}
+	g.relay(w, r, log, provider)
+}
+
+// relay is the one pipeline every inbound shape funnels into: body
+// acquisition with failover replay, provider size skips, streaming
+// pass-through.
+func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logger, provider string) {
+	st := g.st.Load()
 
 	// Body acquisition. Below StreamThresholdBytes (or with streaming off,
 	// the default) the body is buffered so failover can replay it; at or
@@ -308,20 +369,32 @@ func (f flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// headerProvider resolves the pin from the X-Relay-Provider header alone.
+// present=false means the header carried nothing and the caller may apply
+// its own fallback; ok=false means an explicit but unknown provider.
+func headerProvider(r *http.Request, p *pool.Pool) (provider string, ok, present bool) {
+	v := strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderProvider)))
+	if v == "" {
+		return "", true, false
+	}
+	if unpinned(v) {
+		return "", true, true
+	}
+	if p.HasProvider(v) {
+		return v, true, true
+	}
+	return "", false, true
+}
+
 // parseProvider resolves the requested pin: X-Relay-Provider header first,
 // then the first path segment (a client pins by pointing its relay base URL
 // at http://gateway/{provider} — the real path travels in
 // X-Relay-Path, so the prefix costs nothing). ok=false means an explicit but
-// unknown provider.
+// unknown provider. Proxy-form inbound never reaches the path fallback — the
+// target's path belongs to the target, not to the gateway.
 func parseProvider(r *http.Request, p *pool.Pool) (provider string, ok bool) {
-	if v := strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderProvider))); v != "" {
-		if unpinned(v) {
-			return "", true
-		}
-		if p.HasProvider(v) {
-			return v, true
-		}
-		return "", false
+	if provider, ok, present := headerProvider(r, p); present {
+		return provider, ok
 	}
 	seg := strings.TrimPrefix(r.URL.Path, "/")
 	if i := strings.IndexByte(seg, '/'); i >= 0 {
