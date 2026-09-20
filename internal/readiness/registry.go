@@ -294,7 +294,10 @@ func (r *Registry) Enter(key Key, state State, reason string) {
 // Ready records a completed verification that passed end-to-end: the relay
 // is admitted to the pool and the streak resets. Notifies only when the
 // relay newly gains admission — re-verifying an already-serving relay
-// leaves the pool unchanged.
+// leaves the pool unchanged. A verify racing an admin delete can complete on
+// an entry Sync just marked removing: it resurrects the relay as serving for
+// one generation, and the removal branch of the very next Sync (which this
+// notify triggers) pulls it back — self-healing, no guard needed.
 func (r *Registry) Ready(key Key, duration time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
