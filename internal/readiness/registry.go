@@ -564,7 +564,8 @@ func (r *Registry) DeleteDone(key Key, generation uint64) {
 
 // DeleteFailed records a failed remote delete so the operator sees why the
 // relay still shows as removing; the retry is backoff-gated like every
-// other attempt. Stale completions are discarded.
+// other attempt — the failure counts toward the streak, so repeated
+// failures arm an ever-longer gate. Stale completions are discarded.
 func (r *Registry) DeleteFailed(key Key, generation uint64, reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -572,6 +573,7 @@ func (r *Registry) DeleteFailed(key Key, generation uint64, reason string) {
 	if e == nil || e.record.State != StateRemoving {
 		return
 	}
+	e.record.FailStreak++
 	e.record.Reason = reason
 	r.backoffLocked(e, r.cfg.Now())
 }
