@@ -19,7 +19,7 @@ func TestRelayInputLegacy(t *testing.T) {
 			relay, ok, err := relayInput(store.RelayRow{
 				ID: 1, Name: "edge", Provider: "vercel", URL: "https://edge.example.com",
 				Active: tc.active, Origin: store.OriginLegacy,
-			}, nil, nil)
+			}, nil, nil, true)
 			if err != nil || !ok {
 				t.Fatalf("ok=%v err=%v, want the legacy relay in the pool", ok, err)
 			}
@@ -34,7 +34,7 @@ func TestRelayInputManagedWithoutDeploymentServesOwnURL(t *testing.T) {
 	relay, ok, err := relayInput(store.RelayRow{
 		ID: 1, Name: "edge", Provider: "vercel", URL: "https://edge.example.com",
 		Active: true, Origin: store.OriginManaged,
-	}, nil, nil)
+	}, nil, nil, true)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v, want the deploymentless relay in the pool", ok, err)
 	}
@@ -53,7 +53,7 @@ func TestRelayInputManagedDeploymentOverridesURLAndAuthenticates(t *testing.T) {
 		Deployment: &store.DeploymentRow{
 			URL: "https://deployed.example.com", AuthToken: "tok-1234", Status: "active",
 		},
-	}, nil, nil)
+	}, nil, nil, true)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v, want the deployed relay in the pool", ok, err)
 	}
@@ -81,7 +81,7 @@ func TestRelayInputSkips(t *testing.T) {
 			Origin: store.OriginManaged, InactiveDeployment: true},
 	}
 	for name, row := range cases {
-		if _, ok, _ := relayInput(row, nil, nil); ok {
+		if _, ok, _ := relayInput(row, nil, nil, true); ok {
 			t.Fatalf("%s: relay unexpectedly joined the pool", name)
 		}
 	}
@@ -92,7 +92,25 @@ func TestRelayInputRejectsBadPolicyOnServingRelay(t *testing.T) {
 	if _, _, err := relayInput(store.RelayRow{
 		ID: 1, Name: "x", Provider: "vercel", URL: "https://x.example",
 		Origin: store.OriginLegacy, HeaderPolicy: &bad,
-	}, nil, nil); err == nil {
+	}, nil, nil, true); err == nil {
 		t.Fatal("denied header policy accepted on a serving relay")
+	}
+}
+
+func TestRelayInputUnreadyNeverJoinsPool(t *testing.T) {
+	// The readiness gate is the admission authority: even a fully serving
+	// row (legacy active, or managed with an active deployment) contributes
+	// nothing until the reconciler verified it end to end.
+	for name, row := range map[string]store.RelayRow{
+		"legacy active": {ID: 1, Name: "x", Provider: "vercel",
+			URL: "https://x.example", Active: true, Origin: store.OriginLegacy},
+		"managed active deployment": {ID: 1, Name: "x", Provider: "vercel",
+			URL: "https://row.example", Active: true, Origin: store.OriginManaged,
+			Deployment: &store.DeploymentRow{URL: "https://deployed.example",
+				AuthToken: "tok", Status: "active"}},
+	} {
+		if _, ok, err := relayInput(row, nil, nil, false); err != nil || ok {
+			t.Fatalf("%s: ready=false still joined the pool (ok=%v err=%v)", name, ok, err)
+		}
 	}
 }
