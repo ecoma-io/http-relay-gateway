@@ -580,9 +580,12 @@ func (r *Registry) DeleteFailed(key Key, generation uint64, reason string) {
 
 // backoffLocked arms key's retry gate after a failure: exponential base,
 // capped at BackoffMax, and capped harder at RecoverMax while nothing at
-// all is serving so a total outage heals quickly.
+// all is serving so a total outage heals quickly. Every caller increments
+// FailStreak first, so the streak is at least one here — the clamp keeps a
+// future zero-streak caller at the base delay instead of a negative-shift
+// panic that would take the process down.
 func (r *Registry) backoffLocked(e *entry, now time.Time) {
-	wait := r.cfg.BackoffBase << min(e.record.FailStreak-1, 30)
+	wait := r.cfg.BackoffBase << min(max(e.record.FailStreak-1, 0), 30)
 	if wait > r.cfg.BackoffMax || wait <= 0 {
 		wait = r.cfg.BackoffMax
 	}
