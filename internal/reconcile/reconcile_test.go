@@ -781,3 +781,83 @@ func TestVerifyClassifiesProbeAnswers(t *testing.T) {
 		}
 	})
 }
+
+// --- shutdown at the settle barrier ---
+
+// A process that receives its shutdown signal mid-rollout cannot wait on the
+// settle barrier: the applier loop has left its select and the barrier will
+// never be satisfied. The rollout must abandon instead of hanging Stop(), and
+// the demotion it already made must stand — the replacement belongs to the
+// next process, whose first pass completes it.
+func TestShutdownSettleBarrierAbandonsTheRollout(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+
+	rig.sim.setVersion("0.0.1-stale")
+	rig.drainer.setIdle(true)
+	captured := rig.worker.settle
+	rig.worker.settle = func() bool { return false } // shutdown: barrier unsatisfiable
+	rig.worker.pass()
+
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a shutting-down process never deploys)", got)
+	}
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing", rec.State, rec.Reason)
+	}
+	if rig.reg.IsReady(key) {
+		t.Fatal("the demotion made before the barrier must stand")
+	}
+
+	rig.worker.settle = func() bool { captured(); return true } // restore the live process's barrier
+	rig.clock.Advance(2 * time.Minute)                          // past the backoff gate the demotion armed
+	rig.worker.pass()
+
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 on the next process's first pass", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("deferred replacement not completed")
+	}
+}
+
+// The same shutdown discipline for deletes: a relay left labeled removing
+// when the barrier goes unsatisfiable keeps its admission revoked, the delete
+// is retried from scratch by the next pass, and the entry purges on success.
+func TestShutdownSettleBarrierAbandonsTheDelete(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+
+	rig.desired.Relays = nil
+	captured := rig.worker.settle
+	rig.worker.settle = func() bool { return false } // shutdown: barrier unsatisfiable
+	rig.worker.pass()
+
+	if got := rig.factory.deleteCount(); got != 0 {
+		t.Fatalf("deletes = %d, want 0 (a shutting-down process never deletes)", got)
+	}
+	rec, ok := rig.reg.StateOf(key)
+	if !ok || rec.State != readiness.StateRemoving {
+		t.Fatalf("state = %q (ok=%t), want removing", rec.State, ok)
+	}
+	if rig.reg.IsReady(key) {
+		t.Fatal("a removing relay must not serve")
+	}
+
+	rig.worker.settle = func() bool { captured(); return true } // restore the live process's barrier
+	rig.worker.pass()
+
+	if got := rig.factory.deleteCount(); got != 1 {
+		t.Fatalf("deletes = %d, want 1 on the retried pass", got)
+	}
+	if _, ok := rig.reg.StateOf(key); ok {
+		t.Fatal("completed delete must purge the entry")
+	}
+}

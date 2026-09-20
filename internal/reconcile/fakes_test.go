@@ -343,9 +343,10 @@ func (r *testRig) newWorker() *Worker {
 	for _, platform := range deploy.Platforms() {
 		locks[platform] = &sync.Mutex{}
 	}
-	settle := func() {
+	settle := func() bool {
 		r.log.add("settle")
 		r.settles++
+		return true
 	}
 	relayKey := func() (string, error) { return testRelayKey, nil }
 	w := &Worker{

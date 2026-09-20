@@ -157,9 +157,10 @@ func run() error {
 	// already included, so the barrier errs toward waiting — never toward
 	// deploying under traffic that has not been drained.
 	var (
-		applyMu sync.Mutex
-		applied uint64
-		cond    = sync.NewCond(&applyMu)
+		applyMu  sync.Mutex
+		applied  uint64
+		cond     = sync.NewCond(&applyMu)
+		shutting bool
 	)
 	apply := func(source string) {
 		seq := reg.NotifySeq() // captured BEFORE the snapshot: any later notify stays pending
@@ -179,13 +180,15 @@ func run() error {
 		log.Debug().Str("source", source).Int("relays", reg.ReadyCount()).
 			Msg("serving generation rebuilt")
 	}
-	settle := func() {
+	settle := func() bool {
 		target := reg.NotifySeq()
 		applyMu.Lock()
-		for applied < target {
+		for applied < target && !shutting {
 			cond.Wait()
 		}
+		settled := applied >= target
 		applyMu.Unlock()
+		return settled
 	}
 
 	// The fleet worker turns desired state into verified deployments; the
@@ -235,10 +238,17 @@ func run() error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// Shutdown cancels fleet work first: a deploy mid-flight must not eat
+	// Shutdown releases a rollout parked on the settle barrier first — the
+	// applier loop is about to leave its select, so without this broadcast
+	// a mid-replacement Stop() would wait for a barrier nobody will ever
+	// satisfy. Then it cancels fleet work: a deploy mid-flight must not eat
 	// the whole-process drain budget. Then the data plane drains its
 	// in-flight requests against one whole-process grace budget.
 	shutdown := func() {
+		applyMu.Lock()
+		shutting = true
+		cond.Broadcast()
+		applyMu.Unlock()
 		rec.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrap.ShutdownGrace)
 		defer cancel()

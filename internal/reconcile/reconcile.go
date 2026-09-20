@@ -89,8 +89,11 @@ type Config struct {
 	// Settle blocks until every registry notification emitted before the
 	// call has been applied to the serving pool. It is the barrier between
 	// demote and drain: without it a rollout could deploy under traffic the
-	// pool swap had not yet stopped routing.
-	Settle func()
+	// pool swap had not yet stopped routing. It returns false when the
+	// process is shutting down — the applier has left its loop, the barrier
+	// will never be satisfied, and the caller must abandon the operation
+	// instead of waiting forever.
+	Settle func() bool
 	// Log receives the worker's operational events.
 	Log zerolog.Logger
 	// QuiesceTimeout bounds the drain wait; zero takes the default.
@@ -103,7 +106,7 @@ type Worker struct {
 	cfg           Config
 	reg           *readiness.Registry
 	drainer       Drainer
-	settle        func()
+	settle        func() bool
 	log           zerolog.Logger
 	probeHTTP     *http.Client
 	platformLocks map[string]*sync.Mutex
@@ -129,7 +132,7 @@ func Start(cfg Config) *Worker {
 	}
 	settle := cfg.Settle
 	if settle == nil {
-		settle = func() {}
+		settle = func() bool { return true }
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	locks := map[string]*sync.Mutex{}
@@ -332,7 +335,13 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady bool) {
 	if wasReady {
 		w.reg.Demote(key, gen, readiness.ReasonReplacing)
-		w.settle()
+		if !w.settle() {
+			// The process is shutting down and the applier will never
+			// satisfy the barrier. The demotion stands; the replacement is
+			// the next process's first pass. Return so Stop() can finish.
+			w.logWarn("rollout: shutting down at the settle barrier; replacement deferred", key)
+			return
+		}
 		if !w.drainer.AwaitIdle(key.Provider, key.Name, w.cfg.QuiesceTimeout) {
 			// A straggler request still streams through the old incarnation;
 			// deploying now would cut its upstream mid-flight. The relay
@@ -405,7 +414,14 @@ func (w *Worker) runDeletes() {
 		defer release()
 		// The removal already revoked admission; wait for the swap and the
 		// drain, so no in-flight request is cut when the remote disappears.
-		w.settle()
+		if !w.settle() {
+			// Shutting down: leave the relay labeled removing — the delete
+			// retries from scratch in the next process (a fresh registry
+			// never carries pending deletes).
+			w.log.Warn().Str("provider", key.Provider).Str("relay", key.Name).
+				Msg("delete: shutting down at the settle barrier; retry belongs to the next process")
+			return
+		}
 		if !w.drainer.AwaitIdle(key.Provider, key.Name, w.cfg.QuiesceTimeout) {
 			w.reg.DeleteFailed(key, gen, "in-flight requests still draining")
 			return
