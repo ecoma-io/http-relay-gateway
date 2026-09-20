@@ -1033,7 +1033,7 @@ func TestPostSwapPickServesFromTheCurrentGeneration(t *testing.T) {
 	t.Cleanup(gwSrv.Close)
 
 	pr, pw := io.Pipe()
-	defer pw.Close()
+	defer func() { _ = pw.Close() }()
 	req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", pr)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
@@ -1084,7 +1084,7 @@ func TestPostSwapPickServesFromTheCurrentGeneration(t *testing.T) {
 		if resp == nil {
 			t.Fatal("no response")
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		got, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("read response: %v", err)
