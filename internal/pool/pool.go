@@ -254,3 +254,19 @@ func (p *Pool) Stats() []StatsRow {
 	}
 	return rows
 }
+
+// ReadyCount reports how many relays are in the serving set — the readiness
+// gate's own counter, so /readyz and /stats never re-derive it. The serving
+// set only ever contains verified relays: the generation builder already
+// filtered by the registry before New.
+func (p *Pool) ReadyCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, r := range p.relays {
+		if r.Active {
+			n++
+		}
+	}
+	return n
+}
