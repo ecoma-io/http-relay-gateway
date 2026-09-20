@@ -50,12 +50,16 @@ func TestE2E_ForwardsRelaySpec(t *testing.T) {
 }
 
 func TestE2E_FailoverToLiveRelay(t *testing.T) {
-	dead := deadRelayURL(t)
+	liveA := NewEdgeSim(t, "vercel-a")
 	live := NewEdgeSim(t, "vercel-live")
 	g := NewGatewayWithRelays(t,
-		RelaySeed{Name: "vercel-dead", Provider: "vercel", URL: dead},
+		RelaySeed{Name: "vercel-a", Provider: "vercel", URL: liveA.URL},
 		RelaySeed{Name: "vercel-live", Provider: "vercel", URL: live.URL},
 	)
+	// Both relays verified and are serving; now the first one dies.
+	// Best-effort Pick still hands it out, the transport failure triggers
+	// the bounded failover, and the surviving relay answers.
+	liveA.shutdown()
 
 	status, _, body := relayDo(t, g.Addr, "/vercel", `{}`, nil)
 	if status != http.StatusOK {
@@ -66,7 +70,7 @@ func TestE2E_FailoverToLiveRelay(t *testing.T) {
 	}
 
 	st := g.WaitForCondition(applySettle, "dead relay recorded a failure", func(st *StatsView) bool {
-		row, ok := st.relay("vercel-dead")
+		row, ok := st.relay("vercel-a")
 		return ok && row.Failures >= 1
 	})
 	if row, _ := st.relay("vercel-live"); row.Requests != 1 {

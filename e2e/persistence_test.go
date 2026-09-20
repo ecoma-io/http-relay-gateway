@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -18,10 +19,16 @@ func TestE2E_CreateThenRestartPersistence(t *testing.T) {
 		t.Fatalf("status=%d body=%q, want 200 %q before restart\nlogs:\n%s",
 			status, body, sim.servedBody(), g.Logs())
 	}
+	if code, body := readyzDo(t, g.Addr); code != http.StatusOK || !strings.Contains(body, `"ready":true`) {
+		t.Fatalf("readyz before restart = %d %q, want 200 ready", code, body)
+	}
 
 	// No file carries the relay: the restarted process reads SQLite only.
 	g.Restart()
 	g.WaitForRelays([]string{"persist-a"}, applySettle)
+	if code, body := readyzDo(t, g.Addr); code != http.StatusOK || !strings.Contains(body, `"ready":true`) {
+		t.Fatalf("readyz after restart = %d %q, want 200 once re-verified", code, body)
+	}
 
 	if status, _, body := relayDo(t, g.Addr, "/vercel", `{}`, nil); status != http.StatusOK || body != sim.servedBody() {
 		t.Fatalf("status=%d body=%q, want 200 %q after restart\nlogs:\n%s",

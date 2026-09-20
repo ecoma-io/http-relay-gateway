@@ -29,14 +29,16 @@ func TestE2E_BulkImportAndAdopt(t *testing.T) {
 		t.Fatalf("login = %d", code)
 	}
 
-	// The legacy list. Every URL is unreachable on purpose: passive health
-	// means the pool still carries them, and nothing is probed at import.
+	// The legacy list. Every URL is a refused local connection on purpose:
+	// the strict readiness gate means none of them may ever be admitted,
+	// and a closed listener fails the probe deterministically (no DNS
+	// dependency in CI).
 	items := make([]map[string]any, 0, 17)
 	for i := 1; i <= 17; i++ {
 		items = append(items, map[string]any{
 			"name":     fmt.Sprintf("edge-%02d", i),
 			"provider": "vercel",
-			"url":      fmt.Sprintf("https://edge-%02d.example", i),
+			"url":      deadRelayURL(t),
 			"active":   i != 17,
 		})
 	}
@@ -64,7 +66,7 @@ func TestE2E_BulkImportAndAdopt(t *testing.T) {
 	// against their own validation.
 	bad := []map[string]any{
 		{"name": "edge-01", "provider": "vercel", "url": "https://dup.example"},
-		{"name": "twin", "provider": "vercel", "url": "https://twin-a.example"},
+		{"name": "twin", "provider": "vercel", "url": deadRelayURL(t)},
 		{"name": "twin", "provider": "vercel", "url": "https://twin-b.example"},
 		{"name": "no-url", "provider": "vercel"},
 		{"name": "bad-scheme", "provider": "vercel", "url": "ftp://x.example"},
@@ -93,10 +95,24 @@ func TestE2E_BulkImportAndAdopt(t *testing.T) {
 		}
 	}
 
-	// The pool converges on the 17 imported relays plus the one "twin" row.
-	g.WaitForCondition(applySettle, "18 relays in pool", func(st *StatsView) bool {
-		return len(st.Relays) == 18
+	// Strict gate over the whole pool: every imported URL is unreachable,
+	// so none of them may ever earn admission. The rows land in the
+	// registry lifecycle — with the failure reason — not in the traffic
+	// pool, and /readyz stays 503 with zero ready relays.
+	g.WaitForCondition(applySettle, "unreachable imports recorded in lifecycle", func(st *StatsView) bool {
+		if st.Readiness.ReadyRelays != 0 {
+			return false
+		}
+		row, ok := st.lifecycle("edge-01")
+		return ok && row.State != "" && row.Reason != ""
 	})
+	st, err := g.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.relay("edge-01"); ok {
+		t.Fatalf("unreachable imported relay entered the pool: %+v", st.Relays)
+	}
 
 	// Accounts and relay ids for the adoption leg.
 	code, _, body = g.AdminDo(t, http.MethodPost, "/api/v1/accounts", map[string]string{
@@ -112,7 +128,7 @@ func TestE2E_BulkImportAndAdopt(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, _, body = g.AdminDo(t, http.MethodPost, "/api/v1/relays", map[string]any{
-		"name": "cf-edge", "provider": "cloudflare", "url": "https://cf-edge.example",
+		"name": "cf-edge", "provider": "cloudflare", "url": deadRelayURL(t),
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("cloudflare relay create = %d: %s", code, body)

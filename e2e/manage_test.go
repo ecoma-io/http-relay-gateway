@@ -210,14 +210,15 @@ func TestE2E_AdminRejectionKeepsServing(t *testing.T) {
 }
 
 func TestE2E_SettingsChangeAppliesWithoutRestart(t *testing.T) {
-	dead := deadRelayURL(t)
+	downed := NewEdgeSim(t, "vercel-dead")
 	live := NewEdgeSim(t, "vercel-live")
 	g := NewGatewayWithRelays(t,
-		RelaySeed{Name: "vercel-dead", Provider: "vercel", URL: dead},
+		RelaySeed{Name: "vercel-dead", Provider: "vercel", URL: downed.URL},
 		RelaySeed{Name: "vercel-live", Provider: "vercel", URL: live.URL},
 	)
-
-	// Before the knob: a dead first pick failovers to the live relay.
+	// Both verified and admitted; now the first relay dies. Before the
+	// knob, a dead first pick failovers to the live relay.
+	downed.shutdown()
 	status, _, body := relayDo(t, g.Addr, "/vercel", `{}`, nil)
 	if status != http.StatusOK || body != live.servedBody() {
 		t.Fatalf("status=%d body=%q, want 200 %q via failover", status, body, live.servedBody())

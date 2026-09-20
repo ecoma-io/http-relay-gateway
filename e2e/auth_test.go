@@ -91,13 +91,16 @@ func TestE2E_LoginRateLimit(t *testing.T) {
 func TestE2E_SecretsNeverLeakIntoObservability(t *testing.T) {
 	const secret = "hunter2-log-canary-9x7"
 	sim := NewEdgeSim(t, "leak-sim")
-	dead := deadRelayURL(t)
+	// Under the readiness gate a relay that never verifies never gets
+	// admitted, so "dead" must be a live sim that is admitted and then
+	// deleted — the delete path is what the leak assertions care about.
+	leakDead := NewEdgeSim(t, "leak-dead")
 	// Manual flow (not newGatewayWith) so the canary password is the one
 	// this gateway actually installs.
 	g := NewGateway(t)
 	g.Setup(t, secret)
 	g.CreateRelay(t, RelaySeed{Name: "leak-sim", Provider: "vercel", URL: sim.URL})
-	g.CreateRelay(t, RelaySeed{Name: "leak-dead", Provider: "vercel", URL: dead})
+	g.CreateRelay(t, RelaySeed{Name: "leak-dead", Provider: "vercel", URL: leakDead.URL})
 	g.WaitForRelays([]string{"leak-sim", "leak-dead"}, applySettle)
 
 	// Debug logging first, so the data-plane traffic below is logged at the
@@ -114,7 +117,7 @@ func TestE2E_SecretsNeverLeakIntoObservability(t *testing.T) {
 	if logs := g.Logs(); strings.Contains(logs, secret) {
 		t.Fatalf("setup password leaked into logs:\n%s", logs)
 	}
-	if raw := g.RawStats(t); strings.Contains(raw, sim.URL) || strings.Contains(raw, dead) {
+	if raw := g.RawStats(t); strings.Contains(raw, sim.URL) || strings.Contains(raw, leakDead.URL) {
 		t.Fatalf("relay URL leaked into /stats: %s", raw)
 	}
 }
