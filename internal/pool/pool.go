@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"http-relay-gateway/internal/sanitize"
 )
 
 // KeyAll is the selector key for "every provider" (round-robin across all).
@@ -102,13 +104,14 @@ func (r *Relay) RecordSuccess() {
 
 // RecordFailure bumps the failure streak; after `threshold` consecutive
 // failures the relay goes on cooldown (passive health) and is skipped until
-// it expires (half-open recovery).
+// it expires (half-open recovery). The stored label is sanitized: transport
+// errors embed the relay URL, which never reaches /stats.
 func (r *Relay) RecordFailure(err error, threshold int, cooldown time.Duration) {
 	r.Failures.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.consecFails++
-	r.lastErr = err.Error()
+	r.lastErr = sanitize.ErrorString(err)
 	if r.consecFails >= threshold {
 		r.downUntil = time.Now().Add(cooldown)
 		r.consecFails = 0

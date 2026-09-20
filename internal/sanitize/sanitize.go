@@ -1,7 +1,7 @@
 // Package sanitize provides shared safe-diagnostics helpers for pool
-// snapshots, /stats, and structured logs. It redacts URL userinfo,
-// neutralizes terminal controls and ANSI sequences, and bounds output.
-// Zero dependencies beyond the standard library.
+// snapshots, /stats, and structured logs. It strips quoted URL tokens,
+// redacts URL userinfo, neutralizes terminal controls and ANSI sequences,
+// and bounds output. Zero dependencies beyond the standard library.
 package sanitize
 
 import (
@@ -14,13 +14,14 @@ const MaxLength = 512
 
 const redacted = "[redacted]@"
 
-// Sanitize returns bounded diagnostic text with URL userinfo redacted and
-// terminal controls and ANSI sequences neutralized.
+// Sanitize returns bounded diagnostic text with quoted URL tokens and URL
+// userinfo stripped or redacted, and terminal controls and ANSI sequences
+// neutralized.
 func Sanitize(s string) string {
 	if !needsSanitizing(s) {
 		return s
 	}
-	return bound(cleanControls(redactUserinfo(s)))
+	return bound(cleanControls(stripQuotedURLs(redactUserinfo(s))))
 }
 
 // needsSanitizing reports whether any stage of Sanitize would change s, so the
@@ -73,6 +74,47 @@ func redactUserinfo(value string) string {
 		value = value[:userinfoStart] + redacted + value[at+1:]
 		searchFrom = userinfoStart + len(redacted)
 	}
+}
+
+// stripQuotedURLs replaces every double-quoted URL token with "…".
+// net/http folds the request URL into its transport errors
+// (`Get "https://…": dial tcp …`), and relay origins are private: the URL
+// must never survive into /stats, error bodies, or logs — only the cause
+// behind it does. Unquoted URLs keep flowing so userinfo redaction below
+// can still act on them.
+func stripQuotedURLs(value string) string {
+	for i := 0; i < len(value); {
+		start := strings.IndexByte(value[i:], '"')
+		if start < 0 {
+			return value
+		}
+		start += i
+		end := quotedTokenEnd(value, start)
+		if end < 0 {
+			return value
+		}
+		if strings.Contains(value[start:end+1], "://") {
+			value = value[:start] + `"…"` + value[end+1:]
+			i = start + len(`"…"`)
+			continue
+		}
+		i = end + 1
+	}
+	return value
+}
+
+// quotedTokenEnd returns the index of the quote closing the token opened at
+// start, honoring %q-style backslash escapes, or -1 when unterminated.
+func quotedTokenEnd(value string, start int) int {
+	for end := start + 1; end < len(value); end++ {
+		switch value[end] {
+		case '\\':
+			end++ // skip the escaped byte
+		case '"':
+			return end
+		}
+	}
+	return -1
 }
 
 func tokenEndIndex(s string, from int) int {
