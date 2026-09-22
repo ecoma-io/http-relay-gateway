@@ -773,6 +773,64 @@ func TestCloudflareDeleteMatrix(t *testing.T) {
 	}
 }
 
+// A 200 envelope reporting failure is a failed delete — the registry must
+// not purge the relay while the script lives on. The envelope's not-found
+// code is the desired end state, exactly as in Discover.
+func TestCloudflareDeleteEnvelopeMatrix(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		wantOK bool
+	}{
+		{
+			name:   "success envelope",
+			status: http.StatusOK,
+			body:   `{"success":true,"result":null,"errors":[]}`,
+			wantOK: true,
+		},
+		{
+			name:   "http 404",
+			status: http.StatusNotFound,
+			body:   `{"success":false,"result":null,"errors":[]}`,
+			wantOK: true,
+		},
+		{
+			name:   "envelope 7003 inside a 200",
+			status: http.StatusOK,
+			body:   `{"success":false,"result":null,"errors":[{"code":7003,"message":"no route"}]}`,
+			wantOK: true,
+		},
+		{
+			name:   "envelope failure inside a 200",
+			status: http.StatusOK,
+			body:   `{"success":false,"result":null,"errors":[{"code":10143,"message":"script is in use"}]}`,
+			wantOK: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.status, tc.body)
+			})
+			client, err := factoryAt(t, CloudflareAPIBaseEnv, f.URL).For(PlatformCloudflare, Credential{Token: "tok", Account: "acc_pin"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			err = client.Delete(context.Background(), "web-relay")
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("Delete = %v, want the already-deleted end state", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "script is in use") {
+				t.Fatalf("Delete = %v, want the envelope's failure to surface", err)
+			}
+		})
+	}
+}
+
 // --- Deno ---
 
 func TestDenoDiscoverMatrix(t *testing.T) {
