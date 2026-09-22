@@ -11,4 +11,11 @@ config.yaml
 config.*.yaml
 # The committed reference layout is the one deliberate exception.
 !config.example.yaml
+
+# Provider credentials for the compose deployment (compose.yaml env_file).
+relay.env
+
+# token_file: secrets — config.example.yaml suggests relay-token.secret;
+# a credential file, same rule as relay.env. Never committed.
+*.secret
 /data/

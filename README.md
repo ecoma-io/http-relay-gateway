@@ -110,7 +110,7 @@ rejected, which classifies as drift a deploy fixes).
 ```json
 {
   "version": "0.1.0-dev",
-  "relayVersion": "1.0.0",
+  "relayVersion": "0.1.0",
   "relays": [
     {
       "name": "relay-a",
@@ -125,6 +125,10 @@ rejected, which classifies as drift a deploy fixes).
   "lifecycle": [{ "name": "relay-a", "provider": "vercel", "state": "ready", "generation": 1 }]
 }
 ```
+
+A relay row also carries `lastError` — the sanitized label of the most
+recent passive transport failure (never a URL) — omitted entirely while
+the relay has never failed.
 
 ## Readiness gate
 
@@ -153,7 +157,6 @@ Lifecycle is tracked in memory and rendered on `/stats`:
 | `discovering` | Resolving the deployment from the provider                   |
 | `discovered`  | Deployment located; verification pending                     |
 | `deploying`   | A deploy/redeploy is in flight (single-flight per relay)     |
-| `verifying`   | Version + forwarded probe in progress                        |
 | `ready`       | Gate passed; admitted to the pool; round-robins traffic      |
 | `unready`     | Was serving; verification failed `verify_demote_after` times |
 | `failed`      | Never verified; retries under backoff                        |
@@ -356,10 +359,12 @@ state; byte-identical content is not a change — no reconciler wake, no pool
 rebuild; an invalid file is logged and ignored, so the last-known-good
 fleet keeps serving. The file
 being absent at boot is fine: the gateway starts with an empty fleet
-(`/readyz` answers `503`) and reconciles the moment the file appears.
-Delete the file mid-run and the fleet treats every relay as removed (see
-[Removal](#removal)) — back the file up; it plus the referenced
-environment is the whole system.
+(`/readyz` answers `503`) and reconciles the moment the file appears. A
+file that disappears or turns invalid mid-run is a rejected reload, not a
+fleet change — the last-known-good fleet keeps serving and the log warns
+until a valid file returns. Removal happens by deleting a relay entry from
+a valid file (see [Removal](#removal)) — back the file up; it plus the
+referenced environment is the whole system.
 
 ### Settings
 
@@ -471,6 +476,30 @@ bind-mounts `./config.yaml` read-only into the container, requires
 `RELAY_AUTH_TOKEN` from the environment, keeps `stop_grace_period` (30s)
 above `SHUTDOWN_GRACE` (default 20s), bounds `json-file` logs, and uses the
 binary `healthcheck` subcommand (no shell in the image).
+
+Provider credentials reach the container through **`relay.env`** — an
+operator-created, never-committed file next to `compose.yaml` that compose
+injects (`env_file`) into the container environment, so the `${VAR}`
+references inside `config.yaml` resolve there rather than against the
+host shell:
+
+```bash
+cat > relay.env <<'EOF'
+VERCEL_TOKEN=...
+CLOUDFLARE_API_TOKEN=...
+DENO_DEPLOY_TOKEN=...
+# optional scope pins, when the config references them:
+# VERCEL_TEAM_ID=...
+# CLOUDFLARE_ACCOUNT_ID=...
+EOF
+chmod 600 relay.env
+```
+
+The file is optional — compose treats it as such — because a fleet whose
+relays all use `token_file:` secrets needs none of these variables. (The
+optional form, `env_file` with `required: false`, needs Docker Compose
+v2.24 or newer; on an older compose use `env_file: relay.env` and create
+the file — empty is fine.)
 
 ## Layout
 

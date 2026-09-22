@@ -7,8 +7,10 @@
 # Desired state is the config.yaml bind-mounted into the container; provider
 # credentials and the relay key ride the environment as ${VAR} references
 # resolved inside the file (or live in secret files the container can read).
-# Back up the config file — plus whatever secret store holds the referenced
-# variables — and the whole system moves with it.
+# The provider credential variables come from relay.env (env_file below);
+# the relay key still comes from the host environment.
+# Back up the config file — plus relay.env and whatever secret store holds
+# the remaining referenced variables — and the whole system moves with it.
 services:
   relay-gateway:
     build:
@@ -18,6 +20,14 @@ services:
     container_name: relay-gateway
     ports:
       - "20130:20130" # relay endpoint (HTTP): /healthz, /readyz and /stats included
+    # Provider credential variables for the ${VAR} references inside the
+    # desired-state file — interpolation happens in the container, so these
+    # must be in the container's environment. relay.env is operator-created
+    # (see README: Docker), never committed, and optional: a fleet whose
+    # relays all use token_file: secrets runs fine without it.
+    env_file:
+      - path: relay.env
+        required: false
     environment:
       # Bootstrap-only settings: changes require a container restart.
       LISTEN_ADDR: 0.0.0.0:20130

@@ -359,6 +359,56 @@ func TestRelayValidationFailures(t *testing.T) {
 	}
 }
 
+// An inline token follows the same hygiene as a token file: the resolved
+// value is trimmed, and one that is blank afterwards rejects the load. A
+// trailing newline in a secret-manager-sourced env var must not silently
+// ship as part of the credential. Assertions compare against the fixture
+// without echoing the resolved value — the failure text never carries it.
+func TestInlineTokenTrimmedAndBlankRejected(t *testing.T) {
+	const want = "padded-fixture-secret"
+
+	t.Run("env value with surrounding whitespace resolves trimmed", func(t *testing.T) {
+		t.Setenv("RELAY_TEST_PADDED", " \t"+want+"\n")
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: ${RELAY_TEST_PADDED}\n")
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		got := cfg.Relays[0].Token
+		if got != want {
+			t.Errorf("inline token length = %d, want %d (the trimmed secret)", len(got), len(want))
+		}
+	})
+
+	t.Run("literal token with surrounding whitespace resolves trimmed", func(t *testing.T) {
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: \" "+want+" \"\n")
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Relays[0].Token; got != want {
+			t.Errorf("inline token length = %d, want %d (the trimmed literal)", len(got), len(want))
+		}
+	})
+
+	t.Run("env value blank after trimming rejects the load", func(t *testing.T) {
+		t.Setenv("RELAY_TEST_BLANKISH", " \n\t")
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: ${RELAY_TEST_BLANKISH}\n")
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "token is blank") {
+			t.Fatalf("Load error = %v, want a blank-token rejection", err)
+		}
+	})
+
+	t.Run("whitespace-only literal token rejects the load", func(t *testing.T) {
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: \"   \"\n")
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "token is blank") {
+			t.Fatalf("Load error = %v, want a blank-token rejection", err)
+		}
+	})
+}
+
 func TestRelayNameLengthBound(t *testing.T) {
 	long := strings.Repeat("a", 129)
 	_, err := Load(writeConfig(t, "relays:\n  - name: "+long+"\n    provider: vercel\n    token: t\n"))
@@ -656,6 +706,49 @@ func TestBootstrapListenAddrValidation(t *testing.T) {
 	}
 }
 
+// The inline relay key follows the file path's hygiene at boot too: a
+// whitespace-only RELAY_AUTH_TOKEN is fatal at LoadBootstrap (surfacing it
+// only at reconcile time would read as generic verification failures), and
+// a padded value boots and resolves trimmed. Key values are never echoed —
+// assertions are equality/length only.
+func TestBootstrapInlineRelayKeyHygiene(t *testing.T) {
+	t.Run("whitespace-only env value is boot-fatal", func(t *testing.T) {
+		clearBootstrapEnv(t)
+		t.Setenv("RELAY_AUTH_TOKEN", " \t\n")
+		_, err := LoadBootstrap()
+		if err == nil || !strings.Contains(err.Error(), "RELAY_AUTH_TOKEN is blank") {
+			t.Fatalf("LoadBootstrap error = %v, want a blank-key boot failure", err)
+		}
+	})
+
+	t.Run("whitespace-only env value with a file names the whitespace", func(t *testing.T) {
+		clearBootstrapEnv(t)
+		t.Setenv("RELAY_AUTH_TOKEN", " \t\n")
+		t.Setenv("RELAY_AUTH_TOKEN_FILE", "/run/secrets/relay-key")
+		_, err := LoadBootstrap()
+		if err == nil || !strings.Contains(err.Error(), "RELAY_AUTH_TOKEN is blank") {
+			t.Fatalf("LoadBootstrap error = %v, want the blank-token message, not the exclusivity one", err)
+		}
+	})
+
+	t.Run("padded env value boots and resolves trimmed", func(t *testing.T) {
+		const want = "padded-bootstrap-key"
+		clearBootstrapEnv(t)
+		t.Setenv("RELAY_AUTH_TOKEN", "  "+want+"\n")
+		cfg, err := LoadBootstrap()
+		if err != nil {
+			t.Fatalf("LoadBootstrap: %v (a padded key is valid)", err)
+		}
+		got, err := cfg.ResolveRelayKey()
+		if err != nil {
+			t.Fatalf("ResolveRelayKey error = %v, want nil", err)
+		}
+		if got != want {
+			t.Errorf("resolved key length = %d, want %d (the trimmed key)", len(got), len(want))
+		}
+	})
+}
+
 func TestResolveRelayKey(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "relay-key")
@@ -668,6 +761,29 @@ func TestResolveRelayKey(t *testing.T) {
 		got, err := cfg.ResolveRelayKey()
 		if err != nil || got != "inline-key" {
 			t.Fatalf("ResolveRelayKey = %q, %v; want inline-key, nil", got, err)
+		}
+	})
+
+	// The env path must apply the same hygiene as the file path: a value
+	// with surrounding whitespace resolves trimmed. Assertions compare
+	// against the fixture without echoing the key.
+	t.Run("env key with surrounding whitespace resolves trimmed", func(t *testing.T) {
+		const want = "padded-env-key"
+		cfg := &BootstrapConfig{RelayKey: " \t" + want + "\n"}
+		got, err := cfg.ResolveRelayKey()
+		if err != nil {
+			t.Fatalf("ResolveRelayKey error = %v, want nil", err)
+		}
+		if got != want {
+			t.Errorf("ResolveRelayKey length = %d, want %d (the trimmed key)", len(got), len(want))
+		}
+	})
+
+	t.Run("blank env key rejects", func(t *testing.T) {
+		cfg := &BootstrapConfig{RelayKey: " \n\t"}
+		_, err := cfg.ResolveRelayKey()
+		if err == nil || !strings.Contains(err.Error(), "RELAY_AUTH_TOKEN is blank") {
+			t.Fatalf("ResolveRelayKey error = %v, want a blank-key rejection", err)
 		}
 	})
 
