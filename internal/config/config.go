@@ -50,8 +50,9 @@ type BootstrapConfig struct {
 	// supplied — exactly one must be set. The key is the credential the
 	// gateway authenticates to every deployed worker with, injected at
 	// deploy time and sent on every relay leg; workers reject anything else.
-	// A worker deployed without it would reject every request, so boot
-	// refuses to run without one.
+	// The env value is trimmed like the file's content. A worker deployed
+	// without it would reject every request, so boot refuses to run without
+	// one.
 	RelayKey     string
 	RelayKeyFile string
 }
@@ -90,7 +91,16 @@ func (c *BootstrapConfig) validate() error {
 	if c.ShutdownGrace <= 0 {
 		errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE must be positive, got %s", c.ShutdownGrace))
 	}
-	if (c.RelayKey == "") == (c.RelayKeyFile == "") {
+	// The env value is trimmed exactly like a key file's content; a value
+	// that is blank after trimming is no key at all and fails boot here —
+	// surfacing at reconcile time would only ever say "verification
+	// failed", with nothing pointing at the whitespace.
+	key := strings.TrimSpace(c.RelayKey)
+	switch {
+	case c.RelayKey != "" && key == "":
+		errs = append(errs, errors.New(
+			"RELAY_AUTH_TOKEN is blank: it carries only whitespace after trimming"))
+	case (key == "") == (c.RelayKeyFile == ""):
 		errs = append(errs, errors.New(
 			"exactly one of RELAY_AUTH_TOKEN or RELAY_AUTH_TOKEN_FILE must be set: "+
 				"it is the credential deployed workers authenticate with"))
@@ -101,14 +111,23 @@ func (c *BootstrapConfig) validate() error {
 	return errors.Join(errs...)
 }
 
-// ResolveRelayKey returns the relay API key, reading and trimming the key
-// file when the bootstrap pointed at one. Callers resolve it per reconcile
-// pass, so a rotated secret file is picked up without a restart.
+// ResolveRelayKey returns the relay API key. Both paths apply the same
+// hygiene: the file is read and trimmed (readSecretFile), the inline env
+// value is trimmed here — a trailing newline from a compose expansion or a
+// systemd EnvironmentFile line would otherwise produce a key that fails
+// authentication on every relay leg and probe with no hint at the
+// whitespace — and a value blank after trimming is an error. Callers
+// resolve it per reconcile pass, so a rotated secret file is picked up
+// without a restart.
 func (c *BootstrapConfig) ResolveRelayKey() (string, error) {
 	if c.RelayKeyFile != "" {
 		return readSecretFile(c.RelayKeyFile)
 	}
-	return c.RelayKey, nil
+	key := strings.TrimSpace(c.RelayKey)
+	if key == "" {
+		return "", errors.New("RELAY_AUTH_TOKEN is blank: it carries only whitespace after trimming")
+	}
+	return key, nil
 }
 
 func readSecretFile(path string) (string, error) {
