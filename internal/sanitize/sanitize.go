@@ -20,8 +20,8 @@ var (
 	lookupName     = regexp.MustCompile(`\blookup ([^\s:]+)(:|\s+on\s)`) // net.DNSError formatting
 	lookupServer   = regexp.MustCompile(`\bon (\[[^]]+\]|[^\s:]+):(\d+):`)
 	connectTo      = regexp.MustCompile(`\bconnect: ([^\s]+(?: [^\s]+)*) to (\[[^]]+\]|[^\s:]+):(\d+)`)
-	connIODirected = regexp.MustCompile(`\b(read|write) tcp (\[[^]]+\]|[^\s:]+):(\d+)->(\[[^]]+\]|[^\s:]+):(\d+)`)
-	connIOSingle   = regexp.MustCompile(`\b(read|write) tcp (\[[^]]+\]|[^\s:]+):(\d+)`)
+	connIODirected = regexp.MustCompile(`\b([a-z]+) tcp (\[[^]]+\]|[^\s:]+):(\d+)->(\[[^]]+\]|[^\s:]+):(\d+)`)
+	connIOSingle   = regexp.MustCompile(`\b([a-z]+) tcp (\[[^]]+\]|[^\s:]+):(\d+)`)
 )
 
 // Sanitize returns bounded diagnostic text with quoted URL tokens, relay dial
@@ -51,8 +51,11 @@ func needsSanitizing(s string) bool {
 		strings.Contains(s, "dial ") ||
 		strings.Contains(s, "lookup ") ||
 		strings.Contains(s, "connect: ") ||
-		strings.Contains(s, "read tcp ") ||
-		strings.Contains(s, "write tcp ")
+		// Any "<op> tcp …" diagnostic — read, write, Go 1.26's readfrom
+		// body-write wrapper, whatever a future transport adds. An op word
+		// missed here would skip redaction entirely, and that failure is
+		// silent.
+		strings.Contains(s, " tcp ")
 }
 
 // ErrorString sanitizes err.Error(), returning "" for nil.
@@ -123,9 +126,11 @@ func stripQuotedURLs(value string) string {
 }
 
 // redactDialAddresses removes private relay targets from standard-library
-// transport errors and I/O errors (net.OpError's `read tcp A->B:` /
-// `write tcp A->B:` shapes, with or without the source endpoint) while
-// preserving the operation, address family, port, and cause.
+// transport and I/O errors while preserving the operation, address family,
+// port, and cause. Beyond the dial/lookup/connect shapes this covers the
+// "<op> tcp A->B:" family — net.OpError's read/write forms and the readfrom
+// wrapper a declared-length body write produces on Go 1.26 — with the op
+// word matched generically so an op this list never heard of still redacts.
 func redactDialAddresses(value string) string {
 	value = dialTCPAddress.ReplaceAllString(value, "dial tcp [redacted]:$2")
 	value = lookupName.ReplaceAllString(value, "lookup [redacted]$2")

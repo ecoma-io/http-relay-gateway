@@ -202,6 +202,15 @@ func TestSanitizeRedactsConnIOAddresses(t *testing.T) {
 			secret: "10.0.0.1",
 		},
 		{
+			// A declared-length body write wraps the OpError in a readfrom
+			// layer that carries both endpoints itself — every layer must
+			// lose its addresses.
+			name:   "readfrom body-write wrapper redacts at both layers",
+			in:     `Post "…": readfrom tcp 127.0.0.1:41754->127.0.0.1:37445: write tcp 127.0.0.1:41754->127.0.0.1:37445: write: connection reset by peer`,
+			want:   `Post "…": readfrom tcp [redacted]:41754->[redacted]:37445: write tcp [redacted]:41754->[redacted]:37445: write: connection reset by peer`,
+			secret: "127.0.0.1",
+		},
+		{
 			name:   "redaction is idempotent",
 			in:     `read tcp [redacted]:52400->[redacted]:443: read: connection reset by peer`,
 			want:   `read tcp [redacted]:52400->[redacted]:443: read: connection reset by peer`,
