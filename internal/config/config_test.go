@@ -38,14 +38,18 @@ relays:
     provider: cloudflare
     token_file: /run/secrets/cf-token
     account: acc_123
+  - name: edge-relay-deno
+    provider: deno
+    token: deno_secret
+    organization: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 `)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Relays) != 2 {
-		t.Fatalf("got %d relays, want 2", len(cfg.Relays))
+	if len(cfg.Relays) != 3 {
+		t.Fatalf("got %d relays, want 3", len(cfg.Relays))
 	}
 	first := cfg.Relays[0]
 	if first.Name != "web-relay" || first.Provider != "vercel" {
@@ -64,6 +68,12 @@ relays:
 	}
 	if second.TokenFile != "/run/secrets/cf-token" {
 		t.Errorf("relay 1 token_file = %q, want /run/secrets/cf-token", second.TokenFile)
+	}
+	third := cfg.Relays[2]
+	if third.Provider != "deno" ||
+		third.Organization != "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" {
+		t.Errorf("relay 2 = %s/%s organization %q, want deno/edge-relay-deno with the org pin",
+			third.Provider, third.Name, third.Organization)
 	}
 
 	// Keys absent from the file keep their documented defaults.
@@ -196,6 +206,9 @@ func TestExampleConfigLoads(t *testing.T) {
 	} {
 		t.Setenv(name, "stub-"+strings.ToLower(name))
 	}
+	// The deno organization pin must resolve to a UUID-shaped value (the
+	// load validates the shape), so its stub is a UUID, not a bare string.
+	t.Setenv("DENO_ORG_ID", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
 
 	// go test runs the binary in the package directory; the example lives
 	// two levels up, next to compose.yaml.
@@ -332,6 +345,16 @@ func TestRelayValidationFailures(t *testing.T) {
 			wantErr: "account is a cloudflare scope pin",
 		},
 		{
+			name:    "organization on vercel",
+			relay:   "name: web-relay\n    provider: vercel\n    token: t\n    organization: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			wantErr: "organization is a deno scope pin",
+		},
+		{
+			name:    "organization on cloudflare",
+			relay:   "name: web-relay\n    provider: cloudflare\n    token: t\n    organization: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			wantErr: "organization is a deno scope pin",
+		},
+		{
 			name:    "both token and token_file",
 			relay:   "name: web-relay\n    provider: vercel\n    token: t\n    token_file: /tmp/t",
 			wantErr: "set either token or token_file, not both",
@@ -406,6 +429,73 @@ func TestInlineTokenTrimmedAndBlankRejected(t *testing.T) {
 			t.Fatalf("Load error = %v, want a blank-token rejection", err)
 		}
 	})
+}
+
+func TestRelayOrganizationInterpolationAndShape(t *testing.T) {
+	const orgRelay = "name: edge-relay-deno\n    provider: deno\n    token: t\n    organization: "
+	cases := []struct {
+		name    string
+		pin     string
+		env     string // value of RELAY_TEST_DENO_ORG; unset when absent
+		set     bool
+		wantPin string
+		wantErr string
+	}{
+		{
+			name:    "reference resolves to a UUID",
+			pin:     "${RELAY_TEST_DENO_ORG}",
+			env:     "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			set:     true,
+			wantPin: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+		},
+		{
+			name:    "literal UUID passes through",
+			pin:     "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			wantPin: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+		},
+		{
+			name:    "unset reference",
+			pin:     "${RELAY_TEST_DENO_ORG}",
+			wantErr: "organization: environment variable RELAY_TEST_DENO_ORG is not set",
+		},
+		{
+			name:    "reference resolving to whitespace only",
+			pin:     "${RELAY_TEST_DENO_ORG}",
+			env:     "   ",
+			set:     true,
+			wantErr: "organization must not resolve to an empty value",
+		},
+		{
+			name:    "malformed UUID",
+			pin:     "not-a-uuid",
+			wantErr: `organization "not-a-uuid" is not a Deno Deploy organization id (UUID)`,
+		},
+		{
+			name:    "UUID-shaped but wrong group layout",
+			pin:     "a0eebc999c0b4ef8bb6d6bb9bd380a11",
+			wantErr: "is not a Deno Deploy organization id",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("RELAY_TEST_DENO_ORG", tc.env)
+			}
+			cfg, err := Load(writeConfig(t, "relays:\n  - "+orgRelay+tc.pin+"\n"))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.Relays[0].Organization; got != tc.wantPin {
+				t.Errorf("organization = %q, want %q", got, tc.wantPin)
+			}
+		})
+	}
 }
 
 func TestRelayNameLengthBound(t *testing.T) {

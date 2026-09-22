@@ -285,7 +285,8 @@ func (w *Worker) memoCredentials(cfg *config.Config) {
 			continue // ensureRelay reports the credential problem for this relay
 		}
 		key := deploy.RelayKey{Provider: rel.Provider, Name: rel.Name}
-		cred := deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account}
+		cred := deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account,
+			Organization: rel.Organization}
 		if prev, ok := w.credentials[key]; ok && !prev.SameScope(cred) {
 			// The scope pin moved under a stable identity: this pass
 			// discovers and deploys in the NEW scope, and the deployment the
@@ -325,7 +326,8 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		return
 	}
 	client, err := w.cfg.Factory.For(rel.Provider,
-		deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account})
+		deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account,
+			Organization: rel.Organization})
 	if err != nil {
 		w.reg.Failing(key, gen, readiness.ReasonCredentials, 0)
 		w.logError(err, "ensure: build platform client")
@@ -529,6 +531,17 @@ func (w *Worker) runDeletes() {
 			return
 		}
 		if err := client.Delete(w.ctx, deploy.ProjectName(key.Name)); err != nil {
+			// A scope the credential cannot address — e.g. a deno relay whose
+			// organization pin is missing — is operator configuration, not a
+			// gateway fault: retrying cannot fix it, so the identity must not
+			// sit labeled removing forever. Like a vanished credential, the
+			// delete is dropped and the remote left behind with a warning.
+			if errors.Is(err, deploy.ErrAmbiguousScope) {
+				w.log.Warn().Str("provider", key.Provider).Str("relay", key.Name).
+					Msg("delete: credential cannot address the remote scope; removing from the fleet, remote left behind")
+				w.reg.DeleteDone(key, gen)
+				return
+			}
 			// A 404 already surfaced as success inside the client; anything
 			// else keeps the relay labeled removing for a backoff-gated retry.
 			w.reg.DeleteFailed(key, gen, sanitize.ErrorString(err))

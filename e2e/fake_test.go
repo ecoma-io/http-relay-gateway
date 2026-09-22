@@ -3,11 +3,15 @@ package e2e
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +35,10 @@ type fakeEdge struct {
 	require  map[string]string       // provider -> required bearer token ("" accepts any)
 	projects map[string]*fakeProject // slug -> state
 	calls    []fakeCall
-	closed   bool
+	// denoPolls counts GET /deployments/{id} polls per deployment id so the
+	// status walk can model the platform's pending→success transition.
+	denoPolls map[string]int
+	closed    bool
 }
 
 type fakeCall struct {
@@ -69,12 +76,13 @@ func newFakeEdge(t *testing.T) *fakeEdge {
 		t.Fatalf("fake platform listen: %v", err)
 	}
 	f := &fakeEdge{
-		t:        t,
-		base:     "http://" + ln.Addr().String(),
-		ln:       ln,
-		require:  map[string]string{},
-		projects: map[string]*fakeProject{},
-		client:   &http.Client{Timeout: 30 * time.Second},
+		t:         t,
+		base:      "http://" + ln.Addr().String(),
+		ln:        ln,
+		require:   map[string]string{},
+		projects:  map[string]*fakeProject{},
+		denoPolls: map[string]int{},
+		client:    &http.Client{Timeout: 30 * time.Second},
 	}
 	f.srv = &http.Server{Handler: f, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = f.srv.Serve(ln) }()
@@ -466,84 +474,222 @@ func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- deno API ---
+//
+// The published Deploy API wire (api.deno.com/v1): the project collection is
+// organization-scoped, projects are addressed by UUID everywhere else, and
+// deployments are JSON bodies. The by-name routes the previous client
+// invented (/v1/projects/{name}) are deliberately unhandled: the fake 404s
+// them exactly like the real platform, which is the regression lock for the
+// client rewrite.
 
-type denoMeta struct {
+// e2eDenoOrgID is the organization every e2e deno relay pins. The fake
+// serves this org only; any other id answers 404 like the real API.
+const e2eDenoOrgID = "e17a0e6b-7ba7-4a6e-9dbd-1f9a83d4db0a"
+
+// denoProjectID derives the deterministic project UUID for a slug — the
+// platform addresses projects by UUID, never by name.
+func denoProjectID(slug string) string {
+	sum := sha256.Sum256([]byte("deno-project:" + slug))
+	src := []byte(hex.EncodeToString(sum[:16]))
+	src[12] = '4' // UUID version nibble
+	src[16] = '8' // RFC 4122 variant nibble
+	return fmt.Sprintf("%s-%s-%s-%s-%s", src[0:8], src[8:12], src[12:16], src[16:20], src[20:32])
+}
+
+// denoDeployPayload is the spec's CreateDeploymentRequest as the fake reads
+// it: the worker as one inline asset plus the deployment envVars.
+type denoDeployPayload struct {
+	EntryPointUrl string `json:"entryPointUrl"`
+	Assets        map[string]struct {
+		Kind     string `json:"kind"`
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	} `json:"assets"`
 	EnvVars map[string]string `json:"envVars"`
+	Domains []string          `json:"domains"`
+}
+
+// denoProjectJSON renders the spec's Project (all its required fields).
+func denoProjectJSON(slug string) map[string]any {
+	return map[string]any{
+		"id":          denoProjectID(slug),
+		"name":        slug,
+		"description": "",
+		"createdAt":   "2026-01-01T00:00:00Z",
+		"updatedAt":   "2026-01-01T00:00:00Z",
+	}
 }
 
 func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/") // v1/...
 	switch {
-	case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "projects":
-		slug := parts[2]
-		if !f.authorized(w, r, "deno") {
+	// GET list / POST create: /v1/organizations/{organizationId}/projects
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "organizations" && parts[3] == "projects":
+		if parts[2] != e2eDenoOrgID {
+			writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "organization not found"})
 			return
 		}
-		f.record("deno", "discover", slug, r)
-		if p := f.lookup("deno", slug); p != nil && p.exists {
-			writeJSON(w, http.StatusOK, map[string]string{"id": slug})
-			return
-		}
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "project not found"})
+		switch r.Method {
+		case http.MethodGet:
+			if !f.authorized(w, r, "deno") {
+				return
+			}
+			f.record("deno", "discover", "", r)
+			f.mu.Lock()
+			var slugs []string
+			for slug, p := range f.projects {
+				if p.provider == "deno" && p.exists {
+					slugs = append(slugs, slug)
+				}
+			}
+			f.mu.Unlock()
+			sort.Strings(slugs)
+			page, limit := 1, 20 // the spec's documented defaults
+			if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v >= 1 {
+				page = v
+			}
+			if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v >= 1 && v <= 100 {
+				limit = v
+			}
+			start := (page - 1) * limit
+			items := []map[string]any{}
+			if start < len(slugs) {
+				end := start + limit
+				if end > len(slugs) {
+					end = len(slugs)
+				}
+				for _, slug := range slugs[start:end] {
+					items = append(items, denoProjectJSON(slug))
+				}
+			}
+			writeJSON(w, http.StatusOK, items)
 
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/projects":
-		if !f.authorized(w, r, "deno") {
-			return
-		}
-		var body struct {
-			Name string `json:"name"`
-		}
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
-		f.record("deno", "create-project", body.Name, r)
-		f.mu.Lock()
-		if _, ok := f.projects[body.Name]; !ok {
-			f.projects[body.Name] = &fakeProject{provider: "deno", exists: true, sim: newSim(body.Name, simOK)}
-		} else {
-			f.projects[body.Name].exists = true
-		}
-		f.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]string{"id": body.Name})
+		case http.MethodPost:
+			if !f.authorized(w, r, "deno") {
+				return
+			}
+			var body struct {
+				Name string `json:"name"`
+			}
+			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+			if body.Name == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request", "message": "name is required"})
+				return
+			}
+			f.record("deno", "create-project", body.Name, r)
+			f.mu.Lock()
+			p, ok := f.projects[body.Name]
+			if !ok {
+				p = &fakeProject{sim: newSim(body.Name, simOK)}
+				f.projects[body.Name] = p
+			}
+			p.provider = "deno"
+			p.exists = true // gates and sims on a pre-armed stub stay untouched
+			f.mu.Unlock()
+			writeJSON(w, http.StatusOK, denoProjectJSON(body.Name))
 
-	case r.Method == http.MethodPost && len(parts) == 4 && parts[3] == "deployments":
-		slug := parts[2]
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
+		}
+
+	// POST /v1/projects/{projectId}/deployments — JSON body, UUID addressing.
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "projects" && parts[3] == "deployments":
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
+			return
+		}
 		if !f.authorized(w, r, "deno") {
 			return
 		}
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "multipart"})
+		var payload denoDeployPayload
+		if err := json.NewDecoder(io.LimitReader(r.Body, 32<<20)).Decode(&payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request", "message": "json body required"})
 			return
 		}
-		var meta denoMeta
-		if err := json.Unmarshal([]byte(r.FormValue("meta")), &meta); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "meta"})
+		asset, ok := payload.Assets[payload.EntryPointUrl]
+		if payload.EntryPointUrl != "relay.js" || !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request", "message": "entryPointUrl must name a shipped asset"})
 			return
 		}
-		var source string
-		if file, _, err := r.FormFile("file"); err == nil {
-			raw, _ := io.ReadAll(file)
-			_ = file.Close()
-			source = string(raw)
+		source := asset.Content
+		if asset.Encoding == "base64" {
+			if decoded, err := base64.StdEncoding.DecodeString(asset.Content); err == nil {
+				source = string(decoded)
+			}
+		}
+		slug, ok := f.denoSlugFor(parts[2])
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "project not found"})
+			return
 		}
 		f.record("deno", "deploy", slug, r)
 		p := f.waitGate("deno", slug)
-		f.completeDeploy(p, meta.EnvVars["RELAY_VERSION"], meta.EnvVars["RELAY_AUTH_TOKEN"], source)
-		writeJSON(w, http.StatusOK, map[string]string{"id": "dep-" + slugHash(slug), "status": "success"})
+		f.completeDeploy(p, payload.EnvVars["RELAY_VERSION"], payload.EnvVars["RELAY_AUTH_TOKEN"], source)
+		// The build is asynchronous on the platform: create answers pending
+		// and the status poll below observes the pending→success walk.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":        "dep-" + slugHash(slug),
+			"projectId": parts[2],
+			"status":    "pending",
+			"databases": map[string]any{},
+			"createdAt": "2026-01-01T00:00:00Z",
+			"updatedAt": "2026-01-01T00:00:00Z",
+		})
 
-	case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "deployments":
-		writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
+	// GET /v1/deployments/{deploymentId} — the client's status poll: the
+	// first GET after create still reports pending, the second success.
+	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "deployments":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
+			return
+		}
+		f.mu.Lock()
+		n := f.denoPolls[parts[2]]
+		f.denoPolls[parts[2]] = n + 1
+		f.mu.Unlock()
+		status := "pending"
+		if n > 0 {
+			status = "success"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": parts[2], "status": status})
 
-	case r.Method == http.MethodDelete && len(parts) == 3 && parts[1] == "projects":
-		slug := parts[2]
+	// DELETE /v1/projects/{projectId} — by UUID only.
+	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "projects":
+		if r.Method != http.MethodDelete {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
+			return
+		}
 		if !f.authorized(w, r, "deno") {
+			return
+		}
+		slug, ok := f.denoSlugFor(parts[2])
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "project not found"})
 			return
 		}
 		f.record("deno", "delete", slug, r)
 		f.completeDelete("deno", slug)
-		writeJSON(w, http.StatusOK, map[string]any{})
+		w.WriteHeader(http.StatusOK) // the spec's delete answers 200 with no body
 
 	default:
+		// The old client's by-name routes land here: /v1/projects/{name} and
+		// /v1/projects (create) do not exist on the platform, so they must
+		// not exist here either.
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
 	}
+}
+
+// denoSlugFor resolves a project UUID back to its slug among the fake's deno
+// (or not-yet-typed, gate-armed) projects.
+func (f *fakeEdge) denoSlugFor(projectID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for slug, p := range f.projects {
+		if (p.provider == "deno" || p.provider == "") && denoProjectID(slug) == projectID {
+			return slug, true
+		}
+	}
+	return "", false
 }
 
 // --- shared deploy/delete plumbing ---

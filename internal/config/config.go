@@ -168,9 +168,14 @@ type Relay struct {
 	// reach exactly one account it is resolved automatically; any other
 	// account visibility requires the explicit pin.
 	Account string `yaml:"account"`
+	// Organization pins the Deno Deploy organization id (UUID). Unlike team
+	// and account it is mandatory for deno at deploy time: the Deploy API
+	// addresses projects by organization and offers no route that resolves
+	// it from a token.
+	Organization string `yaml:"organization"`
 
-	// team/account must never be set on the wrong provider; validated in
-	// validateRelay via the provider switch.
+	// team/account/organization must never be set on the wrong provider;
+	// validated in resolve via the provider switch.
 }
 
 // Settings is the typed view of the runtime tuning knobs. Every field has a
@@ -242,12 +247,13 @@ func DefaultSettings() Settings { return defaultSettings() }
 // fileRelay mirrors Relay in YAML. Secret-carrying fields stay raw here;
 // interpolation happens in Load where a failure can reject the whole file.
 type fileRelay struct {
-	Name      string `yaml:"name"`
-	Provider  string `yaml:"provider"`
-	Token     string `yaml:"token"`
-	TokenFile string `yaml:"token_file"`
-	Team      string `yaml:"team"`
-	Account   string `yaml:"account"`
+	Name         string `yaml:"name"`
+	Provider     string `yaml:"provider"`
+	Token        string `yaml:"token"`
+	TokenFile    string `yaml:"token_file"`
+	Team         string `yaml:"team"`
+	Account      string `yaml:"account"`
+	Organization string `yaml:"organization"`
 }
 
 type fileSettings struct {
@@ -326,11 +332,12 @@ func parse(raw []byte) (*Config, error) {
 // interpolated from the environment.
 func (fr fileRelay) resolve() (Relay, error) {
 	relay := Relay{
-		Name:      strings.TrimSpace(fr.Name),
-		Provider:  strings.ToLower(strings.TrimSpace(fr.Provider)),
-		Team:      strings.TrimSpace(fr.Team),
-		Account:   strings.TrimSpace(fr.Account),
-		TokenFile: strings.TrimSpace(fr.TokenFile),
+		Name:         strings.TrimSpace(fr.Name),
+		Provider:     strings.ToLower(strings.TrimSpace(fr.Provider)),
+		Team:         strings.TrimSpace(fr.Team),
+		Account:      strings.TrimSpace(fr.Account),
+		Organization: strings.TrimSpace(fr.Organization),
+		TokenFile:    strings.TrimSpace(fr.TokenFile),
 	}
 	if relay.Name == "" {
 		return Relay{}, errors.New("name is required")
@@ -353,6 +360,9 @@ func (fr fileRelay) resolve() (Relay, error) {
 	if relay.Provider != deploy.PlatformCloudflare && relay.Account != "" {
 		return Relay{}, fmt.Errorf("account is a cloudflare scope pin, not valid for %s", relay.Provider)
 	}
+	if relay.Provider != deploy.PlatformDeno && relay.Organization != "" {
+		return Relay{}, fmt.Errorf("organization is a deno scope pin, not valid for %s", relay.Provider)
+	}
 	switch {
 	case fr.Token != "" && relay.TokenFile != "":
 		return Relay{}, errors.New("set either token or token_file, not both")
@@ -374,7 +384,48 @@ func (fr fileRelay) resolve() (Relay, error) {
 	default:
 		return Relay{}, errors.New("a provider credential is required: set token (with ${VAR} references) or token_file")
 	}
+	// The organization pin interpolates exactly like the token — operators
+	// keep environment-shaped values in the environment — and must resolve to
+	// a non-empty UUID: the Deploy API types organization ids as UUIDs, and a
+	// typo'd pin would otherwise surface only as endless unreachable retries.
+	if relay.Organization != "" {
+		org, err := interpolate(relay.Organization)
+		if err != nil {
+			return Relay{}, fmt.Errorf("organization: %w", err)
+		}
+		if org = strings.TrimSpace(org); org == "" {
+			return Relay{}, errors.New("organization must not resolve to an empty value")
+		}
+		if !validUUID(org) {
+			return Relay{}, fmt.Errorf("organization %q is not a Deno Deploy organization id (UUID)", org)
+		}
+		relay.Organization = org
+	}
 	return relay, nil
+}
+
+// validUUID reports whether s is shaped like the UUIDs the Deno Deploy API
+// addresses organizations and projects by: 8-4-4-4-12 hex groups. It is a
+// shape check, not a liveness check — the platform is the final judge.
+func validUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if s[i] != '-' {
+				return false
+			}
+		default:
+			c := s[i]
+			isHex := c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ResolveToken returns the relay's provider credential, reading the secret

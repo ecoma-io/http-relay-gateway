@@ -318,6 +318,7 @@ relays:
   - name: relay-c
     provider: deno
     token: ${DENO_TOKEN}
+    organization: ${DENO_ORG_ID} # required deno organization pin (UUID; ${VAR} resolved like token)
 ```
 
 Start from the committed reference layout: `cp config.example.yaml
@@ -345,8 +346,10 @@ reads as a corrupt credential and demotes the relay until the write
 completes. Scope pins: `team` (vercel only) names the team scope when the token
 can reach more than one; `account` (cloudflare only) pins the account id —
 a cloudflare token that sees exactly one account resolves it automatically,
-anything more ambiguous requires the explicit pin (deno is user-scoped and
-needs none). Changing a scope pin under an unchanged relay name moves the
+anything more ambiguous requires the explicit pin; `organization` (deno only)
+pins the Deploy organization id, required because that API addresses projects
+by organization and offers no route to resolve one from the token. Changing a
+scope pin under an unchanged relay name moves the
 identity to a different platform scope: the gateway deploys fresh there,
 and the deployment the old scope hosted is **orphaned** — no later pass can
 reach or delete it, so the log warns and the old project must be removed

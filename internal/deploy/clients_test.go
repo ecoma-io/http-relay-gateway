@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -832,25 +833,53 @@ func TestCloudflareDeleteEnvelopeMatrix(t *testing.T) {
 }
 
 // --- Deno ---
+//
+// The fakes speak the published Deploy API wire (api.deno.com/v1): projects
+// live under /organizations/{organizationId}/projects and are addressed by
+// UUID everywhere else; deployments are JSON bodies on
+// /projects/{projectId}/deployments, polled at /deployments/{deploymentId}.
+
+const (
+	denoTestOrgID     = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+	denoTestProjectID = "b1eef7d2-9c0b-4ef8-bb6d-6bb9bd380a11"
+)
+
+// denoProjectsPath is the org-scoped project list route.
+func denoProjectsPath() string {
+	return "/v1/organizations/" + denoTestOrgID + "/projects"
+}
 
 func TestDenoDiscoverMatrix(t *testing.T) {
 	cases := []struct {
 		name      string
 		status    int
+		body      string
 		wantExist bool
 		wantErr   error
 	}{
-		{name: "existing project", status: http.StatusOK, wantExist: true},
-		{name: "missing project", status: http.StatusNotFound},
+		{
+			name:      "project in list",
+			status:    http.StatusOK,
+			body:      `[{"id":"` + denoTestProjectID + `","name":"web-relay"}]`,
+			wantExist: true,
+		},
+		{name: "empty list", status: http.StatusOK, body: `[]`},
+		{
+			name:   "other projects only",
+			status: http.StatusOK,
+			body:   `[{"id":"11111111-1111-4111-8111-111111111111","name":"other-relay"}]`,
+		},
 		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+		{name: "forbidden", status: http.StatusForbidden, wantErr: ErrCredentials},
 		{name: "server error", status: http.StatusInternalServerError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
-				writeJSON(w, tc.status, `{"id":"web-relay"}`)
+				writeJSON(w, tc.status, tc.body)
 			})
-			client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+			client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno,
+				Credential{Token: "tok", Organization: denoTestOrgID})
 			if err != nil {
 				t.Fatalf("For: %v", err)
 			}
@@ -879,27 +908,115 @@ func TestDenoDiscoverMatrix(t *testing.T) {
 			if tc.wantExist && discovery.URL != "https://web-relay.deno.dev" {
 				t.Errorf("URL = %q, want the stable deno.dev domain", discovery.URL)
 			}
+			call := f.callFor(t, http.MethodGet, denoProjectsPath())
+			requireBearer(t, call, "tok")
+			if call.RawQuery != "q=web-relay&page=1&limit=100" {
+				t.Errorf("list query = %q, want the spec's q name filter with paged full pages", call.RawQuery)
+			}
 		})
+	}
+}
+
+func TestDenoDiscoverWalksPagesUntilMatch(t *testing.T) {
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") != "1" {
+			writeJSON(w, http.StatusOK, `[{"id":"`+denoTestProjectID+`","name":"web-relay"}]`)
+			return
+		}
+		// A full first page of strangers — a server that ignores the q
+		// filter: the walk must continue and the match stay client-side.
+		var b strings.Builder
+		b.WriteByte('[')
+		for i := 0; i < 100; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"id":"11111111-1111-4111-8111-%012d","name":"filler-%d"}`, i, i)
+		}
+		b.WriteByte(']')
+		writeJSON(w, http.StatusOK, b.String())
+	})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno,
+		Credential{Token: "tok", Organization: denoTestOrgID})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	discovery, err := client.Discover(context.Background(), "web-relay")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if !discovery.Exists || discovery.URL != "https://web-relay.deno.dev" {
+		t.Errorf("discovery = %+v, want the project found past the first page", discovery)
+	}
+	var listCalls int
+	for _, call := range f.recorded() {
+		if call.Method != http.MethodGet || call.Path != denoProjectsPath() {
+			t.Errorf("unexpected call %s %s", call.Method, call.Path)
+			continue
+		}
+		listCalls++
+		requireBearer(t, call, "tok")
+		if call.RawQuery != "q=web-relay&page=1&limit=100" && call.RawQuery != "q=web-relay&page=2&limit=100" {
+			t.Errorf("list query = %q, want the q filter on every paged request", call.RawQuery)
+		}
+	}
+	if listCalls != 2 {
+		t.Errorf("list calls = %d, want 2 (the walk continues past a full page)", listCalls)
+	}
+}
+
+func TestDenoRequiresOrganizationPin(t *testing.T) {
+	// The API has no route that resolves the organization from a token, so
+	// every deno operation refuses up front rather than guess a scope.
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no platform call may happen without the organization pin, got %s %s", r.Method, r.URL.Path)
+		writeJSON(w, http.StatusNotFound, `{}`)
+	})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	check := func(what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s = nil error; the organization pin is mandatory", what)
+		}
+		if !errors.Is(err, ErrAmbiguousScope) {
+			t.Errorf("%s error = %v, want it to classify as ErrAmbiguousScope", what, err)
+		}
+		if !strings.Contains(err.Error(), "organization") {
+			t.Errorf("%s error = %v, want it to name the missing organization pin", what, err)
+		}
+	}
+	_, err = client.Discover(context.Background(), "web-relay")
+	check("Discover", err)
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	check("Deploy", err)
+	check("Delete", client.Delete(context.Background(), "web-relay"))
+	if calls := f.recorded(); len(calls) != 0 {
+		t.Errorf("platform calls = %d, want 0", len(calls))
 	}
 }
 
 func TestDenoDeployCreatesProjectThenDeploys(t *testing.T) {
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/web-relay":
-			writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found"}}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects":
-			writeJSON(w, http.StatusCreated, `{"id":"prj_1","name":"web-relay"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/web-relay/deployments":
-			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"queued"}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments/dep_1":
-			writeJSON(w, http.StatusOK, `{"status":"success"}`)
-			f.signal()
+		case r.Method == http.MethodGet && r.URL.Path == denoProjectsPath():
+			writeJSON(w, http.StatusOK, `[]`) // the project does not exist yet
+		case r.Method == http.MethodPost && r.URL.Path == denoProjectsPath():
+			writeJSON(w, http.StatusOK,
+				`{"id":"`+denoTestProjectID+`","name":"web-relay","description":"",`+
+					`"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/"+denoTestProjectID+"/deployments":
+			writeJSON(w, http.StatusOK,
+				`{"id":"dep_1","projectId":"`+denoTestProjectID+`","status":"success"}`)
+			f.signal() // the last call before the live check
 		default:
 			writeJSON(w, http.StatusNotFound, `{}`)
 		}
 	})
-	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno,
+		Credential{Token: "tok", Organization: denoTestOrgID})
 	if err != nil {
 		t.Fatalf("For: %v", err)
 	}
@@ -914,52 +1031,95 @@ func TestDenoDeployCreatesProjectThenDeploys(t *testing.T) {
 		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
 	}
 
-	create := f.callFor(t, http.MethodPost, "/v1/projects")
+	create := f.callFor(t, http.MethodPost, denoProjectsPath())
 	requireBearer(t, create, "tok")
-	if !strings.Contains(string(create.Body), `"name":"web-relay"`) {
-		t.Errorf("create-project body = %q, want the project name", create.Body)
+	if want := `{"name":"web-relay"}`; string(create.Body) != want {
+		t.Errorf("create-project body = %s, want %s (the schema allows no other field)", create.Body, want)
 	}
 
-	deployCall := f.callFor(t, http.MethodPost, "/v1/projects/web-relay/deployments")
-	form, err := multipartForm(t, deployCall)
-	if err != nil {
-		t.Fatalf("parse multipart body: %v", err)
+	deployCall := f.callFor(t, http.MethodPost, "/v1/projects/"+denoTestProjectID+"/deployments")
+	requireBearer(t, deployCall, "tok")
+	if !strings.HasPrefix(deployCall.ContentType, "application/json") {
+		t.Errorf("deploy content type = %q, want application/json", deployCall.ContentType)
 	}
-	var meta struct {
-		EntryPointURL string            `json:"entryPointUrl"`
-		Production    bool              `json:"production"`
-		EnvVars       map[string]string `json:"envVars"`
+	// CreateDeploymentRequest is additionalProperties:false on the platform:
+	// assert the exact field set, not just the values.
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(deployCall.Body, &payload); err != nil {
+		t.Fatalf("decode deploy payload: %v", err)
 	}
-	if err := json.Unmarshal([]byte(form.Value["meta"][0]), &meta); err != nil {
-		t.Fatalf("decode meta: %v (%q)", err, form.Value["meta"])
+	wantFields := map[string]bool{
+		"entryPointUrl": false, "assets": false, "envVars": false, "domains": false,
 	}
-	if meta.EntryPointURL != "relay.js" || !meta.Production {
-		t.Errorf("meta = %+v, want relay.js production deployment", meta)
+	for field := range payload {
+		if _, known := wantFields[field]; !known {
+			t.Errorf("deploy payload carries %q, which the published schema does not define", field)
+			continue
+		}
+		wantFields[field] = true
 	}
-	if meta.EnvVars["RELAY_VERSION"] != "3.0.0" || meta.EnvVars["RELAY_AUTH_TOKEN"] != "relay-key" {
-		t.Errorf("envVars = %v, want the version and relay key", meta.EnvVars)
+	for field, seen := range wantFields {
+		if !seen {
+			t.Errorf("deploy payload is missing %q", field)
+		}
 	}
-	if got := fileContent(t, form, "file"); got != spec.Source {
-		t.Errorf("file part = %q, want the worker source", got)
+	if got := string(payload["entryPointUrl"]); got != `"relay.js"` {
+		t.Errorf("entryPointUrl = %s, want \"relay.js\"", got)
 	}
-	f.callFor(t, http.MethodGet, "/v1/deployments/dep_1")
+	if got := string(payload["domains"]); got != `["{project.name}.deno.dev"]` {
+		t.Errorf("domains = %s, want the stable {project.name}.deno.dev attachment", got)
+	}
+	var envVars map[string]string
+	if err := json.Unmarshal(payload["envVars"], &envVars); err != nil {
+		t.Fatalf("decode envVars: %v", err)
+	}
+	wantEnv := map[string]string{"RELAY_VERSION": "3.0.0", "RELAY_AUTH_TOKEN": "relay-key"}
+	if len(envVars) != len(wantEnv) {
+		t.Errorf("envVars = %v, want exactly %v", envVars, wantEnv)
+	}
+	for k, v := range wantEnv {
+		if envVars[k] != v {
+			t.Errorf("envVars[%s] = %q, want %q", k, envVars[k], v)
+		}
+	}
+	var assets map[string]struct {
+		Kind     string `json:"kind"`
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(payload["assets"], &assets); err != nil {
+		t.Fatalf("decode assets: %v", err)
+	}
+	if len(assets) != 1 {
+		t.Fatalf("assets = %v, want exactly the entry module", assets)
+	}
+	asset, ok := assets["relay.js"]
+	if !ok {
+		t.Fatalf("assets = %v, want a relay.js entry", assets)
+	}
+	if asset.Kind != "file" || asset.Encoding != "base64" {
+		t.Errorf("relay.js asset = %+v, want a base64 file asset", asset)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(asset.Content)
+	if err != nil || string(decoded) != spec.Source {
+		t.Errorf("relay.js content = %q (%v), want the worker source", decoded, err)
+	}
 }
 
 func TestDenoDeployExistingProjectSkipsCreate(t *testing.T) {
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/web-relay":
-			writeJSON(w, http.StatusOK, `{"id":"prj_1","name":"web-relay"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/web-relay/deployments":
-			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"queued"}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments/dep_1":
-			writeJSON(w, http.StatusOK, `{"status":"success"}`)
-			f.signal()
+		case r.Method == http.MethodGet && r.URL.Path == denoProjectsPath():
+			writeJSON(w, http.StatusOK, `[{"id":"`+denoTestProjectID+`","name":"web-relay"}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/"+denoTestProjectID+"/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"success"}`)
+			f.signal() // the last call before the live check
 		default:
 			writeJSON(w, http.StatusNotFound, `{}`)
 		}
 	})
-	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno,
+		Credential{Token: "tok", Organization: denoTestOrgID})
 	if err != nil {
 		t.Fatalf("For: %v", err)
 	}
@@ -973,31 +1133,32 @@ func TestDenoDeployExistingProjectSkipsCreate(t *testing.T) {
 		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
 	}
 	for _, call := range f.recorded() {
-		if call.Method == http.MethodPost && call.Path == "/v1/projects" {
+		if call.Method == http.MethodPost && call.Path == denoProjectsPath() {
 			t.Error("existing project must not be recreated")
 		}
 	}
 }
 
-func TestDenoDeployFailsOnErroredDeployment(t *testing.T) {
+func TestDenoDeployFailsOnFailedDeployment(t *testing.T) {
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/web-relay":
-			writeJSON(w, http.StatusOK, `{"id":"prj_1"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/web-relay/deployments":
-			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"queued"}`)
+		case r.Method == http.MethodGet && r.URL.Path == denoProjectsPath():
+			writeJSON(w, http.StatusOK, `[{"id":"`+denoTestProjectID+`","name":"web-relay"}]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/"+denoTestProjectID+"/deployments":
+			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"pending"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments/dep_1":
-			writeJSON(w, http.StatusOK, `{"status":"failed"}`)
+			writeJSON(w, http.StatusOK, `{"id":"dep_1","status":"failed"}`)
 		default:
 			writeJSON(w, http.StatusNotFound, `{}`)
 		}
 	})
-	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+	client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno,
+		Credential{Token: "tok", Organization: denoTestOrgID})
 	if err != nil {
 		t.Fatalf("For: %v", err)
 	}
 	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
-	if err == nil || !strings.Contains(err.Error(), "deployment failed") {
+	if err == nil || !strings.Contains(err.Error(), "deployment dep_1 failed") {
 		t.Fatalf("Deploy error = %v, want the failed-deployment failure", err)
 	}
 }
@@ -1005,19 +1166,33 @@ func TestDenoDeployFailsOnErroredDeployment(t *testing.T) {
 func TestDenoDeleteMatrix(t *testing.T) {
 	cases := []struct {
 		name    string
-		status  int
+		inList  bool
+		status  int // the by-id delete answer; 0 = no delete call expected
 		wantErr error
 	}{
-		{name: "deleted", status: http.StatusNoContent},
-		{name: "already gone", status: http.StatusNotFound},
-		{name: "unauthorized", status: http.StatusUnauthorized, wantErr: ErrCredentials},
+		{name: "deleted", inList: true, status: http.StatusNoContent},
+		{name: "delete answered 404", inList: true, status: http.StatusNotFound},
+		{name: "absent from the org already", inList: false},
+		{name: "unauthorized", inList: true, status: http.StatusUnauthorized, wantErr: ErrCredentials},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			listBody := `[]`
+			if tc.inList {
+				listBody = `[{"id":"` + denoTestProjectID + `","name":"web-relay"}]`
+			}
 			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
-				writeJSON(w, tc.status, `{}`)
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == denoProjectsPath():
+					writeJSON(w, http.StatusOK, listBody)
+				case r.Method == http.MethodDelete && r.URL.Path == "/v1/projects/"+denoTestProjectID:
+					writeJSON(w, tc.status, `{}`)
+				default:
+					writeJSON(w, http.StatusNotFound, `{}`)
+				}
 			})
-			client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno, Credential{Token: "tok"})
+			client, err := factoryAt(t, DenoAPIBaseEnv, f.URL).For(PlatformDeno,
+				Credential{Token: "tok", Organization: denoTestOrgID})
 			if err != nil {
 				t.Fatalf("For: %v", err)
 			}
@@ -1031,7 +1206,17 @@ func TestDenoDeleteMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Delete: %v", err)
 			}
-			f.callFor(t, http.MethodDelete, "/v1/projects/web-relay")
+			if !tc.inList {
+				// A name absent from the pinned organization is the only
+				// "already gone" the client may conclude — and it must not
+				// fire a delete at the platform to learn that.
+				if calls := f.recorded(); len(calls) != 1 {
+					t.Fatalf("calls = %d (%+v), want only the list walk", len(calls), calls)
+				}
+				return
+			}
+			call := f.callFor(t, http.MethodDelete, "/v1/projects/"+denoTestProjectID)
+			requireBearer(t, call, "tok")
 		})
 	}
 }

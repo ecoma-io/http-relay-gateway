@@ -54,7 +54,8 @@ Environment variables are bootstrap-only and require restart:
 
 Desired-state file: a `settings:` block (every key optional, malformed
 values are load errors) and a `relays:` list of `{name, provider,
-token|token_file, team? (vercel only), account? (cloudflare only)}`.
+token|token_file, team? (vercel only), account? (cloudflare only),
+organization? (deno only)}`.
 Identity is `(provider, name)`; the project slug and serving URL derive
 from it — never configured. Unknown keys, duplicate names, slug collisions
 on one provider, and unset `${VAR}` references all reject the load;
