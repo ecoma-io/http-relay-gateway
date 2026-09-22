@@ -63,7 +63,9 @@ func TestE2E_ReplacementRolloutStrategyA(t *testing.T) {
 	releaseDeploy := fake.armDeployGate("v-rel")
 	fake.project("v-rel").sim.setMode(simStale)
 
-	g.waitForLifecycle(t, "vercel", "v-rel", "unready", "replacing", 15*time.Second)
+	// The demoted phase is intentionally short when the drain completes, so
+	// observe the durable safety boundary instead: no relay is admitted before
+	// the replacement deploy may start.
 	g.waitForZeroReady(t, 5*time.Second)
 
 	// The settle barrier: no deploy may start while the old worker still
@@ -323,8 +325,8 @@ func TestE2E_InvalidConfigKeepsLastKnownGood(t *testing.T) {
 
 // TestE2E_SuspensionPausesAndRevives: a platform suspension (HTTP 402 or
 // the DEPLOYMENT_DISABLED marker) pauses a relay on its own cadence —
-// never a redeploy — and the revival scan re-admits it untouched once the
-// platform answers again.
+// never a redeploy — and the revival cadence re-admits it untouched once
+// the platform answers again.
 func TestE2E_SuspensionPausesAndRevives(t *testing.T) {
 	fake := newFakeEdge(t)
 	echo := newEcho(t)
@@ -356,7 +358,7 @@ func TestE2E_SuspensionPausesAndRevives(t *testing.T) {
 		t.Fatalf("deploys after suspension = %d, want 1 (never redeploy at a suspension)", n)
 	}
 
-	// The platform recovers; the revival scan re-admits the same deploy.
+	// The platform recovers; the revival cadence re-admits the same deploy.
 	sim.setMode(simOK)
 	g.waitForReady(t, 15*time.Second)
 	if n := fake.deployCount("v-rel"); n != 1 {

@@ -186,7 +186,7 @@ scratch has no WORKDIR. Compose publishes host **20130** only, bind-mounts
 - `internal/readiness` — the in-memory admission gate: lifecycle states,
   incarnations, single-flight, backoff, the verified serving snapshot
 - `internal/reconcile` — the desired-state worker: sync, deletes, probe
-  classification, redeploys, Strategy A replacements, the revival scan
+  classification, redeploys, Strategy A replacements, paused-relay revival
 - `internal/gateway` — HTTP data plane: pinning, bounded failover,
   streaming pass-through, in-flight drain, `/healthz` + `/readyz` + `/stats`
 - `internal/pool` — the serving set: per-selector round-robin cursors,

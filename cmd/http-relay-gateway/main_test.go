@@ -256,13 +256,29 @@ func TestDesiredStorePollLifecycle(t *testing.T) {
 			t.Fatalf("a successful load must be silent: %q", out)
 		}
 
-		// Unchanged content re-logs nothing; a rewrite lands atomically.
-		if !store.poll(path, log) {
-			t.Fatal("unchanged poll must still return true")
+		// Unchanged content is not a change: the published pointer stays,
+		// nothing signals, nothing logs — an idle tick must not re-apply.
+		applied := store.get()
+		if store.poll(path, log) {
+			t.Fatal("an unchanged poll must not signal a change")
+		}
+		if store.get() != applied {
+			t.Fatal("an unchanged poll must not re-publish the config")
 		}
 		if takeLog(&buf) != "" {
 			t.Fatal("a quiet re-poll must not log")
 		}
+
+		// A byte-identical rewrite (fresh mtime) is still not a change: the
+		// gate is content, never file metadata.
+		if err := os.WriteFile(path, []byte(validConfig), 0o600); err != nil {
+			t.Fatalf("rewrite identical config: %v", err)
+		}
+		if store.poll(path, log) {
+			t.Fatal("a byte-identical rewrite must not signal a change")
+		}
+
+		// Edited content is a change and lands atomically.
 		if err := os.WriteFile(path, []byte(validConfig+"settings:\n  max_retries: 5\n"), 0o600); err != nil {
 			t.Fatalf("rewrite config: %v", err)
 		}
@@ -307,6 +323,42 @@ func TestDesiredStorePollLifecycle(t *testing.T) {
 		}
 		if out := takeLog(&buf); !strings.Contains(out, "desired state file invalid") {
 			t.Fatalf("a new condition must re-log: %q", out)
+		}
+	})
+
+	t.Run("good invalid good is one logical load", func(t *testing.T) {
+		// Distinct content from every earlier subtest, so this store's
+		// first observation of it is a genuine apply.
+		roundTrip := "relays:\n  - name: delta\n    provider: vercel\n    token: literal-secret\n"
+		path := writeConfig(t, roundTrip)
+		if !store.poll(path, log) {
+			t.Fatalf("setup poll failed: %q", takeLog(&buf))
+		}
+		applied := store.get()
+		takeLog(&buf)
+
+		if err := os.WriteFile(path, []byte("relays: [broken\n"), 0o600); err != nil {
+			t.Fatalf("break config: %v", err)
+		}
+		if store.poll(path, log) {
+			t.Fatal("an invalid file must not signal a change")
+		}
+		takeLog(&buf)
+
+		// Back to the byte-identical good content: the desired state never
+		// actually moved, so the return must not re-apply it either — the
+		// change gate only moves on a successful load.
+		if err := os.WriteFile(path, []byte(roundTrip), 0o600); err != nil {
+			t.Fatalf("restore config: %v", err)
+		}
+		if store.poll(path, log) {
+			t.Fatal("returning to the applied content must not signal a change")
+		}
+		if store.get() != applied {
+			t.Fatal("the applied configuration must be the original load")
+		}
+		if takeLog(&buf) != "" {
+			t.Fatal("an unchanged return must not log")
 		}
 	})
 }

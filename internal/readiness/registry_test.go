@@ -333,6 +333,70 @@ func TestRecoverMaxCapsBackoffWhenNothingServes(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsAppliesExistingRetryGates(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA, keyB})
+	genA := generationOf(t, r, keyA)
+	admit(t, r, keyB, "https://beta.example", "rk") // avoids the recover cap initially
+
+	// Build a two-failure gate under the original 1s base, then reload the
+	// settings. The existing gate must immediately recompute from LastAttempt:
+	// base 3s with a 3s ceiling, rather than retaining the old 2s deadline.
+	r.Failing(keyA, genA, ReasonUnreachable, time.Millisecond)
+	c.Advance(time.Second)
+	r.Failing(keyA, genA, ReasonUnreachable, time.Millisecond)
+	r.UpdateSettings(Settings{
+		BackoffBase: 3 * time.Second,
+		BackoffMax:  3 * time.Second,
+		RecoverMax:  time.Second,
+		PauseRetry:  2 * time.Second,
+		DemoteAfter: 2,
+	})
+	c.Advance(2 * time.Second)
+	if r.Allow(keyA) {
+		t.Fatal("reloaded BackoffBase/BackoffMax did not extend the existing gate")
+	}
+	c.Advance(time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("reloaded BackoffBase/BackoffMax did not release at the new deadline")
+	}
+
+	// A zero-ready failure uses the reloaded RecoverMax immediately.
+	r.Demote(keyB, generationOf(t, r, keyB), ReasonReplacing)
+	r.Failing(keyA, genA, ReasonUnreachable, time.Millisecond)
+	if r.Allow(keyA) {
+		t.Fatal("zero-ready retry was allowed immediately")
+	}
+	c.Advance(time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("reloaded RecoverMax did not cap the zero-ready gate")
+	}
+
+	// A newly paused relay follows the reloaded revival cadence.
+	r.Ready(keyA, genA, "https://alpha.example", "rk", time.Millisecond)
+	r.Pause(keyA, genA, ReasonPaused)
+	c.Advance(time.Second)
+	if r.Allow(keyA) {
+		t.Fatal("reloaded PauseRetry released a paused relay early")
+	}
+	c.Advance(time.Second)
+	if !r.Allow(keyA) {
+		t.Fatal("reloaded PauseRetry did not release a paused relay on time")
+	}
+
+	// DemoteAfter is read on the next verification result without a restart.
+	r.Ready(keyA, genA, "https://alpha.example", "rk", time.Millisecond)
+	r.Failing(keyA, genA, ReasonUnreachable, time.Millisecond)
+	if !r.IsReady(keyA) {
+		t.Fatal("reloaded DemoteAfter demoted before its second failure")
+	}
+	r.Failing(keyA, genA, ReasonUnreachable, time.Millisecond)
+	if r.IsReady(keyA) {
+		t.Fatal("reloaded DemoteAfter did not demote on its second failure")
+	}
+}
+
 func TestReadyAndDeployingResetTheGate(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
