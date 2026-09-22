@@ -65,8 +65,10 @@ const DefaultQuiesceTimeout = 30 * time.Second
 
 // Drainer is the gateway's per-identity in-flight view. A rollout or delete
 // must wait for an old incarnation's requests before touching its remote.
+// ctx ends the wait early: it carries the whole-process shutdown budget, so
+// a drain can never push shutdown past the grace.
 type Drainer interface {
-	AwaitIdle(provider, name string, timeout time.Duration) bool
+	AwaitIdle(ctx context.Context, provider, name string, timeout time.Duration) bool
 }
 
 // Config wires the worker to its collaborators. Every function is re-read
@@ -122,6 +124,16 @@ type Worker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// The shutdown budget and the drain tree. Stop publishes the budget so
+	// drains that start from then on clamp their wait to what remains of
+	// it, and cancels the drain tree at the budget's deadline so a wait
+	// already parked inside AwaitIdle — which cannot re-read the published
+	// deadline — still ends inside the budget.
+	budgetMu    sync.Mutex
+	budget      context.Context
+	drainCtx    context.Context
+	drainCancel context.CancelFunc
 }
 
 // Start launches the worker. It runs one pass immediately and returns.
@@ -134,6 +146,7 @@ func Start(cfg Config) *Worker {
 		settle = func() bool { return true }
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	drainCtx, drainCancel := context.WithCancel(context.Background())
 	locks := map[string]*sync.Mutex{}
 	for _, platform := range deploy.Platforms() {
 		locks[platform] = &sync.Mutex{}
@@ -151,6 +164,9 @@ func Start(cfg Config) *Worker {
 		ctx:           ctx,
 		cancel:        cancel,
 		done:          make(chan struct{}),
+		budget:        context.Background(),
+		drainCtx:      drainCtx,
+		drainCancel:   drainCancel,
 	}
 	go w.loop()
 	return w
@@ -165,12 +181,43 @@ func (w *Worker) Wake() {
 	}
 }
 
-// Stop cancels the worker and waits for the in-flight pass to unwind. A
-// deploy caught mid-flight is abandoned; every deploy is idempotent, so the
-// next start simply retries from discovery.
-func (w *Worker) Stop() {
+// Stop cancels the worker and waits for the in-flight pass to unwind,
+// bounded by ctx — the whole-process shutdown budget. A deploy caught
+// mid-flight is abandoned; every deploy is idempotent, so the next start
+// simply retries from discovery. A drain parked in AwaitIdle keeps waiting
+// inside the budget and is cancelled at its deadline, so the reconciler can
+// never push shutdown past the grace the orchestrator honors; if the pass
+// still has not unwound by then, the process exit closes whatever remains.
+func (w *Worker) Stop(ctx context.Context) {
+	w.budgetMu.Lock()
+	w.budget = ctx
+	w.budgetMu.Unlock()
 	w.cancel()
-	<-w.done
+	if dl, ok := ctx.Deadline(); ok {
+		time.AfterFunc(time.Until(dl), w.drainCancel)
+	}
+	select {
+	case <-w.done:
+	case <-ctx.Done():
+	}
+}
+
+// awaitIdle bounds one drain wait by the quiesce timeout and by whatever
+// remains of the shutdown budget Stop published — the whole drain, the
+// reconciler's share included, must fit inside the process's grace. The
+// wait itself runs on the drain tree, which Stop cancels at the budget's
+// deadline.
+func (w *Worker) awaitIdle(provider, name string) bool {
+	w.budgetMu.Lock()
+	budget := w.budget
+	w.budgetMu.Unlock()
+	timeout := w.cfg.QuiesceTimeout
+	if dl, ok := budget.Deadline(); ok {
+		if remain := time.Until(dl); remain < timeout {
+			timeout = remain
+		}
+	}
+	return w.drainer.AwaitIdle(w.drainCtx, provider, name, timeout)
 }
 
 // loop runs a pass at start, on every configuration change, and on the
@@ -286,6 +333,15 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 	}
 	project := deploy.ProjectName(rel.Name)
 	wasReady := w.reg.IsReady(key)
+	// A replacement an earlier pass deferred at the drain timeout keeps an
+	// incarnation-scoped marker; a pass that resumes it must settle and drain
+	// again before deploying. The marker — unlike the (state, reason) pair,
+	// which Failing and Pause rewrite between passes — survives that churn
+	// until the barrier completes or the incarnation changes.
+	drainPending := false
+	if rec, ok := w.reg.StateOf(key); ok {
+		drainPending = rec.DrainPending
+	}
 
 	w.reg.Enter(key, gen, readiness.StateDiscovering, "")
 	disc, err := client.Discover(w.ctx, project)
@@ -305,7 +361,7 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		// No deployment for this identity: a first bring-up, or the remote
 		// was deleted out-of-band. Either way the fix is a deploy.
 		w.reg.Enter(key, gen, readiness.StateDiscovered, readiness.ReasonMissing)
-		w.rollout(rel, key, gen, relayKey, client, project, wasReady)
+		w.rollout(rel, key, gen, relayKey, client, project, wasReady, drainPending)
 		return
 	}
 
@@ -321,7 +377,7 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		// Drift a deploy fixes: stale worker version, rejected relay key
 		// (rotate the key → every relay redeploys), or no worker behind the
 		// URL at all.
-		w.rollout(rel, key, gen, relayKey, client, project, wasReady)
+		w.rollout(rel, key, gen, relayKey, client, project, wasReady, drainPending)
 	case verifySuspended:
 		// The platform answers instead of the worker — a suspension page.
 		// No deploy lifts it: pause, and let the revival cadence re-probe.
@@ -339,10 +395,19 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 // rollout is Strategy A: demote, settle the pool swap, drain in-flight
 // requests — and only then deploy, because the platform switches the
 // production URL mid-deploy and an old admission left standing would serve
-// whatever lands on that URL next.
-func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady bool) {
+// whatever lands on that URL next. The settle+drain gate also covers a
+// replacement an earlier pass deferred at the drain timeout (the incarnation-
+// scoped drainPending marker): the retry pass re-runs both before deploying —
+// the same discipline the delete path applies on every retry.
+func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady, drainPending bool) {
+	// Gating the drain on wasReady alone skips it on the retry pass — the
+	// first pass already demoted the relay, so IsReady is false from there
+	// on — and the deploy would fire under the very straggler the ordering
+	// exists to protect.
 	if wasReady {
 		w.reg.Demote(key, gen, readiness.ReasonReplacing)
+	}
+	if wasReady || drainPending {
 		if !w.settle() {
 			// The process is shutting down and the applier will never
 			// satisfy the barrier. The demotion stands; the replacement is
@@ -350,16 +415,22 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 			w.logWarn("rollout: shutting down at the settle barrier; replacement deferred", key)
 			return
 		}
-		if !w.drainer.AwaitIdle(key.Provider, key.Name, w.cfg.QuiesceTimeout) {
+		if !w.awaitIdle(key.Provider, key.Name) {
 			// A straggler request still streams through the old incarnation;
 			// deploying now would cut its upstream mid-flight. The relay
 			// stays demoted (its URL is about to change — serving it would
 			// be the exact race this design removes) and the next pass
-			// retries the drain.
+			// retries the drain. The marker carries the deferral across
+			// any Failing/Pause relabeling in between.
 			w.reg.Enter(key, gen, readiness.StateUnready, readiness.ReasonReplacing)
+			w.reg.DeferDrain(key, gen)
 			w.logWarn("rollout: in-flight drain timed out; replacement deferred to the next pass", key)
 			return
 		}
+		// The barrier passed and the old incarnation is quiet. Deploy
+		// retries from here no longer re-drain: admission stays revoked, so
+		// in-flight traffic can only shrink.
+		w.reg.DrainCompleted(key, gen)
 	}
 	w.reg.Enter(key, gen, readiness.StateDeploying, "")
 	mu := w.platformLocks[rel.Provider]
@@ -381,6 +452,17 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 		return
 	}
 	v := w.verify(result.URL, relayKey)
+	if v.kind == verifySuspended {
+		// The deploy switched the production URL and the platform suspended
+		// the project behind it (a re-suspension during a catch-up deploy of
+		// a previously paused relay). No deploy lifts a suspension — pause on
+		// the revival cadence; a demotion would label it failed with the
+		// ordinary backoff armed, re-probing a suspended platform every few
+		// seconds instead.
+		w.reg.Pause(key, gen, readiness.ReasonPaused)
+		w.logWarn("rollout: new worker answered with a suspension page; paused on the revival cadence", key)
+		return
+	}
 	if v.kind != verifyOK {
 		// The platform switched the production URL and the new worker cannot
 		// be trusted. The old worker no longer exists behind that URL, so
@@ -430,7 +512,7 @@ func (w *Worker) runDeletes() {
 				Msg("delete: shutting down at the settle barrier; retry belongs to the next process")
 			return
 		}
-		if !w.drainer.AwaitIdle(key.Provider, key.Name, w.cfg.QuiesceTimeout) {
+		if !w.awaitIdle(key.Provider, key.Name) {
 			w.reg.DeleteFailed(key, gen, "in-flight requests still draining")
 			return
 		}

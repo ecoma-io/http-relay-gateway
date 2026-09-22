@@ -12,6 +12,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -164,11 +165,14 @@ func (g *Gateway) Swap(st *State) {
 }
 
 // AwaitIdle blocks until the relay identity (provider, name) carries no
-// in-flight request, or the timeout expires. The replacement rollout calls
-// it after demotion and the pool swap, before the new deploy may cut over:
-// serving traffic must have drained from the old incarnation first. It
-// reports whether the drain completed.
-func (g *Gateway) AwaitIdle(provider, name string, timeout time.Duration) bool {
+// in-flight request, the timeout expires, or ctx ends — whichever comes
+// first. The replacement rollout calls it after demotion and the pool swap,
+// before the new deploy may cut over: serving traffic must have drained from
+// the old incarnation first. ctx is the whole-process shutdown budget: its
+// end must terminate the wait even while the timer still has time left, so
+// a stalled stream can never push shutdown past the grace. It reports
+// whether the drain completed.
+func (g *Gateway) AwaitIdle(ctx context.Context, provider, name string, timeout time.Duration) bool {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
@@ -183,6 +187,8 @@ func (g *Gateway) AwaitIdle(provider, name string, timeout time.Duration) bool {
 			// this can only be a straggler finishing, not new traffic).
 			continue
 		case <-deadline.C:
+			return false
+		case <-ctx.Done():
 			return false
 		}
 	}

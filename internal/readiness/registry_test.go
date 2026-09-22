@@ -485,6 +485,47 @@ func TestFailingKeepsPausedRelaysPaused(t *testing.T) {
 	}
 }
 
+// A sync pass runs Enter(discovering) before every probe — including the
+// revival probe of a suspended relay. Routine progress must not clobber the
+// pause marker, or a transport blip during revival finds the relay
+// mid-discover, Failing labels it failed, and the ordinary backoff erodes
+// the revival cadence. Definitive transitions (a deploy) still leave the
+// pause.
+func TestEnterKeepsPausedRelaysPausedThroughRoutineProgress(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+	r.Pause(keyA, gen, ReasonPaused)
+
+	r.Enter(keyA, gen, StateDiscovering, "")
+	r.Enter(keyA, gen, StateVerifying, "")
+	if rec, _ := r.StateOf(keyA); rec.State != StatePaused {
+		t.Fatalf("state = %s after routine progress, want paused", rec.State)
+	}
+
+	// The blip: with the marker intact, Failing keeps the paused label and
+	// the PauseRetry gate instead of the ordinary backoff.
+	r.Failing(keyA, gen, ReasonUnreachable, 0)
+	if rec, _ := r.StateOf(keyA); rec.State != StatePaused {
+		t.Fatalf("state = %s after a blip during revival, want paused", rec.State)
+	}
+	c.Advance(2 * time.Minute) // past every ordinary backoff ceiling here (4s)
+	if r.Allow(keyA) {
+		t.Fatal("routine progress eroded the paused revival gate into the ordinary backoff")
+	}
+	c.Advance(8 * time.Minute)
+	if !r.Allow(keyA) {
+		t.Fatal("pause gate did not release at the revival cadence")
+	}
+
+	// A deploy is definitive: it takes the relay out of the pause.
+	r.Enter(keyA, gen, StateDeploying, "")
+	if rec, _ := r.StateOf(keyA); rec.State != StateDeploying {
+		t.Fatalf("state = %s after Enter(deploying), want deploying", rec.State)
+	}
+}
+
 func TestDeleteLifecycleGuardsAndPurge(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
@@ -784,5 +825,58 @@ func TestPausedRelayKeepsItsRevivalGateThroughOrdinaryFailures(t *testing.T) {
 	c.Advance(10 * time.Minute) // past the PauseRetry cadence
 	if !r.Allow(keyA) {
 		t.Fatal("pause gate did not release at the PauseRetry cadence")
+	}
+}
+
+func TestDrainPendingMarkerSurvivesChurnAndClearsAtTheBarrier(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+
+	r.DeferDrain(keyA, gen)
+	if rec, _ := r.StateOf(keyA); !rec.DrainPending {
+		t.Fatal("DeferDrain did not mark the record")
+	}
+
+	// Phase and reason churn between passes must not erase the marker: a
+	// Failing refreshes the reason, a Pause replaces the phase, and the
+	// resumed pass always re-enters discovering first.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	r.Pause(keyA, gen, ReasonPaused)
+	r.Enter(keyA, gen, StateDiscovering, "")
+	if rec, _ := r.StateOf(keyA); !rec.DrainPending {
+		t.Fatal("reason/phase churn erased the deferred-drain marker")
+	}
+
+	// Stale completions are discarded like every other transition.
+	r.DrainCompleted(keyA, gen+1)
+	if rec, _ := r.StateOf(keyA); !rec.DrainPending {
+		t.Fatal("a stale generation cleared the deferred-drain marker")
+	}
+
+	// The barrier completing clears it — and so does re-admission, which
+	// ends the deferral outright.
+	r.DrainCompleted(keyA, gen)
+	if rec, _ := r.StateOf(keyA); rec.DrainPending {
+		t.Fatal("the barrier completion must clear the marker")
+	}
+	r.DeferDrain(keyA, gen)
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	if rec, _ := r.StateOf(keyA); rec.DrainPending {
+		t.Fatal("Ready must clear the deferred-drain marker")
+	}
+
+	// A new incarnation starts clean: the marker never leaks across a
+	// removal or a re-add.
+	r.DeferDrain(keyA, gen)
+	r.Sync(nil)
+	r.Sync([]Key{keyA})
+	rec, ok := r.StateOf(keyA)
+	if !ok || rec.DrainPending {
+		t.Fatal("the marker leaked across an incarnation change")
+	}
+	if rec.Generation != gen+2 {
+		t.Fatalf("generation = %d, want %d (removal + re-add)", rec.Generation, gen+2)
 	}
 }

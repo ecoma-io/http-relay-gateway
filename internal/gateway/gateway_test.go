@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -980,7 +981,7 @@ func TestAwaitIdleExactness(t *testing.T) {
 	})
 
 	idle := make(chan bool, 1)
-	go func() { idle <- g.AwaitIdle("vercel", "a", 5*time.Second) }()
+	go func() { idle <- g.AwaitIdle(context.Background(), "vercel", "a", 5*time.Second) }()
 	select {
 	case v := <-idle:
 		t.Fatalf("AwaitIdle returned %v while the old-pool request was still in flight", v)
@@ -1005,7 +1006,7 @@ func TestAwaitIdleExactness(t *testing.T) {
 	}
 
 	// An identity the gateway never tracked is idle by definition.
-	if !g.AwaitIdle("deno", "nope", time.Millisecond) {
+	if !g.AwaitIdle(context.Background(), "deno", "nope", time.Millisecond) {
 		t.Fatal("unknown identity must report idle immediately")
 	}
 
@@ -1044,7 +1045,7 @@ func TestAwaitIdleExactness(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("second request never reached the upstream")
 	}
-	if g.AwaitIdle("cloudflare", "b", 20*time.Millisecond) {
+	if g.AwaitIdle(context.Background(), "cloudflare", "b", 20*time.Millisecond) {
 		t.Fatal("AwaitIdle must report false when the timeout expires in flight")
 	}
 	close(gate2)
@@ -1056,8 +1057,80 @@ func TestAwaitIdleExactness(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("second request never completed")
 	}
-	if !g.AwaitIdle("cloudflare", "b", 2*time.Second) {
+	if !g.AwaitIdle(context.Background(), "cloudflare", "b", 2*time.Second) {
 		t.Fatal("identity must be idle after its request drained")
+	}
+}
+
+// TestAwaitIdleStopsWhenTheContextEnds pins the shutdown half of the drain
+// contract: the whole-process grace budget ends the wait even while the
+// quiesce timer still has time left — a stalled stream must never push
+// shutdown past the grace.
+func TestAwaitIdleStopsWhenTheContextEnds(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-gate // the straggler: a stream that never finishes on its own
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(up.Close)
+
+	g := newGateway(t, &State{
+		Pool: buildPool(t, []relaySpec{
+			{name: "a", provider: "vercel", rawURL: up.URL, maxBody: bufferBytes()},
+		}),
+		MaxRetries:     0,
+		MaxBufferBytes: bufferBytes(),
+	})
+	gwSrv := httptest.NewServer(g)
+	t.Cleanup(gwSrv.Close)
+
+	req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set(HeaderProvider, "vercel")
+	done := make(chan error, 1)
+	go func() {
+		resp, doErr := gwSrv.Client().Do(req)
+		if doErr == nil {
+			_ = resp.Body.Close()
+		}
+		done <- doErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request never reached the upstream")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	idle := make(chan bool, 1)
+	go func() { idle <- g.AwaitIdle(ctx, "vercel", "a", 30*time.Second) }()
+	select {
+	case v := <-idle:
+		t.Fatalf("AwaitIdle returned %v while the straggler was still in flight", v)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel() // the shutdown budget expires
+	select {
+	case v := <-idle:
+		if v {
+			t.Fatal("a context that ended mid-drain must report the drain incomplete")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AwaitIdle did not return when the context ended (timer-only wait)")
+	}
+	close(gate) // let the request finish and the test goroutines unwind
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("straggler request failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("straggler request never completed after release")
 	}
 }
 
@@ -1115,7 +1188,7 @@ func TestPostSwapPickServesFromTheCurrentGeneration(t *testing.T) {
 
 	// The replacement's drain concludes immediately: the parked request has
 	// not begun on the old generation, so nothing is holding it.
-	if !g.AwaitIdle("vercel", "a", 500*time.Millisecond) {
+	if !g.AwaitIdle(context.Background(), "vercel", "a", 500*time.Millisecond) {
 		t.Fatal("AwaitIdle blocked on a request that never picked from the old generation")
 	}
 

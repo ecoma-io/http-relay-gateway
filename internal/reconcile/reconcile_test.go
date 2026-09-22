@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -260,6 +261,115 @@ func TestPassSuspensionPausesThenRevives(t *testing.T) {
 	}
 }
 
+// A transport blip during the revival probe must not erode the pause: the
+// relay keeps the paused label and its own revival cadence (10m here)
+// instead of falling into the ordinary verification backoff (base 1s,
+// recover ceiling 15s) — which would re-probe a suspended platform every
+// few seconds until the next 402 re-pauses it.
+func TestPassTransportBlipDuringRevivalKeepsThePauseCadence(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	client := rig.newPrimaryClient(true)
+	rig.sim.setSuspend(true)
+
+	rig.worker.pass() // the platform answers instead of the worker: pause
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+
+	// At the revival tick the platform blips on transport instead of
+	// answering: the relay must stay paused, not become an ordinary failure.
+	rig.clock.Advance(10 * time.Minute)
+	rig.factory.mu.Lock()
+	client.discoverErr = errors.New("transport blip")
+	rig.factory.mu.Unlock()
+	rig.worker.pass()
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StatePaused {
+		t.Fatalf("state after a transport blip during revival = %s, want paused", rec.State)
+	}
+
+	// The cadence pin: ordinary backoff would probe again within two
+	// minutes; a paused relay must not probe until the next revival tick.
+	probes := rig.factory.forCount()
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.forCount(); got != probes {
+		t.Fatalf("factory calls = %d after %d (the pause cadence eroded into the ordinary backoff)", got, probes)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want still paused", rec.State)
+	}
+
+	// Past the full revival cadence the relay re-probes and rejoins.
+	rig.factory.mu.Lock()
+	client.discoverErr = nil
+	rig.factory.mu.Unlock()
+	rig.sim.setSuspend(false)
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.clock.Advance(8 * time.Minute)
+	rig.worker.pass()
+	if !rig.reg.IsReady(key) {
+		t.Fatal("revived relay not re-admitted after the blip")
+	}
+}
+
+// A catch-up deploy of a previously paused relay can land on a platform
+// that re-suspends the project behind the URL it just switched. The
+// suspension must pause on the revival cadence — not demote into the
+// ordinary backoff, and never fire another deploy at the suspension.
+func TestRolloutResuspensionPausesOnTheRevivalCadence(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready on the first pass")
+	}
+
+	// The platform suspends the relay.
+	rig.sim.setSuspend(true)
+	rig.worker.pass()
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+
+	// The revival tick: the suspension lifted but the worker went stale, so
+	// a catch-up deploy runs — and the platform re-suspends behind it.
+	rig.clock.Advance(10 * time.Minute)
+	rig.sim.setSuspend(false)
+	rig.sim.setVersion("0.0.1-stale")
+	rig.factory.mu.Lock()
+	client.fixSim = false // the deploy does not heal the sim
+	client.postDeploy = func() { rig.sim.setSuspend(true) }
+	rig.factory.mu.Unlock()
+	rig.worker.pass()
+
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 catch-up deploy", got)
+	}
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StatePaused || rec.Reason != readiness.ReasonPaused {
+		t.Fatalf("state/reason = %s/%s, want paused/paused (a suspension is never a demotion)", rec.State, rec.Reason)
+	}
+	if rig.reg.IsReady(key) {
+		t.Fatal("suspended relay admitted")
+	}
+
+	// The revival cadence holds: the ordinary backoff (≤15s at zero ready)
+	// would re-probe within two minutes; a paused relay must not.
+	probes := rig.factory.forCount()
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.forCount(); got != probes {
+		t.Fatalf("factory calls = %d after %d (a re-suspended relay must keep the revival cadence)", got, probes)
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want still 1 (no deploy is ever fired at a suspension)", got)
+	}
+}
+
 // --- credential problems ---
 
 func TestPassCredentialRejectionNeverDeploys(t *testing.T) {
@@ -416,15 +526,162 @@ func TestStrategyADrainTimeoutDefersReplacement(t *testing.T) {
 	if rig.reg.IsReady(key) {
 		t.Fatal("a demoted relay with a pending replacement must not serve")
 	}
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d, want 1 on the deferring pass", got)
+	}
 
-	// The stream ends; the backoff gate must not hot-loop, but the next pass
-	// after it elapses completes the replacement.
+	// The stream still lives past the backoff gate: the retry pass must
+	// settle and drain AGAIN before any deploy — deploying under the
+	// straggler is exactly the race the ordering exists to remove.
 	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (the retry pass must not deploy under a live stream)", got)
+	}
+	if got := len(rig.drainer.calls); got != 2 {
+		t.Fatalf("drains = %d across the passes, want 2 (a resumed replacement re-drains)", got)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want still unready/replacing after the second deferral", rec.State, rec.Reason)
+	}
+
+	// The stream ends; the next pass completes the replacement behind a
+	// third drain, and the deploy follows it.
 	rig.drainer.setIdle(true)
 	rig.worker.pass()
-
+	if got := len(rig.drainer.calls); got != 3 {
+		t.Fatalf("drains = %d, want 3 across the passes", got)
+	}
 	if got := rig.factory.deployCount(); got != 1 {
-		t.Fatalf("deploys = %d, want 1 on the retried pass", got)
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("deferred replacement not completed")
+	}
+	events := rig.log.all()
+	lastDrain, deployAt := -1, -1
+	for i, e := range events {
+		if len(e) > 5 && e[:5] == "drain" {
+			lastDrain = i
+		}
+		if e == "deploy" && deployAt < 0 {
+			deployAt = i
+		}
+	}
+	if lastDrain < 0 || deployAt < 0 || lastDrain > deployAt {
+		t.Fatalf("the completing pass deployed before its drain: %v", events)
+	}
+}
+
+func TestStrategyADeferralSurvivesAFailingBetweenPasses(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+
+	// A replacement defers at the drain timeout: the straggler keeps
+	// streaming and the relay sits demoted, replacement deferred.
+	rig.sim.setVersion("0.0.1-stale")
+	rig.drainer.setIdle(false)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d, want 1 on the deferring pass", got)
+	}
+
+	// Between the passes the probe transport-fails: Failing keeps the
+	// unready phase but overwrites the reason. The deferral must not ride
+	// on that (state, reason) pair.
+	client.url = rig.server.URL + "-closed"
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	rec, _ := rig.reg.StateOf(key)
+	if rec.Reason != readiness.ReasonUnreachable {
+		t.Fatalf("reason = %q, want %q (the blip must actually churn the reason)", rec.Reason, readiness.ReasonUnreachable)
+	}
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d after the blip pass, want 1 (no rollout ran)", got)
+	}
+
+	// The retry pass must still settle and drain again before any deploy.
+	client.url = rig.server.URL
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a churned reason must not drop the drain barrier)", got)
+	}
+	if got := len(rig.drainer.calls); got != 2 {
+		t.Fatalf("drains = %d, want 2 (the resumed replacement re-drains)", got)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing after the retry deferral", rec.State, rec.Reason)
+	}
+
+	// The stream ends and the replacement completes behind a third drain.
+	rig.drainer.setIdle(true)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 3 {
+		t.Fatalf("drains = %d, want 3 across the passes", got)
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("deferred replacement not completed")
+	}
+}
+
+func TestStrategyADeferralSurvivesAPauseBetweenPasses(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+
+	// A replacement defers at the drain timeout.
+	rig.sim.setVersion("0.0.1-stale")
+	rig.drainer.setIdle(false)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d, want 1 on the deferring pass", got)
+	}
+
+	// The platform suspends the relay while the replacement waits: the next
+	// pass pauses it — no deploy is ever fired at a suspension.
+	rig.sim.setSuspend(true)
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 at a suspension", got)
+	}
+
+	// The suspension lifts but the worker is still stale: the revival
+	// queues the catch-up replacement, and it must still drain before
+	// deploying — the pause replaced the phase the deferral sat in.
+	rig.sim.setSuspend(false)
+	rig.clock.Advance(10*time.Minute + time.Second) // past the PauseRetry cadence
+	rig.worker.pass()
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a pause must not drop the drain barrier)", got)
+	}
+	if got := len(rig.drainer.calls); got != 2 {
+		t.Fatalf("drains = %d, want 2 (the resumed replacement re-drains)", got)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing after the revival deferral", rec.State, rec.Reason)
+	}
+
+	// The stream ends and the replacement completes behind a third drain.
+	rig.drainer.setIdle(true)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 3 {
+		t.Fatalf("drains = %d, want 3 across the passes", got)
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
 	}
 	if !rig.reg.IsReady(key) {
 		t.Fatal("deferred replacement not completed")
@@ -786,6 +1043,81 @@ func TestVerifyClassifiesProbeAnswers(t *testing.T) {
 }
 
 // --- shutdown at the settle barrier ---
+
+// --- shutdown inside the grace budget ---
+
+// A rollout parked in the in-flight drain behind a stalled stream must
+// unwind inside the budget handed to Stop — not the full QuiesceTimeout on
+// top of it. Stop publishes the budget, and cancels the drain tree at the
+// budget's deadline so a wait already parked inside AwaitIdle (which cannot
+// re-read the published deadline) still ends inside the budget.
+func TestStopBoundsTheInFlightDrainToTheBudget(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before the replacement")
+	}
+
+	// Version drift parks the replacement in the drain behind a stream that
+	// never ends on its own.
+	rig.sim.setVersion("0.0.1-stale")
+	parked := &budgetDrainer{entered: make(chan struct{})}
+	rig.worker.drainer = parked
+	passDone := make(chan struct{})
+	go func() {
+		defer close(passDone)
+		rig.worker.pass()
+	}()
+	<-parked.entered
+
+	budget := 250 * time.Millisecond // far below the rig's 5s quiesce timeout
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	started := time.Now()
+	rig.worker.Stop(ctx)
+	took := time.Since(started)
+	if took > 2*time.Second {
+		t.Fatalf("Stop took %s with a %s budget — the parked drain ran on its own timer, not the budget", took, budget)
+	}
+	select {
+	case <-passDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the parked pass did not unwind after the budget expired")
+	}
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a shutting-down process never deploys)", got)
+	}
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing (the replacement defers to the next process)", rec.State, rec.Reason)
+	}
+}
+
+// A drain that starts after Stop published the budget clamps its wait to
+// whatever remains of it — the quiesce timeout may never exceed the
+// whole-process grace.
+func TestAwaitIdleClampsToTheRemainingBudget(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	rig.worker.budgetMu.Lock()
+	rig.worker.budget = ctx
+	rig.worker.budgetMu.Unlock()
+
+	rig.drainer.setIdle(true)
+	if !rig.worker.awaitIdle("vercel", "edge-a") {
+		t.Fatal("an idle identity must report drained regardless of the budget")
+	}
+	got := rig.drainer.timeouts[len(rig.drainer.timeouts)-1]
+	if got > 100*time.Millisecond {
+		t.Fatalf("drain timeout = %s, want it clamped to the remaining budget", got)
+	}
+}
 
 // A process that receives its shutdown signal mid-rollout cannot wait on the
 // settle barrier: the applier loop has left its select and the barrier will

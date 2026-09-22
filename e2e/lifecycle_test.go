@@ -118,6 +118,67 @@ func TestE2E_ReplacementRolloutStrategyA(t *testing.T) {
 	}
 }
 
+// TestE2E_ShutdownDrainStaysInsideTheGraceBudget: a SIGTERM that lands
+// while a replacement is parked in the in-flight drain must unwind inside
+// the single SHUTDOWN_GRACE budget (5s in this harness) — the reconciler's
+// drain may not add its own 30s quiesce window on top before the HTTP drain
+// even starts, or the orchestrator's kill timer closes the straggler
+// anyway.
+func TestE2E_ShutdownDrainStaysInsideTheGraceBudget(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, vt := freshIdentity("drain")
+	fake.setToken("vercel", vt)
+
+	g := startGateway(t, fake, gwOptions{
+		config:   configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
+	})
+	g.waitForReady(t, 20*time.Second)
+	sim := fake.project("v-rel").sim
+
+	// One request held inside the worker sim: the straggler the rollout's
+	// drain waits for. It never finishes on its own — process exit closes it.
+	releaseHold := sim.blockMarker("hold")
+	inflight := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, g.base+"/", bytes.NewReader([]byte("held")))
+		if err != nil {
+			inflight <- err
+			return
+		}
+		req.Header.Set("X-Relay-Target", echo.base)
+		req.Header.Set("X-Relay-Path", "/held")
+		req.Header.Set("X-Marker", "hold")
+		resp, err := relayClient.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		inflight <- err
+	}()
+	waitFor(t, 10*time.Second, "the held request to reach the relay", func() bool {
+		return sim.markerSeen("hold")
+	})
+
+	// Version drift parks the replacement in the drain behind the held
+	// request (verify_interval is 1s in the e2e settings).
+	sim.setMode(simStale)
+	g.waitForLifecycle(t, "vercel", "v-rel", "unready", "replacing", 15*time.Second)
+
+	started := time.Now()
+	g.exitOK(10 * time.Second) // SHUTDOWN_GRACE is 5s in this harness
+	if took := time.Since(started); took > 9*time.Second {
+		t.Fatalf("shutdown took %s with a 5s grace — the reconciler drain ran on its own budget", took)
+	}
+	if n := fake.deployCount("v-rel"); n != 1 {
+		t.Fatalf("deploys = %d, want 1 (a shutting-down process never deploys under the straggler)", n)
+	}
+
+	releaseHold()
+	<-inflight
+}
+
 // TestE2E_RemoveReAddWhileDeleteInFlight: removing a relay deletes its
 // remote project; re-adding the same identity while that delete is still
 // in flight waits for it (no concurrent deploy against a dying project)
