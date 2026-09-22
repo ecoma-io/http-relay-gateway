@@ -496,7 +496,10 @@ chmod 600 relay.env
 ```
 
 The file is optional — compose treats it as such — because a fleet whose
-relays all use `token_file:` secrets needs none of these variables.
+relays all use `token_file:` secrets needs none of these variables. (The
+optional form, `env_file` with `required: false`, needs Docker Compose
+v2.24 or newer; on an older compose use `env_file: relay.env` and create
+the file — empty is fine.)
 
 ## Layout
 
