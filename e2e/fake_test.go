@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -62,7 +63,8 @@ type fakeProject struct {
 	provider   string
 	slug       string
 	exists     bool
-	rootRoutes bool // vercel only: a deployment shipped the root rewrite
+	rootRoutes bool                  // vercel only: a deployment shipped the root rewrite
+	envs       map[string]fakeEnvVar // vercel only: the project env the worker reads
 	sim        *simState
 	deploys    []deployRecord
 	deletes    []time.Time
@@ -70,6 +72,17 @@ type fakeProject struct {
 
 	gate     chan struct{} // non-nil: the next deploy blocks until closed
 	deleteOp chan struct{} // non-nil: the next delete blocks until closed
+}
+
+// fakeEnvVar is one Vercel project environment variable. Value never rides
+// an answer — the real API returns encrypted values redacted, and nothing
+// here ever asks for them back.
+type fakeEnvVar struct {
+	ID     string   `json:"id"`
+	Key    string   `json:"key"`
+	Target []string `json:"target"`
+	Type   string   `json:"type"`
+	Value  string   `json:"-"`
 }
 
 func newFakeEdge(t *testing.T) *fakeEdge {
@@ -114,7 +127,8 @@ func (f *fakeEdge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// worker's unauthenticated version route.
 		writeJSON(w, http.StatusOK, map[string]string{"version": "self-forward-upstream"})
 		return
-	case strings.HasPrefix(path, "/v9/projects/"), strings.HasPrefix(path, "/v13/deployments"):
+	case strings.HasPrefix(path, "/v9/projects/"), strings.HasPrefix(path, "/v10/projects/"),
+		strings.HasPrefix(path, "/v11/projects"), strings.HasPrefix(path, "/v13/deployments"):
 		f.serveVercel(w, r)
 	case path == "/accounts" || strings.HasPrefix(path, "/accounts/"):
 		f.serveCloudflare(w, r)
@@ -304,6 +318,13 @@ func (f *fakeEdge) secretMarkers() []string {
 		}
 	}
 	for _, p := range f.projects {
+		for _, e := range p.envs {
+			// RELAY_VERSION is public — /stats reports it by design; every
+			// other env value (the relay key) is a secret.
+			if e.Value != "" && e.Key != "RELAY_VERSION" {
+				out = append(out, e.Value)
+			}
+		}
 		for _, d := range p.deploys {
 			out = append(out, d.Token)
 		}
@@ -332,13 +353,17 @@ type vercelPayloadFile struct {
 	Encoding string `json:"encoding"`
 }
 
+// vercelPayload enumerates every field of the v13 deployment request the
+// client may send. The fake decodes it strictly — any field outside the
+// documented v13 schema, like the old client's env and
+// deploymentProtection, is a 400, the schema rejection the real API makes.
 type vercelPayload struct {
-	Name  string              `json:"name"`
-	Files []vercelPayloadFile `json:"files"`
-	Env   []struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
-	} `json:"env"`
+	Name            string              `json:"name"`
+	Target          string              `json:"target"`
+	Files           []vercelPayloadFile `json:"files"`
+	ProjectSettings *struct {
+		Framework any `json:"framework"`
+	} `json:"projectSettings"`
 }
 
 // vercelRewrites is the vercel.json content as the fake decodes it.
@@ -390,6 +415,96 @@ func (p *vercelPayload) workerSource() string {
 func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
+	case r.Method == http.MethodPost && path == "/v11/projects":
+		if !f.authorized(w, r, "vercel") {
+			return
+		}
+		var body struct {
+			Name      string `json:"name"`
+			Framework any    `json:"framework"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+		f.record("vercel", "create-project", body.Name, r)
+		f.mu.Lock()
+		p := f.projects[body.Name]
+		if p == nil {
+			p = &fakeProject{provider: "vercel", slug: body.Name, sim: newSim(body.Name, simOK)}
+			f.projects[body.Name] = p
+		}
+		p.exists = true
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"id": "prj-" + body.Name, "name": body.Name})
+
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) &&
+		strings.HasPrefix(path, "/v10/projects/") && strings.HasSuffix(path, "/env"):
+		slug := strings.TrimSuffix(strings.TrimPrefix(path, "/v10/projects/"), "/env")
+		if !f.authorized(w, r, "vercel") {
+			return
+		}
+		p := f.lookup("vercel", slug)
+		if p == nil || !p.exists {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "NOT_FOUND"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			f.record("vercel", "env-list", slug, r)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"envs":       p.envList(f),
+				"pagination": map[string]any{"count": len(p.envList(f))},
+			})
+			return
+		}
+		var body struct {
+			Key    string   `json:"key"`
+			Value  string   `json:"value"`
+			Type   string   `json:"type"`
+			Target []string `json:"target"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || body.Key == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "BAD_REQUEST"})
+			return
+		}
+		f.record("vercel", "env-create", slug, r)
+		id, conflict := p.setEnv(f, body.Key, body.Value, body.Type, body.Target)
+		if conflict {
+			// The documented conflict answer: an existing key cannot be
+			// created again.
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "already exists"})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"created": map[string]any{"id": id, "key": body.Key, "type": body.Type, "target": body.Target},
+			"failed":  []any{},
+		})
+
+	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/v9/projects/") && strings.Contains(path, "/env/"):
+		rest := strings.TrimPrefix(path, "/v9/projects/")
+		i := strings.LastIndex(rest, "/env/")
+		slug, id := rest[:i], rest[i+len("/env/"):]
+		if !f.authorized(w, r, "vercel") {
+			return
+		}
+		p := f.lookup("vercel", slug)
+		if p == nil || !p.exists {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "NOT_FOUND"})
+			return
+		}
+		var body struct {
+			Value  string   `json:"value"`
+			Type   string   `json:"type"`
+			Target []string `json:"target"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "BAD_REQUEST"})
+			return
+		}
+		f.record("vercel", "env-update", slug, r)
+		if !p.updateEnv(f, id, body.Value, body.Target) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "NOT_FOUND"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "type": body.Type, "target": body.Target})
+
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v9/projects/"):
 		slug := strings.Trim(strings.TrimPrefix(path, "/v9/projects/"), "/")
 		if !f.authorized(w, r, "vercel") {
@@ -408,24 +523,19 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 		}
 		raw, _ := io.ReadAll(io.LimitReader(r.Body, 32<<20))
 		var payload vercelPayload
-		if err := json.Unmarshal(raw, &payload); err != nil || payload.Name == "" {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&payload); err != nil || payload.Name == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "BAD_REQUEST"})
 			return
 		}
-		var version, token string
-		for _, e := range payload.Env {
-			switch e.Key {
-			case "RELAY_VERSION":
-				version = e.Value
-			case "RELAY_AUTH_TOKEN":
-				token = e.Value
-			}
-		}
 		f.record("vercel", "deploy", payload.Name, r)
 		p := f.waitGate("vercel", payload.Name)
-		// rootRoutes records whether the deployment shipped the vercel.json
-		// rewrite: without it the worker answers only at /api/relay and
-		// every root probe dies on Vercel's 404.
+		// The worker's environment is whatever the project env held when
+		// the deployment was created: the values arrive through the env
+		// endpoints, never through the deployment payload.
+		version := p.envValue(f, "RELAY_VERSION")
+		token := p.envValue(f, "RELAY_AUTH_TOKEN")
 		f.completeDeploy(p, version, token, payload.workerSource(), payload.routesRoot())
 		writeJSON(w, http.StatusOK, map[string]any{"id": "dpl-" + slugHash(payload.Name), "readyState": "READY"})
 
@@ -441,6 +551,62 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no vercel route"})
 	}
+}
+
+// envList snapshots the project's environment variables for a list answer.
+func (p *fakeProject) envList(f *fakeEdge) []fakeEnvVar {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keys := make([]string, 0, len(p.envs))
+	for key := range p.envs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]fakeEnvVar, 0, len(keys))
+	for _, key := range keys {
+		e := p.envs[key]
+		out = append(out, fakeEnvVar{ID: e.ID, Key: e.Key, Target: e.Target, Type: e.Type})
+	}
+	return out
+}
+
+// setEnv creates one variable, reporting the conflict the real API answers
+// with 403 when the key already exists.
+func (p *fakeProject) setEnv(f *fakeEdge, key, value, typ string, target []string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := p.envs[key]; ok {
+		return "", true
+	}
+	if p.envs == nil {
+		p.envs = map[string]fakeEnvVar{}
+	}
+	id := "env-" + slugHash(p.slug+"-"+key)
+	p.envs[key] = fakeEnvVar{ID: id, Key: key, Value: value, Type: typ, Target: target}
+	return id, false
+}
+
+// updateEnv rewrites one variable by id; false means the id is unknown.
+func (p *fakeProject) updateEnv(f *fakeEdge, id, value string, target []string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for key, e := range p.envs {
+		if e.ID != id {
+			continue
+		}
+		e.Value, e.Target = value, target
+		p.envs[key] = e
+		return true
+	}
+	return false
+}
+
+// envValue returns one variable's current value — what a new deployment
+// hands its worker.
+func (p *fakeProject) envValue(f *fakeEdge, key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return p.envs[key].Value
 }
 
 // --- cloudflare API ---

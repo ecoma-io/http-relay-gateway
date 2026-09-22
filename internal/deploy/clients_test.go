@@ -12,6 +12,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +86,18 @@ func (f *fakeAPI) recorded() []fakeCall {
 	return append([]fakeCall(nil), f.calls...)
 }
 
+// lastBody returns the body of the request currently being routed — the
+// recorder stores it before the route function runs, and r.Body is drained
+// by then.
+func (f *fakeAPI) lastBody() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.calls) == 0 {
+		return nil
+	}
+	return f.calls[len(f.calls)-1].Body
+}
+
 func (f *fakeAPI) signal() {
 	select {
 	case f.gate <- struct{}{}:
@@ -94,21 +108,27 @@ func (f *fakeAPI) signal() {
 // callFor finds the one recorded call for (method, path) or fails the test.
 func (f *fakeAPI) callFor(t *testing.T, method, path string) fakeCall {
 	t.Helper()
+	calls := f.callsFor(t, method, path)
+	if len(calls) != 1 {
+		t.Fatalf("%d recorded %s %s calls, want 1", len(calls), method, path)
+	}
+	return calls[0]
+}
+
+// callsFor returns every recorded call for (method, path) and fails when
+// there is none.
+func (f *fakeAPI) callsFor(t *testing.T, method, path string) []fakeCall {
+	t.Helper()
 	var found []fakeCall
 	for _, c := range f.recorded() {
 		if c.Method == method && c.Path == path {
 			found = append(found, c)
 		}
 	}
-	switch len(found) {
-	case 1:
-		return found[0]
-	case 0:
+	if len(found) == 0 {
 		t.Fatalf("no recorded %s %s among %+v", method, path, f.recorded())
-	default:
-		t.Fatalf("%d recorded %s %s calls, want 1", len(found), method, path)
 	}
-	return fakeCall{}
+	return found
 }
 
 func requireBearer(t *testing.T, call fakeCall, token string) {
@@ -205,6 +225,132 @@ func fileContent(t *testing.T, form *multipart.Form, field string) string {
 
 // --- Vercel ---
 
+// vercelEnvAPI is the Project Env API half of a Vercel unit-test fake: an
+// in-memory store answering the documented list/create/update wire. Deploy
+// sets the worker's environment through these endpoints before every
+// deployment, so each deploy fake routes its requests here first.
+type vercelEnvAPI struct {
+	mu       sync.Mutex
+	exists   bool
+	ids      map[string]string // key -> env id
+	values   map[string]string // key -> value
+	conflict map[string]int    // key -> create attempts left to answer 403
+	adopt    map[string]bool   // key -> the conflicted create also stores the variable
+}
+
+func newVercelEnvAPI() *vercelEnvAPI {
+	return &vercelEnvAPI{
+		exists:   true,
+		ids:      map[string]string{},
+		values:   map[string]string{},
+		conflict: map[string]int{},
+		adopt:    map[string]bool{},
+	}
+}
+
+// seed pre-creates one variable, as a previous deploy leaves it behind.
+func (e *vercelEnvAPI) seed(key, value string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ids[key] = "env_" + strings.ToLower(key)
+	e.values[key] = value
+}
+
+// failCreate makes the next create of key answer 403 — the documented
+// already-exists conflict. With adopt set, the variable appears in the
+// store at that moment, exactly as a concurrent creation would; without it
+// the 403 is a plain refusal and the store stays empty.
+func (e *vercelEnvAPI) failCreate(key string, adopt bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.conflict[key]++
+	e.adopt[key] = adopt
+}
+
+// route answers the env endpoints and reports whether it did. A missing
+// project answers 404 on every call, exactly like the real API. The request
+// body is read from the recorder — ServeHTTP drains r.Body before routing.
+func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request) bool {
+	path := r.URL.Path
+	envPath := strings.HasPrefix(path, "/v10/projects/") && strings.HasSuffix(path, "/env")
+	patchPath := r.Method == http.MethodPatch && strings.HasPrefix(path, "/v9/projects/") && strings.Contains(path, "/env/")
+	if !((r.Method == http.MethodGet || r.Method == http.MethodPost) && envPath) && !patchPath {
+		return false
+	}
+	body := f.lastBody()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.exists {
+		writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found","message":"project not found"}}`)
+		return true
+	}
+	switch {
+	case r.Method == http.MethodGet:
+		keys := make([]string, 0, len(e.ids))
+		for key := range e.ids {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		envs := make([]map[string]string, 0, len(keys))
+		for _, key := range keys {
+			envs = append(envs, map[string]string{"id": e.ids[key], "key": key})
+		}
+		raw, _ := json.Marshal(map[string]any{"envs": envs, "pagination": map[string]any{"count": len(envs)}})
+		writeJSON(w, http.StatusOK, string(raw))
+	case r.Method == http.MethodPost:
+		var create struct {
+			Key    string   `json:"key"`
+			Value  string   `json:"value"`
+			Type   string   `json:"type"`
+			Target []string `json:"target"`
+		}
+		if err := json.Unmarshal(body, &create); err != nil || create.Key == "" {
+			writeJSON(w, http.StatusBadRequest, `{"error":{"code":"bad_request"}}`)
+			return true
+		}
+		if _, ok := e.ids[create.Key]; ok {
+			writeJSON(w, http.StatusForbidden, `{"error":{"code":"conflict","message":"already exists"}}`)
+			return true
+		}
+		if e.conflict[create.Key] > 0 {
+			e.conflict[create.Key]--
+			if e.adopt[create.Key] {
+				e.ids[create.Key] = "env_" + strings.ToLower(create.Key)
+				e.values[create.Key] = create.Value
+				delete(e.adopt, create.Key)
+			}
+			writeJSON(w, http.StatusForbidden, `{"error":{"code":"conflict","message":"already exists"}}`)
+			return true
+		}
+		e.ids[create.Key] = "env_" + strings.ToLower(create.Key)
+		e.values[create.Key] = create.Value
+		raw, _ := json.Marshal(map[string]any{
+			"created": map[string]any{"id": e.ids[create.Key], "key": create.Key, "type": create.Type, "target": create.Target},
+			"failed":  []any{},
+		})
+		writeJSON(w, http.StatusCreated, string(raw))
+	case r.Method == http.MethodPatch:
+		id := path[strings.LastIndex(path, "/env/")+len("/env/"):]
+		var key string
+		for k, v := range e.ids {
+			if v == id {
+				key = k
+			}
+		}
+		if key == "" {
+			writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found"}}`)
+			return true
+		}
+		var update struct {
+			Value string `json:"value"`
+		}
+		_ = json.Unmarshal(body, &update)
+		e.values[key] = update.Value
+		writeJSON(w, http.StatusOK, `{"id":"`+id+`","value":""}`)
+	}
+	return true
+}
+
 func TestVercelDiscoverMatrix(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -287,7 +433,11 @@ func TestVercelDiscoverPinsTeamScope(t *testing.T) {
 }
 
 func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
+	env := newVercelEnvAPI()
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if env.route(f, w, r) {
+			return
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
 			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
 			f.signal()
@@ -311,39 +461,53 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
 	}
 
+	// The v13 request carries exactly the documented field set. env and
+	// deploymentProtection are not v13 fields — the version and relay key
+	// travel through the Project Env API instead, so neither may appear
+	// anywhere in the deployment payload.
 	call := f.callFor(t, http.MethodPost, "/v13/deployments")
 	requireBearer(t, call, "tok")
-	var payload struct {
-		Name   string `json:"name"`
-		Target string `json:"target"`
-		Files  []struct {
-			File     string `json:"file"`
-			Data     string `json:"data"`
-			Encoding string `json:"encoding"`
-		} `json:"files"`
-		ProjectSettings      map[string]any `json:"projectSettings"`
-		DeploymentProtection map[string]any `json:"deploymentProtection"`
-		Env                  []struct {
-			Key    string   `json:"key"`
-			Value  string   `json:"value"`
-			Target []string `json:"target"`
-		} `json:"env"`
-	}
+	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(call.Body, &payload); err != nil {
 		t.Fatalf("decode deploy payload: %v", err)
 	}
-	if payload.Name != "web-relay" || payload.Target != "production" {
-		t.Errorf("payload name/target = %q/%q, want web-relay/production", payload.Name, payload.Target)
+	var fields []string
+	for k := range payload {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	if want := []string{"files", "name", "projectSettings", "target"}; !slices.Equal(fields, want) {
+		t.Fatalf("payload fields = %v, want exactly %v (no env, no deploymentProtection)", fields, want)
+	}
+	var head struct {
+		Name   string `json:"name"`
+		Target string `json:"target"`
+	}
+	_ = json.Unmarshal(payload["name"], &head.Name)
+	_ = json.Unmarshal(payload["target"], &head.Target)
+	if head.Name != "web-relay" || head.Target != "production" {
+		t.Errorf("payload name/target = %q/%q, want web-relay/production", head.Name, head.Target)
+	}
+	if body := string(call.Body); strings.Contains(body, "RELAY_") || strings.Contains(body, spec.Token) {
+		t.Errorf("deploy payload carries worker environment values: %s", body)
 	}
 
 	// Two files: the worker and the vercel.json that routes the project
 	// root to it. The rewrite is pinned byte for byte — it is what makes
-	// every root probe and relayed request reach the worker (#21).
-	if len(payload.Files) != 2 {
-		t.Fatalf("files = %+v, want the worker and vercel.json", payload.Files)
+	// every root probe and relayed request reach the worker.
+	var files []struct {
+		File     string `json:"file"`
+		Data     string `json:"data"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(payload["files"], &files); err != nil {
+		t.Fatalf("decode files: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files = %+v, want the worker and vercel.json", files)
 	}
 	uploaded := map[string]string{}
-	for _, fl := range payload.Files {
+	for _, fl := range files {
 		if fl.Encoding != "base64" {
 			t.Errorf("file %q encoding = %q, want base64", fl.File, fl.Encoding)
 		}
@@ -362,32 +526,272 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 		t.Errorf("vercel.json = %q, want the catch-all rewrite %q", uploaded["vercel.json"], wantRewrite)
 	}
 
-	if v, ok := payload.ProjectSettings["framework"]; !ok || v != nil {
-		t.Errorf("projectSettings.framework = %v (present %v), want explicit null", v, ok)
+	var settings struct {
+		Framework *string `json:"framework"`
 	}
-	if v, ok := payload.DeploymentProtection["ssoProtection"]; !ok || v != nil {
-		t.Errorf("deploymentProtection.ssoProtection = %v (present %v), want explicit null (no SSO wall)", v, ok)
+	if err := json.Unmarshal(payload["projectSettings"], &settings); err != nil {
+		t.Fatalf("decode projectSettings: %v", err)
 	}
-	env := map[string]struct {
+	if settings.Framework != nil {
+		t.Errorf("projectSettings.framework = %q, want explicit null", *settings.Framework)
+	}
+
+	// Both worker variables were created on the Project Env API before the
+	// deployment — encrypted, production-targeted, one create each.
+	creates := f.callsFor(t, http.MethodPost, "/v10/projects/web-relay/env")
+	if len(creates) != 2 {
+		t.Fatalf("%d env creates, want one per worker variable", len(creates))
+	}
+	created := map[string]struct {
 		value  string
+		typ    string
 		target []string
 	}{}
-	for _, e := range payload.Env {
-		env[e.Key] = struct {
+	for _, c := range creates {
+		requireBearer(t, c, "tok")
+		var b struct {
+			Key    string   `json:"key"`
+			Value  string   `json:"value"`
+			Type   string   `json:"type"`
+			Target []string `json:"target"`
+		}
+		if err := json.Unmarshal(c.Body, &b); err != nil {
+			t.Fatalf("decode env create: %v", err)
+		}
+		created[b.Key] = struct {
 			value  string
+			typ    string
 			target []string
-		}{e.Value, e.Target}
+		}{b.Value, b.Type, b.Target}
 	}
-	if e, ok := env["RELAY_VERSION"]; !ok || e.value != "1.0.0" || len(e.target) != 1 || e.target[0] != "production" {
-		t.Errorf("RELAY_VERSION env = %+v, want 1.0.0 on production", e)
+	if c := created["RELAY_VERSION"]; c.value != "1.0.0" || c.typ != "encrypted" || len(c.target) != 1 || c.target[0] != "production" {
+		t.Errorf("RELAY_VERSION create = %+v, want 1.0.0 encrypted on production", c)
 	}
-	if e, ok := env["RELAY_AUTH_TOKEN"]; !ok || e.value != "relay-key" || len(e.target) != 1 || e.target[0] != "production" {
-		t.Errorf("RELAY_AUTH_TOKEN env = %+v, want the relay key on production", e)
+	if c := created["RELAY_AUTH_TOKEN"]; c.value != "relay-key" || c.typ != "encrypted" || len(c.target) != 1 || c.target[0] != "production" {
+		t.Errorf("RELAY_AUTH_TOKEN create = %+v, want the relay key encrypted on production", c)
+	}
+	for _, c := range f.callsFor(t, http.MethodGet, "/v10/projects/web-relay/env") {
+		requireBearer(t, c, "tok")
+	}
+	for _, c := range f.recorded() {
+		if c.Method == http.MethodPatch {
+			t.Errorf("unexpected %s %s on a fresh project", c.Method, c.Path)
+		}
+	}
+}
+
+// TestVercelDeployUpdatesExistingProjectEnv pins the redeploy wire: a
+// variable left behind by the previous deploy is updated in place through
+// the documented edit endpoint, and only the genuinely missing one is
+// created — the upsert is idempotent by key.
+func TestVercelDeployUpdatesExistingProjectEnv(t *testing.T) {
+	env := newVercelEnvAPI()
+	env.seed("RELAY_VERSION", "0.9.0")
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if env.route(f, w, r) {
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
+			f.signal()
+			return
+		}
+		writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok", Team: "team_42"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	spec := Spec{Project: "web-relay", Source: "src", Version: "2.0.0", Token: "relay-key"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+
+	patch := f.callFor(t, http.MethodPatch, "/v9/projects/web-relay/env/env_relay_version")
+	requireBearer(t, patch, "tok")
+	if patch.RawQuery != "teamId=team_42" {
+		t.Errorf("patch query = %q, want the pinned team scope", patch.RawQuery)
+	}
+	var body struct {
+		Value  string   `json:"value"`
+		Type   string   `json:"type"`
+		Target []string `json:"target"`
+	}
+	if err := json.Unmarshal(patch.Body, &body); err != nil {
+		t.Fatalf("decode patch body: %v", err)
+	}
+	if body.Value != "2.0.0" || body.Type != "encrypted" || len(body.Target) != 1 || body.Target[0] != "production" {
+		t.Errorf("patch body = %+v, want the new version encrypted on production", body)
+	}
+
+	creates := f.callsFor(t, http.MethodPost, "/v10/projects/web-relay/env")
+	if len(creates) != 1 {
+		t.Fatalf("%d env creates, want exactly the missing variable", len(creates))
+	}
+	var create struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(creates[0].Body, &create); err != nil {
+		t.Fatalf("decode create body: %v", err)
+	}
+	if create.Key != "RELAY_AUTH_TOKEN" || create.Value != "relay-key" {
+		t.Errorf("create = %+v, want the relay key", create)
+	}
+}
+
+// TestVercelDeployCreatesProjectBeforeFirstEnv: on a brand-new relay the env
+// list 404s because the project does not exist yet — but the variables must
+// be in place before the first deployment runs, so Deploy creates the empty
+// project first. A 409 from a concurrent creation is the same end state.
+func TestVercelDeployCreatesProjectBeforeFirstEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		createStatus  int
+		wantCreateErr bool
+	}{
+		{name: "created", createStatus: http.StatusOK},
+		{name: "already exists", createStatus: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newVercelEnvAPI()
+			env.exists = false
+			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.URL.Path == "/v11/projects" {
+					writeJSON(w, tc.createStatus, `{"id":"prj_1","name":"web-relay"}`)
+					env.exists = true
+					return
+				}
+				if env.route(f, w, r) {
+					return
+				}
+				if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
+					writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
+					f.signal()
+					return
+				}
+				writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
+			})
+			client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+			if err != nil {
+				t.Fatalf("For: %v", err)
+			}
+			spec := Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+			if out.err == nil {
+				t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+			}
+
+			create := f.callFor(t, http.MethodPost, "/v11/projects")
+			requireBearer(t, create, "tok")
+			var body struct {
+				Name      string  `json:"name"`
+				Framework *string `json:"framework"`
+			}
+			if err := json.Unmarshal(create.Body, &body); err != nil {
+				t.Fatalf("decode create-project body: %v", err)
+			}
+			if body.Name != "web-relay" || body.Framework != nil {
+				t.Errorf("create-project body = %+v, want the name with an explicit null framework", body)
+			}
+			// The variables landed before the deployment did.
+			deployCall := f.recorded()
+			firstDeploy := -1
+			lastEnv := -1
+			for i, c := range deployCall {
+				if c.Path == "/v13/deployments" && c.Method == http.MethodPost && firstDeploy < 0 {
+					firstDeploy = i
+				}
+				if strings.HasPrefix(c.Path, "/v10/projects/web-relay/env") || strings.HasPrefix(c.Path, "/v9/projects/web-relay/env") {
+					lastEnv = i
+				}
+			}
+			if firstDeploy < 0 || lastEnv < 0 || lastEnv > firstDeploy {
+				t.Fatalf("env calls must precede the deployment: last env at %d, deployment at %d", lastEnv, firstDeploy)
+			}
+		})
+	}
+}
+
+// TestVercelDeployEnvCreateConflictAdoptsExisting: a 403 on create is the
+// documented already-exists answer — Deploy re-lists, adopts the variable
+// and updates it instead of failing.
+func TestVercelDeployEnvCreateConflictAdoptsExisting(t *testing.T) {
+	env := newVercelEnvAPI()
+	env.failCreate("RELAY_VERSION", true) // 403, then the variable appears — a concurrent creation
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if env.route(f, w, r) {
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
+			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
+			f.signal()
+			return
+		}
+		writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	spec := Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+	if out.err == nil {
+		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+	}
+	patch := f.callFor(t, http.MethodPatch, "/v9/projects/web-relay/env/env_relay_version")
+	var body struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(patch.Body, &body); err != nil {
+		t.Fatalf("decode patch body: %v", err)
+	}
+	if body.Value != "1.0.0" {
+		t.Errorf("patch value = %q, want the deployed version", body.Value)
+	}
+}
+
+// TestVercelDeployEnvRefusalFailsTheDeploy: a 403 that is a permission
+// refusal, not a conflict — the re-list still finds nothing, so the create
+// error stands and no deployment is fired at a project whose env the
+// gateway could not set.
+func TestVercelDeployEnvRefusalFailsTheDeploy(t *testing.T) {
+	env := newVercelEnvAPI()
+	env.failCreate("RELAY_VERSION", false) // 403 with nothing behind it: a refusal
+	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if env.route(f, w, r) {
+			return
+		}
+		writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
+	})
+	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
+	if err == nil || !strings.Contains(err.Error(), "vercel env") {
+		t.Fatalf("Deploy error = %v, want the env failure", err)
+	}
+	for _, c := range f.recorded() {
+		if c.Path == "/v13/deployments" {
+			t.Errorf("deployment fired despite the env refusal: %s %s", c.Method, c.Path)
+		}
 	}
 }
 
 func TestVercelDeployPollsUntilReady(t *testing.T) {
+	env := newVercelEnvAPI()
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if env.route(f, w, r) {
+			return
+		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v13/deployments":
 			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"BUILDING"}`)
@@ -419,7 +823,11 @@ func TestVercelDeployPollsUntilReady(t *testing.T) {
 }
 
 func TestVercelDeployFailsOnErroredDeployment(t *testing.T) {
+	env := newVercelEnvAPI()
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
+		if env.route(f, w, r) {
+			return
+		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v13/deployments":
 			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"BUILDING"}`)
@@ -440,8 +848,16 @@ func TestVercelDeployFailsOnErroredDeployment(t *testing.T) {
 }
 
 func TestVercelDeployPostFailure(t *testing.T) {
+	env := newVercelEnvAPI()
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusInternalServerError, `boom`)
+		if env.route(f, w, r) {
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
+			writeJSON(w, http.StatusInternalServerError, `boom`)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, `{}`)
 	})
 	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
 	if err != nil {
