@@ -1,10 +1,14 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -69,10 +73,16 @@ func TestE2E_ReplacementRolloutStrategyA(t *testing.T) {
 	g.waitForZeroReady(t, 5*time.Second)
 
 	// The settle barrier: no deploy may start while the old worker still
-	// carries the in-flight request.
+	// carries the in-flight request. Observed by deploy *receipt* — the
+	// fake records the call the moment it arrives, before its (gated)
+	// completion — so a regression that starts the replacement deploy while
+	// the drain is still waiting cannot pass on a technicality.
 	time.Sleep(700 * time.Millisecond)
+	if n := len(fake.callsFor("vercel", "deploy")); n != 1 {
+		t.Fatalf("deploy calls received while a request was in flight = %d, want 1 (the admission deploy; settle and drain precede any deploy)", n)
+	}
 	if n := fake.deployCount("v-rel"); n != 1 {
-		t.Fatalf("deploys started while a request was in flight = %d, want 1 (settle first)", n)
+		t.Fatalf("deploys completed while a request was in flight = %d, want 1 (settle first)", n)
 	}
 
 	releaseHold()
@@ -177,6 +187,133 @@ func TestE2E_ShutdownDrainStaysInsideTheGraceBudget(t *testing.T) {
 
 	releaseHold()
 	<-inflight
+}
+
+// trickleServer is an upstream whose response body never ends on its own:
+// one numbered, flushed chunk per interval — a mid-stream response the
+// gateway must keep draining across shutdown.
+type trickleServer struct {
+	base     string
+	srv      *http.Server
+	ln       net.Listener
+	interval time.Duration
+}
+
+func newTrickle(t *testing.T, interval time.Duration) *trickleServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("trickle listen: %v", err)
+	}
+	s := &trickleServer{base: "http://" + ln.Addr().String(), ln: ln, interval: interval}
+	s.srv = &http.Server{Handler: http.HandlerFunc(s.handle), ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = s.srv.Serve(ln) }()
+	t.Cleanup(func() { _ = s.srv.Close() })
+	return s
+}
+
+func (s *trickleServer) handle(w http.ResponseWriter, r *http.Request) {
+	fl, _ := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	for i := 0; ; i++ {
+		if _, err := fmt.Fprintf(w, "chunk-%d\n", i); err != nil {
+			return
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(s.interval):
+		}
+	}
+}
+
+// TestE2E_ShutdownDrainsAMidStreamResponse: SIGTERM lands while a response
+// is already streaming through the gateway — the stream keeps flowing to
+// the client afterwards (in-flight drain, streaming included), and the
+// process still exits cleanly inside the one SHUTDOWN_GRACE budget instead
+// of waiting on the never-ending body.
+func TestE2E_ShutdownDrainsAMidStreamResponse(t *testing.T) {
+	fake := newFakeEdge(t)
+	key, vt := freshIdentity("midstream")
+	fake.setToken("vercel", vt)
+	trickle := newTrickle(t, 150*time.Millisecond)
+
+	g := startGateway(t, fake, gwOptions{
+		config:   configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
+	})
+	g.waitForReady(t, 20*time.Second)
+
+	req, err := http.NewRequest(http.MethodGet, g.base+"/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Relay-Target", trickle.base)
+	req.Header.Set("X-Relay-Path", "/stream")
+	resp, err := relayClient.Do(req)
+	if err != nil {
+		t.Fatalf("streaming request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("streaming request = %d, want 200", resp.StatusCode)
+	}
+
+	lines := make(chan string, 16)
+	readErr := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(resp.Body)
+		for {
+			line, rerr := br.ReadString('\n')
+			if rerr != nil {
+				readErr <- rerr
+				return
+			}
+			lines <- line
+		}
+	}()
+
+	// The response is live: chunks flow before any signal.
+	select {
+	case line := <-lines:
+		if line != "chunk-0\n" {
+			t.Fatalf("first chunk = %q, want chunk-0", line)
+		}
+	case rerr := <-readErr:
+		t.Fatalf("stream ended before shutdown: %v", rerr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no chunk reached the client within 10s")
+	}
+
+	// Shutdown while the body is mid-flight.
+	started := time.Now()
+	if err := g.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM: %v", err)
+	}
+
+	// The drain keeps the open stream alive: another chunk arrives after
+	// the process was told to stop.
+	select {
+	case line := <-lines:
+		if line != "chunk-1\n" {
+			t.Fatalf("post-signal chunk = %q, want chunk-1", line)
+		}
+	case rerr := <-readErr:
+		t.Fatalf("the stream was cut by shutdown instead of drained: %v", rerr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no chunk reached the client after SIGTERM — the in-flight stream was not drained")
+	}
+
+	// A body that never ends must not hold the process past its budget.
+	g.exitOK(10 * time.Second) // SHUTDOWN_GRACE is 5s in this harness
+	if took := time.Since(started); took > 9*time.Second {
+		t.Fatalf("shutdown took %s with a 5s grace — the streaming request outlived the budget", took)
+	}
 }
 
 // TestE2E_RemoveReAddWhileDeleteInFlight: removing a relay deletes its

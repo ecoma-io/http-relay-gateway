@@ -320,22 +320,26 @@ func (g *gatewayProc) do(t *testing.T, method, path string, headers map[string]s
 // --- typed /stats ---
 
 type statsDoc struct {
-	Version      string `json:"version"`
-	RelayVersion string `json:"relayVersion"`
-	Relays       []struct {
-		Name      string `json:"name"`
-		Provider  string `json:"provider"`
-		Healthy   bool   `json:"healthy"`
-		MaxBody   int64  `json:"maxBody"`
-		Requests  int64  `json:"requests"`
-		Failures  int64  `json:"failures"`
-		LastError string `json:"lastError,omitempty"`
-	} `json:"relays"`
-	Readiness struct {
+	Version      string          `json:"version"`
+	RelayVersion string          `json:"relayVersion"`
+	Relays       []relayStatsRow `json:"relays"`
+	Readiness    struct {
 		Ready       bool `json:"ready"`
 		ReadyRelays int  `json:"readyRelays"`
 	} `json:"readiness"`
 	Lifecycle []lifecycleRow `json:"lifecycle"`
+}
+
+// relayStatsRow is one relay's passive-health row: the serving counters and
+// the cooldown view (/stats never carries the relay URL or a credential).
+type relayStatsRow struct {
+	Name      string `json:"name"`
+	Provider  string `json:"provider"`
+	Healthy   bool   `json:"healthy"`
+	MaxBody   int64  `json:"maxBody"`
+	Requests  int64  `json:"requests"`
+	Failures  int64  `json:"failures"`
+	LastError string `json:"lastError,omitempty"`
 }
 
 type lifecycleRow struct {
@@ -344,6 +348,16 @@ type lifecycleRow struct {
 	State      string `json:"state"`
 	Reason     string `json:"reason,omitempty"`
 	Generation uint64 `json:"generation"`
+}
+
+// relayRow returns one relay's passive-health row from a snapshot.
+func relayRow(d *statsDoc, provider, name string) (relayStatsRow, bool) {
+	for _, row := range d.Relays {
+		if row.Provider == provider && row.Name == name {
+			return row, true
+		}
+	}
+	return relayStatsRow{}, false
 }
 
 func (g *gatewayProc) stats(t *testing.T) *statsDoc {
@@ -452,18 +466,63 @@ func (g *gatewayProc) writeConfig(content string) {
 // configYAML assembles a desired-state file: fast test cadences plus the
 // given relay blocks.
 func configYAML(relays ...string) string {
+	return renderConfig(harnessSettings(nil, nil), relays)
+}
+
+// configYAMLOverrides assembles a desired-state file from the harness's
+// fast cadences with individual settings overridden — the failover and
+// passive-health tests need shapes the shared defaults cannot express (a
+// quiet verify tick so the verified layer stays out of the way, a
+// one-strike failure threshold, streaming switched on). An override that
+// names no harness setting fails the test: a typo must not silently run
+// the scenario on the default cadence.
+func configYAMLOverrides(t *testing.T, overrides map[string]string, relays ...string) string {
+	t.Helper()
+	return renderConfig(harnessSettings(t, overrides), relays)
+}
+
+// harnessSettings is the shared settings block, with overrides applied.
+func harnessSettings(t *testing.T, overrides map[string]string) [][2]string {
+	settings := [][2]string{
+		{"log_level", "debug"},
+		{"failure_threshold", "2"},
+		{"cooldown", "2s"},
+		{"max_retries", "1"},
+		{"stream_threshold_bytes", "0"},
+		{"response_header_timeout", "0"},
+		{"verify_interval", "1s"},
+		{"revive_scan_interval", "2s"},
+		{"verify_backoff_base", "200ms"},
+		{"verify_backoff_max", "1s"},
+		{"verify_recover_max", "300ms"},
+		{"verify_demote_after", "2"},
+	}
+	for key, value := range overrides {
+		known := false
+		for i := range settings {
+			if settings[i][0] == key {
+				settings[i][1] = value
+				known = true
+				break
+			}
+		}
+		if !known {
+			if t == nil {
+				panic("configYAML override " + key + " is not a harness setting")
+			}
+			t.Fatalf("config override %q is not a harness setting", key)
+		}
+	}
+	return settings
+}
+
+// renderConfig writes the settings block plus the given relay blocks.
+func renderConfig(settings [][2]string, relays []string) string {
 	var b strings.Builder
 	b.WriteString("settings:\n")
-	b.WriteString("  log_level: debug\n")
-	b.WriteString("  failure_threshold: 2\n")
-	b.WriteString("  cooldown: 2s\n")
-	b.WriteString("  max_retries: 1\n")
-	b.WriteString("  verify_interval: 1s\n")
-	b.WriteString("  revive_scan_interval: 2s\n")
-	b.WriteString("  verify_backoff_base: 200ms\n")
-	b.WriteString("  verify_backoff_max: 1s\n")
-	b.WriteString("  verify_recover_max: 300ms\n")
-	b.WriteString("  verify_demote_after: 2\n")
+	for _, kv := range settings {
+		fmt.Fprintf(&b, "  %s: %s\n", kv[0], kv[1])
+	}
 	if len(relays) > 0 {
 		b.WriteString("relays:\n")
 		for _, r := range relays {
@@ -513,4 +572,24 @@ func randSuffix(n int) string {
 		b[i] = alphabet[rand.IntN(len(alphabet))]
 	}
 	return string(b)
+}
+
+// runSubcommand executes one gateway subcommand (healthcheck,
+// readinesscheck) against a running gatewayProc — the same process image,
+// pointed at the running listener by LISTEN_ADDR alone — and returns its
+// exit code with the combined output.
+func runSubcommand(t *testing.T, g *gatewayProc, arg string) (int, string) {
+	t.Helper()
+	cmd := exec.Command(binPath, arg)
+	env := scrubbedEnv()
+	env = append(env, "LISTEN_ADDR="+strings.TrimPrefix(g.base, "http://"))
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatalf("run %q: %v (%s)", arg, err, out)
+	}
+	return code, string(out)
 }

@@ -1012,6 +1012,7 @@ func slugHash(s string) string {
 const (
 	simOK              = "ok"
 	simDown            = "down"            // TCP-level refusal: connection accepted then closed
+	simHang            = "hang"            // accepts the request, answers nothing (data plane)
 	simSuspended402    = "suspended402"    // platform quota page: HTTP 402
 	simSuspendedMarker = "suspendedMarker" // platform page: X-Vercel-Error DEPLOYMENT_DISABLED
 	simNotWorker       = "notWorker"       // someone else's app on the URL
@@ -1130,6 +1131,17 @@ func (s *simState) serveHTTP(w http.ResponseWriter, r *http.Request, f *fakeEdge
 			}
 		}
 		time.Sleep(45 * time.Second)
+		return
+	case simHang:
+		// Accept the request and answer nothing. The data-plane tests that
+		// need a transport failure use this with response_header_timeout:
+		// the gateway's own timeout is the error, deterministically and
+		// without a mid-write reset. The context ends when the caller gives
+		// up; the timer only bounds a stuck connection.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(45 * time.Second):
+		}
 		return
 	case simSuspended402:
 		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "QUOTA_EXHAUSTED"})
@@ -1260,7 +1272,25 @@ func (s *simState) forward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// The real worker streams: every read that produced bytes goes out and
+	// is flushed immediately, so a slow upstream answer reaches the gateway
+	// chunk by chunk (an SSE body must not pool in the sim's own buffer).
+	fl, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // sharedSimClient carries the sims' inner forwarding fetches.
