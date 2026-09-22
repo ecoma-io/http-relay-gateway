@@ -421,12 +421,9 @@ func interpolate(s string) (string, error) {
 }
 
 // redact makes an interpolation error message safe: the raw string may
-// carry a literal secret, so only its shape is reported.
+// carry a literal secret, so only its length is reported.
 func redact(s string) string {
-	if len(s) > 16 {
-		return s[:16] + "…"
-	}
-	return s
+	return fmt.Sprintf("[redacted value: %d bytes]", len(s))
 }
 
 // resolve turns the file settings into typed values, applying defaults for
