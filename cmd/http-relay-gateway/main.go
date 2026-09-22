@@ -65,12 +65,27 @@ func main() {
 // was recognized (subcommands, help — anything else must never fall through
 // to run(): a typo like `healthchek` silently starting the relay gateway is
 // the failure this exists to prevent) and the process exit code to use.
-// stdout/stderr are parameters so tests can see the output; the healthcheck
-// subcommand's own diagnostics still go to the process stderr. No arguments
-// at all starts the gateway proper.
+// Surplus arguments after a recognized subcommand are the same
+// operator-error class and are rejected too — `version extra` exiting 0 or
+// `healthcheck extra` probing anyway would hide the mistake usage exists to
+// surface. stdout/stderr are parameters so tests can see the output; the
+// healthcheck subcommand's own diagnostics still go to the process stderr.
+// No arguments at all starts the gateway proper.
 func dispatch(stdout, stderr io.Writer, args []string) (code int, handled bool) {
 	if len(args) == 0 {
 		return 0, false
+	}
+	switch args[0] {
+	case "version", "healthcheck", "readinesscheck", "-h", "--help":
+	default:
+		_, _ = fmt.Fprintln(stderr, "unknown argument:", args[0])
+		usage(stderr)
+		return 2, true
+	}
+	if len(args) > 1 {
+		_, _ = fmt.Fprintf(stderr, "unexpected arguments after %q: %v\n", args[0], args[1:])
+		usage(stderr)
+		return 2, true
 	}
 	switch args[0] {
 	case "version":
@@ -80,13 +95,9 @@ func dispatch(stdout, stderr io.Writer, args []string) (code int, handled bool) 
 		return healthcheck("/healthz", "ok\n"), true
 	case "readinesscheck":
 		return healthcheck("/readyz", ""), true
-	case "-h", "--help":
+	default: // -h | --help
 		usage(stdout)
 		return 0, true
-	default:
-		_, _ = fmt.Fprintln(stderr, "unknown argument:", args[0])
-		usage(stderr)
-		return 2, true
 	}
 }
 

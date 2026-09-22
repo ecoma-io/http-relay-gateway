@@ -449,6 +449,46 @@ func TestDispatchUnknownArgumentIsRejected(t *testing.T) {
 	}
 }
 
+// Surplus arguments after a recognized subcommand must not be silently
+// ignored: `version extra` exiting 0 or `healthcheck extra` probing anyway
+// hides an operator mistake the same way an unknown subcommand does. The
+// healthcheck case in particular must fail before any probe runs — the
+// wrong-address mistake the surplus hides is exactly what the probe would
+// misreport on.
+func TestDispatchRejectsSurplusArguments(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"version with extra", []string{"version", "extra"}},
+		{"healthcheck with extra", []string{"healthcheck", "extra"}},
+		{"readinesscheck with two extras", []string{"readinesscheck", "one", "two"}},
+		{"help flag with extra", []string{"--help", "extra"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			code, handled := dispatch(&out, &errOut, tc.args)
+			if !handled {
+				t.Fatalf("dispatch(%v) not handled; surplus arguments must never reach run()", tc.args)
+			}
+			if code != 2 {
+				t.Fatalf("dispatch(%v) = %d, want exit code 2", tc.args, code)
+			}
+			if out.String() != "" {
+				t.Fatalf("dispatch(%v) wrote to stdout %q, want usage on stderr only", tc.args, out.String())
+			}
+			diagnostic := errOut.String()
+			if !strings.Contains(diagnostic, "unexpected arguments after") {
+				t.Fatalf("dispatch(%v) stderr %q must say the arguments are unexpected", tc.args, diagnostic)
+			}
+			if !strings.Contains(diagnostic, "usage:") {
+				t.Fatalf("dispatch(%v) stderr %q must include usage", tc.args, diagnostic)
+			}
+		})
+	}
+}
+
 func TestDispatchHelpPrintsUsage(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code, handled := dispatch(&out, &errOut, []string{"--help"})
