@@ -20,6 +20,8 @@ var (
 	lookupName     = regexp.MustCompile(`\blookup ([^\s:]+)(:|\s+on\s)`) // net.DNSError formatting
 	lookupServer   = regexp.MustCompile(`\bon (\[[^]]+\]|[^\s:]+):(\d+):`)
 	connectTo      = regexp.MustCompile(`\bconnect: ([^\s]+(?: [^\s]+)*) to (\[[^]]+\]|[^\s:]+):(\d+)`)
+	connIODirected = regexp.MustCompile(`\b(read|write) tcp (\[[^]]+\]|[^\s:]+):(\d+)->(\[[^]]+\]|[^\s:]+):(\d+)`)
+	connIOSingle   = regexp.MustCompile(`\b(read|write) tcp (\[[^]]+\]|[^\s:]+):(\d+)`)
 )
 
 // Sanitize returns bounded diagnostic text with quoted URL tokens, relay dial
@@ -48,7 +50,9 @@ func needsSanitizing(s string) bool {
 	return strings.Contains(s, "://") ||
 		strings.Contains(s, "dial ") ||
 		strings.Contains(s, "lookup ") ||
-		strings.Contains(s, "connect: ")
+		strings.Contains(s, "connect: ") ||
+		strings.Contains(s, "read tcp ") ||
+		strings.Contains(s, "write tcp ")
 }
 
 // ErrorString sanitizes err.Error(), returning "" for nil.
@@ -119,11 +123,17 @@ func stripQuotedURLs(value string) string {
 }
 
 // redactDialAddresses removes private relay targets from standard-library
-// transport errors while preserving their address family, port, and cause.
+// transport errors and I/O errors (net.OpError's `read tcp A->B:` /
+// `write tcp A->B:` shapes, with or without the source endpoint) while
+// preserving the operation, address family, port, and cause.
 func redactDialAddresses(value string) string {
 	value = dialTCPAddress.ReplaceAllString(value, "dial tcp [redacted]:$2")
 	value = lookupName.ReplaceAllString(value, "lookup [redacted]$2")
 	value = lookupServer.ReplaceAllString(value, "on [redacted]:$2:")
+	value = connIODirected.ReplaceAllString(value, "$1 tcp [redacted]:$3->[redacted]:$5")
+	value = connIOSingle.ReplaceAllString(value, "$1 tcp [redacted]:$3")
+	// The single-endpoint rewrite is a no-op on the already-redacted directed
+	// form, so the order above keeps every stage idempotent.
 	return connectTo.ReplaceAllString(value, "connect: $1 to [redacted]:$3")
 }
 
