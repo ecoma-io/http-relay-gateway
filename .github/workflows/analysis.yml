@@ -194,7 +194,7 @@ jobs:
       # a wrong or partial download.
       - name: Install gitleaks
         run: |
-          url="https://github.com/zricethezav/gitleaks/releases/download/v8.24.3"
+          url="https://github.com/zricethezav/gitleaks/releases/download/v8.30.1"
           version="${url##*/v}"
           asset="gitleaks_${version}_linux_x64.tar.gz"
           curl --fail --silent --show-error --location \
