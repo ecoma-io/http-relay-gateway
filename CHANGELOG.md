@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/ecoma-io/http-relay-gateway/compare/v0.2.0...v0.2.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **ci:** pin renovate-bumped tool downloads to a single version literal ([#50](https://github.com/ecoma-io/http-relay-gateway/issues/50)) ([eed79d1](https://github.com/ecoma-io/http-relay-gateway/commit/eed79d1e2f996ccad95da1d01b51d31cbc9d130e)), closes [#49](https://github.com/ecoma-io/http-relay-gateway/issues/49)
+
 ## [0.2.0](https://github.com/ecoma-io/http-relay-gateway/compare/v0.1.0...v0.2.0) (2026-09-22)
 
 
