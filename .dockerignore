@@ -1,13 +1,8 @@
-# Runtime state (SQLite DB, WAL files) must never enter the image.
-data
-
-# The UI bundle is built inside the image; a stale host-side copy must not
-# leak into the build (the committed stub exists for host `go build` only).
-web/dist
-internal/web/dist
-
-# Local development artifacts do not belong in the build context.
+# Local development artifacts do not belong in the build context: the Node
+# toolchain (commitlint, lefthook, prettier — the pnpm install CONTRIBUTING
+# requires), the built binary, and the black-box test tree.
 .git
 .claude
 bin
 e2e
+node_modules

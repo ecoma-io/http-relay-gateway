@@ -5,10 +5,13 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 # Dependencies resolve before source lands: only go.mod / go.sum bust this
-# layer, so a source edit re-downloads nothing. Cache-mount contents are not
-# part of any layer, so the build step re-mounts the module cache (to see the
-# downloaded modules) plus the compile cache — a source edit then rebuilds in
-# seconds instead of recompiling every package from scratch.
+# layer, so a source edit re-downloads nothing — that layer cache is what
+# survives on an ephemeral CI builder. The cache mounts below are
+# builder-local state and never leave it: `cache-to` exports layer metadata,
+# not mount contents, and CI runners start a fresh builder every job, so the
+# mounts pay off only where the builder persists (local compose builds, a
+# long-lived daemon) — there an unchanged go.mod/go.sum plus warm mounts
+# rebuilds a source edit in seconds instead of recompiling every package.
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
