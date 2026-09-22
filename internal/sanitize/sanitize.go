@@ -5,6 +5,7 @@
 package sanitize
 
 import (
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -14,14 +15,21 @@ const MaxLength = 512
 
 const redacted = "[redacted]@"
 
-// Sanitize returns bounded diagnostic text with quoted URL tokens and URL
-// userinfo stripped or redacted, and terminal controls and ANSI sequences
-// neutralized.
+var (
+	dialTCPAddress = regexp.MustCompile(`\bdial tcp (\[[^]]+\]|[^\s:]+):(\d+)`)
+	lookupName     = regexp.MustCompile(`\blookup ([^\s:]+)(:|\s+on\s)`) // net.DNSError formatting
+	lookupServer   = regexp.MustCompile(`\bon (\[[^]]+\]|[^\s:]+):(\d+):`)
+	connectTo      = regexp.MustCompile(`\bconnect: ([^\s]+(?: [^\s]+)*) to (\[[^]]+\]|[^\s:]+):(\d+)`)
+)
+
+// Sanitize returns bounded diagnostic text with quoted URL tokens, relay dial
+// addresses, and URL userinfo stripped or redacted, and terminal controls and
+// ANSI sequences neutralized.
 func Sanitize(s string) string {
 	if !needsSanitizing(s) {
 		return s
 	}
-	return bound(cleanControls(stripQuotedURLs(redactUserinfo(s))))
+	return bound(cleanControls(redactDialAddresses(stripQuotedURLs(redactUserinfo(s)))))
 }
 
 // needsSanitizing reports whether any stage of Sanitize would change s, so the
@@ -37,7 +45,10 @@ func needsSanitizing(s string) bool {
 			return true // stripANSI consumes ESC; cleanControls rewrites controls
 		}
 	}
-	return strings.Contains(s, "://") // redactUserinfo only rewrites URL tokens
+	return strings.Contains(s, "://") ||
+		strings.Contains(s, "dial ") ||
+		strings.Contains(s, "lookup ") ||
+		strings.Contains(s, "connect: ")
 }
 
 // ErrorString sanitizes err.Error(), returning "" for nil.
@@ -81,7 +92,8 @@ func redactUserinfo(value string) string {
 // (`Get "https://…": dial tcp …`), and relay origins are private: the URL
 // must never survive into /stats, error bodies, or logs — only the cause
 // behind it does. Unquoted URLs keep flowing so userinfo redaction below
-// can still act on them.
+// can still act on them. An unterminated URL token is redacted through the
+// remainder of the string, since a truncated diagnostic must fail closed.
 func stripQuotedURLs(value string) string {
 	for i := 0; i < len(value); {
 		start := strings.IndexByte(value[i:], '"')
@@ -91,6 +103,9 @@ func stripQuotedURLs(value string) string {
 		start += i
 		end := quotedTokenEnd(value, start)
 		if end < 0 {
+			if strings.Contains(value[start:], "://") {
+				return value[:start] + `"…"`
+			}
 			return value
 		}
 		if strings.Contains(value[start:end+1], "://") {
@@ -101,6 +116,15 @@ func stripQuotedURLs(value string) string {
 		i = end + 1
 	}
 	return value
+}
+
+// redactDialAddresses removes private relay targets from standard-library
+// transport errors while preserving their address family, port, and cause.
+func redactDialAddresses(value string) string {
+	value = dialTCPAddress.ReplaceAllString(value, "dial tcp [redacted]:$2")
+	value = lookupName.ReplaceAllString(value, "lookup [redacted]$2")
+	value = lookupServer.ReplaceAllString(value, "on [redacted]:$2:")
+	return connectTo.ReplaceAllString(value, "connect: $1 to [redacted]:$3")
 }
 
 // quotedTokenEnd returns the index of the quote closing the token opened at
