@@ -359,6 +359,56 @@ func TestRelayValidationFailures(t *testing.T) {
 	}
 }
 
+// An inline token follows the same hygiene as a token file: the resolved
+// value is trimmed, and one that is blank afterwards rejects the load. A
+// trailing newline in a secret-manager-sourced env var must not silently
+// ship as part of the credential. Assertions compare against the fixture
+// without echoing the resolved value — the failure text never carries it.
+func TestInlineTokenTrimmedAndBlankRejected(t *testing.T) {
+	const want = "padded-fixture-secret"
+
+	t.Run("env value with surrounding whitespace resolves trimmed", func(t *testing.T) {
+		t.Setenv("RELAY_TEST_PADDED", " \t"+want+"\n")
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: ${RELAY_TEST_PADDED}\n")
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		got := cfg.Relays[0].Token
+		if got != want {
+			t.Errorf("inline token length = %d, want %d (the trimmed secret)", len(got), len(want))
+		}
+	})
+
+	t.Run("literal token with surrounding whitespace resolves trimmed", func(t *testing.T) {
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: \" "+want+" \"\n")
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Relays[0].Token; got != want {
+			t.Errorf("inline token length = %d, want %d (the trimmed literal)", len(got), len(want))
+		}
+	})
+
+	t.Run("env value blank after trimming rejects the load", func(t *testing.T) {
+		t.Setenv("RELAY_TEST_BLANKISH", " \n\t")
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: ${RELAY_TEST_BLANKISH}\n")
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "token is blank") {
+			t.Fatalf("Load error = %v, want a blank-token rejection", err)
+		}
+	})
+
+	t.Run("whitespace-only literal token rejects the load", func(t *testing.T) {
+		path := writeConfig(t, "relays:\n  - name: web-relay\n    provider: vercel\n    token: \"   \"\n")
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "token is blank") {
+			t.Fatalf("Load error = %v, want a blank-token rejection", err)
+		}
+	})
+}
+
 func TestRelayNameLengthBound(t *testing.T) {
 	long := strings.Repeat("a", 129)
 	_, err := Load(writeConfig(t, "relays:\n  - name: "+long+"\n    provider: vercel\n    token: t\n"))

@@ -133,7 +133,8 @@ type Relay struct {
 	// Provider is one of the hard-coded providers (deploy.Platforms).
 	Provider string `yaml:"provider"`
 	// Token is the provider management credential, with ${VAR} references
-	// resolved from the environment at load time. Exactly one of Token and
+	// resolved from the environment at load time and the result trimmed
+	// exactly like a token file's content. Exactly one of Token and
 	// TokenFile must be set.
 	Token string `yaml:"token"`
 	// TokenFile names a secret file whose trimmed content is the provider
@@ -341,7 +342,15 @@ func (fr fileRelay) resolve() (Relay, error) {
 		if err != nil {
 			return Relay{}, fmt.Errorf("token: %w", err)
 		}
-		relay.Token = token
+		// Same hygiene as token_file (readSecretFile trims): a value that
+		// picked up surrounding whitespace — a trailing newline from
+		// $(cat …) or a secret manager — is trimmed, and one that is blank
+		// afterwards rejects the load instead of deploying a whitespace
+		// credential that 401s at every platform call.
+		relay.Token = strings.TrimSpace(token)
+		if relay.Token == "" {
+			return Relay{}, errors.New("token is blank: it carries only whitespace after trimming")
+		}
 	case relay.TokenFile != "":
 	default:
 		return Relay{}, errors.New("a provider credential is required: set token (with ${VAR} references) or token_file")
