@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -226,25 +227,23 @@ func fileContent(t *testing.T, form *multipart.Form, field string) string {
 // --- Vercel ---
 
 // vercelEnvAPI is the Project Env API half of a Vercel unit-test fake: an
-// in-memory store answering the documented list/create/update wire. Deploy
-// sets the worker's environment through these endpoints before every
-// deployment, so each deploy fake routes its requests here first.
+// in-memory store answering the documented list/upsert wire. Deploy sets the
+// worker's environment through these endpoints before every deployment, so
+// each deploy fake routes its requests here first.
 type vercelEnvAPI struct {
-	mu       sync.Mutex
-	exists   bool
-	ids      map[string]string // key -> env id
-	values   map[string]string // key -> value
-	conflict map[string]int    // key -> create attempts left to answer 403
-	adopt    map[string]bool   // key -> the conflicted create also stores the variable
+	mu     sync.Mutex
+	exists bool
+	ids    map[string]string // key -> env id
+	values map[string]string // key -> value
+	refuse map[string]bool   // key -> upserts answered 403, a permission refusal
 }
 
 func newVercelEnvAPI() *vercelEnvAPI {
 	return &vercelEnvAPI{
-		exists:   true,
-		ids:      map[string]string{},
-		values:   map[string]string{},
-		conflict: map[string]int{},
-		adopt:    map[string]bool{},
+		exists: true,
+		ids:    map[string]string{},
+		values: map[string]string{},
+		refuse: map[string]bool{},
 	}
 }
 
@@ -256,15 +255,19 @@ func (e *vercelEnvAPI) seed(key, value string) {
 	e.values[key] = value
 }
 
-// failCreate makes the next create of key answer 403 — the documented
-// already-exists conflict. With adopt set, the variable appears in the
-// store at that moment, exactly as a concurrent creation would; without it
-// the 403 is a plain refusal and the store stays empty.
-func (e *vercelEnvAPI) failCreate(key string, adopt bool) {
+// refuseUpsert makes every upsert of key answer 403 — with the upsert flag
+// in play a 403 can only be a permission refusal, never an already-exists.
+func (e *vercelEnvAPI) refuseUpsert(key string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.conflict[key]++
-	e.adopt[key] = adopt
+	e.refuse[key] = true
+}
+
+// value returns the stored value of key — what the platform now serves.
+func (e *vercelEnvAPI) value(key string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.values[key]
 }
 
 // route answers the env endpoints and reports whether it did. A missing
@@ -273,9 +276,7 @@ func (e *vercelEnvAPI) failCreate(key string, adopt bool) {
 func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request) bool {
 	path := r.URL.Path
 	envPath := strings.HasPrefix(path, "/v10/projects/") && strings.HasSuffix(path, "/env")
-	patchPath := r.Method == http.MethodPatch && strings.HasPrefix(path, "/v9/projects/") && strings.Contains(path, "/env/")
-	envCall := (r.Method == http.MethodGet || r.Method == http.MethodPost) && envPath
-	if !envCall && !patchPath {
+	if !envPath || (r.Method != http.MethodGet && r.Method != http.MethodPost) {
 		return false
 	}
 	body := f.lastBody()
@@ -287,6 +288,8 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 	}
 	switch r.Method {
 	case http.MethodGet:
+		// One page carrying the whole store: a client that goes back to
+		// listing at least never sees a partial answer here.
 		keys := make([]string, 0, len(e.ids))
 		for key := range e.ids {
 			keys = append(keys, key)
@@ -309,17 +312,13 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusBadRequest, `{"error":{"code":"bad_request"}}`)
 			return true
 		}
-		if _, ok := e.ids[create.Key]; ok {
-			writeJSON(w, http.StatusForbidden, `{"error":{"code":"conflict","message":"already exists"}}`)
+		if e.refuse[create.Key] {
+			writeJSON(w, http.StatusForbidden, `{"error":{"code":"forbidden","message":"no access to this project"}}`)
 			return true
 		}
-		if e.conflict[create.Key] > 0 {
-			e.conflict[create.Key]--
-			if e.adopt[create.Key] {
-				e.ids[create.Key] = "env_" + strings.ToLower(create.Key)
-				e.values[create.Key] = create.Value
-				delete(e.adopt, create.Key)
-			}
+		if _, ok := e.ids[create.Key]; ok && r.URL.Query().Get("upsert") != "true" {
+			// The documented conflict: creating an existing key without
+			// the upsert flag.
 			writeJSON(w, http.StatusForbidden, `{"error":{"code":"conflict","message":"already exists"}}`)
 			return true
 		}
@@ -330,24 +329,6 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 			"failed":  []any{},
 		})
 		writeJSON(w, http.StatusCreated, string(raw))
-	case http.MethodPatch:
-		id := path[strings.LastIndex(path, "/env/")+len("/env/"):]
-		var key string
-		for k, v := range e.ids {
-			if v == id {
-				key = k
-			}
-		}
-		if key == "" {
-			writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found"}}`)
-			return true
-		}
-		var update struct {
-			Value string `json:"value"`
-		}
-		_ = json.Unmarshal(body, &update)
-		e.values[key] = update.Value
-		writeJSON(w, http.StatusOK, `{"id":"`+id+`","value":""}`)
 	}
 	return true
 }
@@ -537,11 +518,12 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 		t.Errorf("projectSettings.framework = %q, want explicit null", *settings.Framework)
 	}
 
-	// Both worker variables were created on the Project Env API before the
-	// deployment — encrypted, production-targeted, one create each.
+	// Both worker variables were upserted on the Project Env API before the
+	// deployment — one POST each, encrypted and production-targeted, carrying
+	// the documented upsert flag so the call is create-or-update by key.
 	creates := f.callsFor(t, http.MethodPost, "/v10/projects/web-relay/env")
 	if len(creates) != 2 {
-		t.Fatalf("%d env creates, want one per worker variable", len(creates))
+		t.Fatalf("%d env upserts, want one per worker variable", len(creates))
 	}
 	created := map[string]struct {
 		value  string
@@ -550,6 +532,9 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 	}{}
 	for _, c := range creates {
 		requireBearer(t, c, "tok")
+		if c.RawQuery != "upsert=true" {
+			t.Errorf("env upsert query = %q, want upsert=true", c.RawQuery)
+		}
 		var b struct {
 			Key    string   `json:"key"`
 			Value  string   `json:"value"`
@@ -557,7 +542,7 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 			Target []string `json:"target"`
 		}
 		if err := json.Unmarshal(c.Body, &b); err != nil {
-			t.Fatalf("decode env create: %v", err)
+			t.Fatalf("decode env upsert: %v", err)
 		}
 		created[b.Key] = struct {
 			value  string
@@ -566,28 +551,35 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 		}{b.Value, b.Type, b.Target}
 	}
 	if c := created["RELAY_VERSION"]; c.value != "1.0.0" || c.typ != "encrypted" || len(c.target) != 1 || c.target[0] != "production" {
-		t.Errorf("RELAY_VERSION create = %+v, want 1.0.0 encrypted on production", c)
+		t.Errorf("RELAY_VERSION upsert = %+v, want 1.0.0 encrypted on production", c)
 	}
 	if c := created["RELAY_AUTH_TOKEN"]; c.value != "relay-key" || c.typ != "encrypted" || len(c.target) != 1 || c.target[0] != "production" {
-		t.Errorf("RELAY_AUTH_TOKEN create = %+v, want the relay key encrypted on production", c)
+		t.Errorf("RELAY_AUTH_TOKEN upsert = %+v, want the relay key encrypted on production", c)
 	}
-	for _, c := range f.callsFor(t, http.MethodGet, "/v10/projects/web-relay/env") {
-		requireBearer(t, c, "tok")
-	}
+	// The env walk never lists and never edits by id: the list is paginated
+	// (a list-first client can miss its own variables on a reused project)
+	// and the upsert call needs no ids at all.
 	for _, c := range f.recorded() {
+		if c.Method == http.MethodGet && c.Path == "/v10/projects/web-relay/env" {
+			t.Errorf("unexpected env list %s %s — the upsert call needs no ids", c.Method, c.Path)
+		}
 		if c.Method == http.MethodPatch {
-			t.Errorf("unexpected %s %s on a fresh project", c.Method, c.Path)
+			t.Errorf("unexpected %s %s on the env API", c.Method, c.Path)
 		}
 	}
 }
 
-// TestVercelDeployUpdatesExistingProjectEnv pins the redeploy wire: a
-// variable left behind by the previous deploy is updated in place through
-// the documented edit endpoint, and only the genuinely missing one is
-// created — the upsert is idempotent by key.
-func TestVercelDeployUpdatesExistingProjectEnv(t *testing.T) {
+// TestVercelDeployEnvUpsertOverwritesExisting pins the redeploy wire on a
+// reused project: however many variables the previous life of the project
+// left behind — enough to push the RELAY_* pair past any list page — the
+// same two upsert calls land the deployed values, with no list walk and no
+// per-id edit to go page-blind on.
+func TestVercelDeployEnvUpsertOverwritesExisting(t *testing.T) {
 	env := newVercelEnvAPI()
 	env.seed("RELAY_VERSION", "0.9.0")
+	for i := range 200 { // a crowded project: more variables than any page
+		env.seed("VAR_"+strconv.Itoa(i), "x")
+	}
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
 		if env.route(f, w, r) {
 			return
@@ -611,51 +603,61 @@ func TestVercelDeployUpdatesExistingProjectEnv(t *testing.T) {
 		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
 	}
 
-	patch := f.callFor(t, http.MethodPatch, "/v9/projects/web-relay/env/env_relay_version")
-	requireBearer(t, patch, "tok")
-	if patch.RawQuery != "teamId=team_42" {
-		t.Errorf("patch query = %q, want the pinned team scope", patch.RawQuery)
-	}
-	var body struct {
-		Value  string   `json:"value"`
-		Type   string   `json:"type"`
-		Target []string `json:"target"`
-	}
-	if err := json.Unmarshal(patch.Body, &body); err != nil {
-		t.Fatalf("decode patch body: %v", err)
-	}
-	if body.Value != "2.0.0" || body.Type != "encrypted" || len(body.Target) != 1 || body.Target[0] != "production" {
-		t.Errorf("patch body = %+v, want the new version encrypted on production", body)
-	}
-
 	creates := f.callsFor(t, http.MethodPost, "/v10/projects/web-relay/env")
-	if len(creates) != 1 {
-		t.Fatalf("%d env creates, want exactly the missing variable", len(creates))
+	if len(creates) != 2 {
+		t.Fatalf("%d env upserts, want exactly one per worker variable", len(creates))
 	}
-	var create struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
+	values := map[string]string{}
+	for _, c := range creates {
+		requireBearer(t, c, "tok")
+		if c.RawQuery != "teamId=team_42&upsert=true" {
+			t.Errorf("env upsert query = %q, want the pinned team scope with upsert=true", c.RawQuery)
+		}
+		var b struct {
+			Key    string   `json:"key"`
+			Value  string   `json:"value"`
+			Type   string   `json:"type"`
+			Target []string `json:"target"`
+		}
+		if err := json.Unmarshal(c.Body, &b); err != nil {
+			t.Fatalf("decode env upsert: %v", err)
+		}
+		if b.Type != "encrypted" || len(b.Target) != 1 || b.Target[0] != "production" {
+			t.Errorf("%s upsert = %+v, want encrypted on production", b.Key, b)
+		}
+		values[b.Key] = b.Value
 	}
-	if err := json.Unmarshal(creates[0].Body, &create); err != nil {
-		t.Fatalf("decode create body: %v", err)
+	if values["RELAY_VERSION"] != "2.0.0" || values["RELAY_AUTH_TOKEN"] != "relay-key" {
+		t.Errorf("upsert values = %+v, want the deployed version and relay key", values)
 	}
-	if create.Key != "RELAY_AUTH_TOKEN" || create.Value != "relay-key" {
-		t.Errorf("create = %+v, want the relay key", create)
+	if got := env.value("RELAY_VERSION"); got != "2.0.0" {
+		t.Errorf("stored RELAY_VERSION = %q, want the overwrite to land", got)
+	}
+	for _, c := range f.recorded() {
+		if c.Method == http.MethodGet && c.Path == "/v10/projects/web-relay/env" {
+			t.Errorf("unexpected env list %s %s — a list walk can go page-blind", c.Method, c.Path)
+		}
+		if c.Method == http.MethodPatch {
+			t.Errorf("unexpected %s %s on the env API", c.Method, c.Path)
+		}
 	}
 }
 
 // TestVercelDeployCreatesProjectBeforeFirstEnv: on a brand-new relay the env
-// list 404s because the project does not exist yet — but the variables must
+// call 404s because the project does not exist yet — but the variables must
 // be in place before the first deployment runs, so Deploy creates the empty
-// project first. A 409 from a concurrent creation is the same end state.
+// project first. A 409 from a concurrent creation is the same end state; a
+// 403 is a permission refusal and must fail the deploy as a credentials
+// error, not as a confusing not-found on the env call that would follow.
 func TestVercelDeployCreatesProjectBeforeFirstEnv(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		createStatus  int
-		wantCreateErr bool
+		name         string
+		createStatus int
+		wantErr      error // nil: the deploy proceeds to the deployment
 	}{
-		{name: "created", createStatus: http.StatusOK},
+		{name: "created", createStatus: http.StatusCreated},
 		{name: "already exists", createStatus: http.StatusConflict},
+		{name: "forbidden", createStatus: http.StatusForbidden, wantErr: ErrCredentials},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newVercelEnvAPI()
@@ -663,7 +665,9 @@ func TestVercelDeployCreatesProjectBeforeFirstEnv(t *testing.T) {
 			f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodPost && r.URL.Path == "/v11/projects" {
 					writeJSON(w, tc.createStatus, `{"id":"prj_1","name":"web-relay"}`)
-					env.exists = true
+					if tc.wantErr == nil {
+						env.exists = true
+					}
 					return
 				}
 				if env.route(f, w, r) {
@@ -683,9 +687,45 @@ func TestVercelDeployCreatesProjectBeforeFirstEnv(t *testing.T) {
 			spec := Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
-			if out.err == nil {
-				t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+
+			// The refused create never reaches the gating deployment call,
+			// so that shape runs Deploy to its own early return.
+			if tc.wantErr != nil {
+				_, err := client.Deploy(ctx, spec)
+				if err == nil || !errors.Is(err, tc.wantErr) || !strings.Contains(err.Error(), "vercel create project") {
+					t.Fatalf("Deploy error = %v, want the create-project %v failure", err, tc.wantErr)
+				}
+				envCalls := 0
+				for _, c := range f.recorded() {
+					if c.Path == "/v13/deployments" {
+						t.Errorf("deployment fired despite the refused project create: %s %s", c.Method, c.Path)
+					}
+					if strings.HasPrefix(c.Path, "/v10/projects/web-relay/env") {
+						envCalls++
+					}
+				}
+				if envCalls != 1 {
+					t.Errorf("%d env calls, want only the initial 404 probe before the refused create", envCalls)
+				}
+			} else {
+				out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
+				if out.err == nil {
+					t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
+				}
+				// The variables landed before the deployment did.
+				firstDeploy := -1
+				lastEnv := -1
+				for i, c := range f.recorded() {
+					if c.Path == "/v13/deployments" && c.Method == http.MethodPost && firstDeploy < 0 {
+						firstDeploy = i
+					}
+					if strings.HasPrefix(c.Path, "/v10/projects/web-relay/env") {
+						lastEnv = i
+					}
+				}
+				if firstDeploy < 0 || lastEnv < 0 || lastEnv > firstDeploy {
+					t.Fatalf("env calls must precede the deployment: last env at %d, deployment at %d", lastEnv, firstDeploy)
+				}
 			}
 
 			create := f.callFor(t, http.MethodPost, "/v11/projects")
@@ -700,72 +740,17 @@ func TestVercelDeployCreatesProjectBeforeFirstEnv(t *testing.T) {
 			if body.Name != "web-relay" || body.Framework != nil {
 				t.Errorf("create-project body = %+v, want the name with an explicit null framework", body)
 			}
-			// The variables landed before the deployment did.
-			deployCall := f.recorded()
-			firstDeploy := -1
-			lastEnv := -1
-			for i, c := range deployCall {
-				if c.Path == "/v13/deployments" && c.Method == http.MethodPost && firstDeploy < 0 {
-					firstDeploy = i
-				}
-				if strings.HasPrefix(c.Path, "/v10/projects/web-relay/env") || strings.HasPrefix(c.Path, "/v9/projects/web-relay/env") {
-					lastEnv = i
-				}
-			}
-			if firstDeploy < 0 || lastEnv < 0 || lastEnv > firstDeploy {
-				t.Fatalf("env calls must precede the deployment: last env at %d, deployment at %d", lastEnv, firstDeploy)
-			}
 		})
 	}
 }
 
-// TestVercelDeployEnvCreateConflictAdoptsExisting: a 403 on create is the
-// documented already-exists answer — Deploy re-lists, adopts the variable
-// and updates it instead of failing.
-func TestVercelDeployEnvCreateConflictAdoptsExisting(t *testing.T) {
-	env := newVercelEnvAPI()
-	env.failCreate("RELAY_VERSION", true) // 403, then the variable appears — a concurrent creation
-	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
-		if env.route(f, w, r) {
-			return
-		}
-		if r.Method == http.MethodPost && r.URL.Path == "/v13/deployments" {
-			writeJSON(w, http.StatusOK, `{"id":"dpl_1","readyState":"READY"}`)
-			f.signal()
-			return
-		}
-		writeJSON(w, http.StatusNotFound, `{"error":"unexpected"}`)
-	})
-	client, err := factoryAt(t, VercelAPIBaseEnv, f.URL).For(PlatformVercel, Credential{Token: "tok"})
-	if err != nil {
-		t.Fatalf("For: %v", err)
-	}
-	spec := Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	out := runDeployUntilGate(t, ctx, cancel, f, client, spec)
-	if out.err == nil {
-		t.Fatal("Deploy = nil error; a deployment can never go live against a fake")
-	}
-	patch := f.callFor(t, http.MethodPatch, "/v9/projects/web-relay/env/env_relay_version")
-	var body struct {
-		Value string `json:"value"`
-	}
-	if err := json.Unmarshal(patch.Body, &body); err != nil {
-		t.Fatalf("decode patch body: %v", err)
-	}
-	if body.Value != "1.0.0" {
-		t.Errorf("patch value = %q, want the deployed version", body.Value)
-	}
-}
-
-// TestVercelDeployEnvRefusalFailsTheDeploy: a 403 that is a permission
-// refusal, not a conflict — the re-list still finds nothing, so the create
-// error stands and no deployment is fired at a project whose env the
-// gateway could not set.
+// TestVercelDeployEnvRefusalFailsTheDeploy: a 403 on the upsert can only be
+// a permission refusal — with upsert=true there is no already-exists answer
+// — so Deploy reports a credentials error and fires no deployment at a
+// project whose env the gateway could not set.
 func TestVercelDeployEnvRefusalFailsTheDeploy(t *testing.T) {
 	env := newVercelEnvAPI()
-	env.failCreate("RELAY_VERSION", false) // 403 with nothing behind it: a refusal
+	env.refuseUpsert("RELAY_VERSION") // 403 on the upsert: a refusal
 	f := newFakeAPI(t, func(f *fakeAPI, w http.ResponseWriter, r *http.Request) {
 		if env.route(f, w, r) {
 			return
@@ -777,8 +762,8 @@ func TestVercelDeployEnvRefusalFailsTheDeploy(t *testing.T) {
 		t.Fatalf("For: %v", err)
 	}
 	_, err = client.Deploy(context.Background(), Spec{Project: "web-relay", Source: "src", Version: "1.0.0", Token: "k"})
-	if err == nil || !strings.Contains(err.Error(), "vercel env") {
-		t.Fatalf("Deploy error = %v, want the env failure", err)
+	if err == nil || !strings.Contains(err.Error(), "vercel env") || !errors.Is(err, ErrCredentials) {
+		t.Fatalf("Deploy error = %v, want the env credentials failure", err)
 	}
 	for _, c := range f.recorded() {
 		if c.Path == "/v13/deployments" {

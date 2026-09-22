@@ -375,7 +375,8 @@ type vercelRewrites struct {
 }
 
 // routesRoot reports whether the deployment's files carry the vercel.json
-// catch-all rewrite to the worker: without it Vercel serves the api/
+// catch-all rewrite to the worker — exactly the shape the client ships, so
+// the lock admits no looser substitute: without it Vercel serves the api/
 // function only at /api/relay and every root probe dies on Vercel's 404.
 func (p *vercelPayload) routesRoot() bool {
 	for _, fl := range p.Files {
@@ -391,7 +392,7 @@ func (p *vercelPayload) routesRoot() bool {
 			continue
 		}
 		for _, rw := range cfg.Rewrites {
-			if (rw.Source == "/(.*)" || rw.Source == "/") && rw.Destination == "/api/relay" {
+			if rw.Source == "/(.*)" && rw.Destination == "/api/relay" {
 				return true
 			}
 		}
@@ -465,10 +466,11 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.record("vercel", "env-create", slug, r)
-		id, conflict := p.setEnv(f, body.Key, body.Value, body.Type, body.Target)
+		upsert := r.URL.Query().Get("upsert") == "true"
+		id, conflict := p.setEnv(f, body.Key, body.Value, body.Type, body.Target, upsert)
 		if conflict {
 			// The documented conflict answer: an existing key cannot be
-			// created again.
+			// created again without the upsert flag.
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "already exists"})
 			return
 		}
@@ -570,12 +572,13 @@ func (p *fakeProject) envList(f *fakeEdge) []fakeEnvVar {
 	return out
 }
 
-// setEnv creates one variable, reporting the conflict the real API answers
-// with 403 when the key already exists.
-func (p *fakeProject) setEnv(f *fakeEdge, key, value, typ string, target []string) (string, bool) {
+// setEnv stores one variable, reporting the conflict the real API answers
+// with 403: an existing key stored by a call that is not an upsert. An
+// upsert overwrites the existing entry in place.
+func (p *fakeProject) setEnv(f *fakeEdge, key, value, typ string, target []string, upsert bool) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := p.envs[key]; ok {
+	if _, ok := p.envs[key]; ok && !upsert {
 		return "", true
 	}
 	if p.envs == nil {
