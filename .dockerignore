@@ -7,6 +7,8 @@ bin
 e2e
 node_modules
 
-# Provider credentials (compose.yaml env_file) must never ride the build
-# context, let alone the image.
+# Provider credentials — the compose env_file plus token_file: secrets
+# (config.example.yaml suggests relay-token.secret) — must never ride the
+# build context, let alone the image.
 relay.env
+*.secret
