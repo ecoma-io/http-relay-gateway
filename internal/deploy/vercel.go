@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,9 +13,11 @@ import (
 	"time"
 )
 
-// Vercel client. One project per relay, deployed from one inline file
-// (api/relay.js) with the version and relay key riding as deployment env.
-// The stable URL is the project's default production domain
+// Vercel client. One project per relay, deployed from two inline files
+// (api/relay.js + vercel.json) with the version and relay key riding as
+// project environment variables, upserted through the Project Env API
+// before each deployment — POST /v13/deployments carries no env of its
+// own. The stable URL is the project's default production domain
 // (<project>.vercel.app) — derived deterministically, identical across
 // redeploys, and never the per-deployment URL, which changes on every push.
 //
@@ -26,8 +29,17 @@ const (
 	vercelReadyTimeout = 2 * time.Minute
 	vercelLiveTimeout  = 30 * time.Second
 	vercelWorkerPath   = "api/relay.js"
+	vercelConfigPath   = "vercel.json"
 	vercelStatusPoll   = time.Second
 )
+
+// vercelConfig routes every request to the worker. Files under api/ serve
+// only at /api/* on Vercel, while every gateway probe and every relayed
+// request targets the project root — without this rewrite the worker is
+// unreachable (#21). The catch-all is Vercel's documented SPA fallback
+// shape, and rewrites run only after the filesystem check, so /api/relay
+// itself still resolves to the function and the rewrite never loops.
+const vercelConfig = `{"rewrites":[{"source":"/(.*)","destination":"/api/relay"}]}`
 
 type vercelClient struct {
 	base string
@@ -93,26 +105,33 @@ type vercelDeployment struct {
 	ReadyState string `json:"readyState"`
 }
 
-// Deploy uploads the worker as a production deployment of the project (the
-// project is created on first deploy), waits for READY, then waits until the
-// new worker actually answers its version endpoint.
+// Deploy uploads the worker as a production deployment of the project,
+// waits for READY, then waits until the new worker actually answers its
+// version endpoint. The version and relay key reach the worker as project
+// environment variables set before the deployment is created — the
+// documented mechanism, since the v13 deployment request has no env fields
+// of its own (#22).
 func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
+	if err := c.ensureEnv(ctx, spec.Project, spec.Version, spec.Token); err != nil {
+		return Result{}, err
+	}
 	payload := map[string]any{
 		"name":   spec.Project,
 		"target": "production",
-		"files": []vercelFile{{
-			File:     vercelWorkerPath,
-			Data:     base64.StdEncoding.EncodeToString([]byte(spec.Source)),
-			Encoding: "base64",
-		}},
+		"files": []vercelFile{
+			{
+				File:     vercelWorkerPath,
+				Data:     base64.StdEncoding.EncodeToString([]byte(spec.Source)),
+				Encoding: "base64",
+			},
+			{
+				File:     vercelConfigPath,
+				Data:     base64.StdEncoding.EncodeToString([]byte(vercelConfig)),
+				Encoding: "base64",
+			},
+		},
 		// No framework: the worker is a bare edge function, not an app.
 		"projectSettings": map[string]any{"framework": nil},
-		// A public relay must never sit behind the SSO wall.
-		"deploymentProtection": map[string]any{"ssoProtection": nil},
-		"env": []map[string]any{
-			{"key": "RELAY_VERSION", "value": spec.Version, "target": []string{"production"}},
-			{"key": "RELAY_AUTH_TOKEN", "value": spec.Token, "target": []string{"production"}},
-		},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -160,6 +179,123 @@ func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 		return Result{}, fmt.Errorf("vercel deploy: %w", err)
 	}
 	return result, nil
+}
+
+// ensureEnv makes RELAY_VERSION and RELAY_AUTH_TOKEN — the exact pair the
+// worker's Vercel entry reads from process.env — carry the deployed values
+// on the production target. Each variable lands through the documented
+// upsert call, which creates it or overwrites the existing entry of the same
+// key; no list-first walk is involved, because the env list is paginated and
+// a reused project can hold its RELAY_* variables past any page a client
+// stops reading at. The values ride request bodies only and never appear in
+// an error or a log.
+func (c *vercelClient) ensureEnv(ctx context.Context, project, version, token string) error {
+	for _, v := range []struct{ key, value string }{
+		{"RELAY_VERSION", version},
+		{"RELAY_AUTH_TOKEN", token},
+	} {
+		err := c.upsertEnv(ctx, project, v.key, v.value)
+		switch {
+		case err == nil:
+		case notFound(err):
+			// A 404 from the env call is a project that does not exist
+			// yet. The first deployment would create it, but the
+			// variables must be in place before that deployment runs,
+			// so create the empty project and set the variable on it.
+			if cerr := c.createProject(ctx, project); cerr != nil {
+				return cerr
+			}
+			if err = c.upsertEnv(ctx, project, v.key, v.value); err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+	}
+	return nil
+}
+
+// upsertEnv lands one project environment variable: encrypted, scoped to the
+// production target, created or overwritten in place through the documented
+// upsert flag — idempotent by key, so a redeploy with a rotated key or a new
+// version lands the new value before the next deployment reads it.
+func (c *vercelClient) upsertEnv(ctx context.Context, project, key, value string) error {
+	body, err := json.Marshal(vercelEnvBody{Key: key, Value: value, Type: "encrypted", Target: []string{"production"}})
+	if err != nil {
+		return err
+	}
+	var answer struct {
+		Failed []struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"failed"`
+	}
+	u := c.base + "/v10/projects/" + url.PathEscape(project) + "/env" + c.envQuery()
+	err = platformCall(ctx, c.http, http.MethodPost, u, c.cred.Token,
+		"application/json", strings.NewReader(string(body)), &answer)
+	switch {
+	case err == nil:
+	case credentialsRejected(err):
+		return fmt.Errorf("vercel env %s: %w", key, ErrCredentials)
+	default:
+		return fmt.Errorf("vercel env %s: %w", key, err)
+	}
+	if len(answer.Failed) > 0 {
+		return fmt.Errorf("vercel env %s: %s", key, answer.Failed[0].Error.Message)
+	}
+	return nil
+}
+
+// envQuery is the query of an env upsert: upsert=true — the documented flag
+// that makes the create call overwrite an existing variable of the same key
+// instead of answering 403 — plus the team scope when pinned.
+func (c *vercelClient) envQuery() string {
+	v := url.Values{}
+	v.Set("upsert", "true")
+	if c.cred.Team != "" {
+		v.Set("teamId", c.cred.Team)
+	}
+	return "?" + v.Encode()
+}
+
+// vercelEnvBody is the request body of the env upsert call.
+type vercelEnvBody struct {
+	Key    string   `json:"key"`
+	Value  string   `json:"value"`
+	Type   string   `json:"type"`
+	Target []string `json:"target"`
+}
+
+// createProject creates the empty project a first deploy needs before its
+// environment variables can be set. A 409 conflict is an existing project —
+// the desired end state. A 403 there is a permission refusal on the account
+// or team, never a duplicate, and surfaces as a credentials error here
+// rather than as a misleading not-found on the env call that follows.
+func (c *vercelClient) createProject(ctx context.Context, project string) error {
+	body, err := json.Marshal(map[string]any{"name": project, "framework": nil})
+	if err != nil {
+		return err
+	}
+	u := c.base + "/v11/projects" + c.teamQuery()
+	err = platformCall(ctx, c.http, http.MethodPost, u, c.cred.Token,
+		"application/json", strings.NewReader(string(body)), nil)
+	switch {
+	case err == nil, alreadyExists(err):
+		return nil
+	case credentialsRejected(err):
+		return fmt.Errorf("vercel create project: %w", ErrCredentials)
+	default:
+		return fmt.Errorf("vercel create project: %w", err)
+	}
+}
+
+// alreadyExists reports the platform's duplicate answer: 409, the documented
+// project-create conflict. A 403 is a permission refusal on every Vercel
+// endpoint and must never be read as a conflict.
+func alreadyExists(err error) bool {
+	var pe *platformError
+	return errors.As(err, &pe) && pe.status == http.StatusConflict
 }
 
 // Delete removes the project; a missing project is already the desired end
