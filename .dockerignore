@@ -6,3 +6,7 @@
 bin
 e2e
 node_modules
+
+# Provider credentials (compose.yaml env_file) must never ride the build
+# context, let alone the image.
+relay.env

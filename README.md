@@ -477,6 +477,27 @@ bind-mounts `./config.yaml` read-only into the container, requires
 above `SHUTDOWN_GRACE` (default 20s), bounds `json-file` logs, and uses the
 binary `healthcheck` subcommand (no shell in the image).
 
+Provider credentials reach the container through **`relay.env`** — an
+operator-created, never-committed file next to `compose.yaml` that compose
+injects (`env_file`) into the container environment, so the `${VAR}`
+references inside `config.yaml` resolve there rather than against the
+host shell:
+
+```bash
+cat > relay.env <<'EOF'
+VERCEL_TOKEN=...
+CLOUDFLARE_API_TOKEN=...
+DENO_DEPLOY_TOKEN=...
+# optional scope pins, when the config references them:
+# VERCEL_TEAM_ID=...
+# CLOUDFLARE_ACCOUNT_ID=...
+EOF
+chmod 600 relay.env
+```
+
+The file is optional — compose treats it as such — because a fleet whose
+relays all use `token_file:` secrets needs none of these variables.
+
 ## Layout
 
 - `cmd/http-relay-gateway` — lifecycle, signals, the config poller, the
