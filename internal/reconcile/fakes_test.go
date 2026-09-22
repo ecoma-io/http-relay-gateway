@@ -111,6 +111,8 @@ func (s *workerSim) handler() http.Handler {
 
 func (s *workerSim) setVersion(v string) { s.mu.Lock(); s.version = v; s.mu.Unlock() }
 
+func (s *workerSim) setSuspend(v bool) { s.mu.Lock(); s.suspend = v; s.mu.Unlock() }
+
 func (s *workerSim) lastToken() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -220,6 +222,7 @@ type recordedClient struct {
 	deleteErr   error
 	fixSim      bool
 	deleteHook  func() // blocks the delete while non-nil
+	postDeploy  func() // runs after the deploy records; models what the platform does to the URL next
 }
 
 func (c *recordedClient) Platform() string { return c.platform }
@@ -239,7 +242,7 @@ func (c *recordedClient) Deploy(_ context.Context, spec deploy.Spec) (deploy.Res
 	c.f.mu.Lock()
 	c.f.deploys = append(c.f.deploys, spec)
 	c.f.log.add("deploy")
-	deployErr, fixSim := c.deployErr, c.fixSim
+	deployErr, fixSim, postDeploy := c.deployErr, c.fixSim, c.postDeploy
 	c.exists = true // a real deploy creates the project; later discovery finds it
 	c.f.mu.Unlock()
 	if deployErr != nil {
@@ -252,6 +255,9 @@ func (c *recordedClient) Deploy(_ context.Context, spec deploy.Spec) (deploy.Res
 		c.f.sim.suspend = false
 		c.f.sim.forward = 0
 		c.f.sim.mu.Unlock()
+	}
+	if postDeploy != nil {
+		postDeploy()
 	}
 	return deploy.Result{Project: spec.Project, URL: c.url}, nil
 }

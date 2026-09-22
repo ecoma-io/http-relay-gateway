@@ -261,6 +261,115 @@ func TestPassSuspensionPausesThenRevives(t *testing.T) {
 	}
 }
 
+// A transport blip during the revival probe must not erode the pause: the
+// relay keeps the paused label and its own revival cadence (10m here)
+// instead of falling into the ordinary verification backoff (base 1s,
+// recover ceiling 15s) — which would re-probe a suspended platform every
+// few seconds until the next 402 re-pauses it.
+func TestPassTransportBlipDuringRevivalKeepsThePauseCadence(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	client := rig.newPrimaryClient(true)
+	rig.sim.setSuspend(true)
+
+	rig.worker.pass() // the platform answers instead of the worker: pause
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+
+	// At the revival tick the platform blips on transport instead of
+	// answering: the relay must stay paused, not become an ordinary failure.
+	rig.clock.Advance(10 * time.Minute)
+	rig.factory.mu.Lock()
+	client.discoverErr = errors.New("transport blip")
+	rig.factory.mu.Unlock()
+	rig.worker.pass()
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StatePaused {
+		t.Fatalf("state after a transport blip during revival = %s, want paused", rec.State)
+	}
+
+	// The cadence pin: ordinary backoff would probe again within two
+	// minutes; a paused relay must not probe until the next revival tick.
+	probes := rig.factory.forCount()
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.forCount(); got != probes {
+		t.Fatalf("factory calls = %d after %d (the pause cadence eroded into the ordinary backoff)", got, probes)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want still paused", rec.State)
+	}
+
+	// Past the full revival cadence the relay re-probes and rejoins.
+	rig.factory.mu.Lock()
+	client.discoverErr = nil
+	rig.factory.mu.Unlock()
+	rig.sim.setSuspend(false)
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.clock.Advance(8 * time.Minute)
+	rig.worker.pass()
+	if !rig.reg.IsReady(key) {
+		t.Fatal("revived relay not re-admitted after the blip")
+	}
+}
+
+// A catch-up deploy of a previously paused relay can land on a platform
+// that re-suspends the project behind the URL it just switched. The
+// suspension must pause on the revival cadence — not demote into the
+// ordinary backoff, and never fire another deploy at the suspension.
+func TestRolloutResuspensionPausesOnTheRevivalCadence(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready on the first pass")
+	}
+
+	// The platform suspends the relay.
+	rig.sim.setSuspend(true)
+	rig.worker.pass()
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+
+	// The revival tick: the suspension lifted but the worker went stale, so
+	// a catch-up deploy runs — and the platform re-suspends behind it.
+	rig.clock.Advance(10 * time.Minute)
+	rig.sim.setSuspend(false)
+	rig.sim.setVersion("0.0.1-stale")
+	rig.factory.mu.Lock()
+	client.fixSim = false // the deploy does not heal the sim
+	client.postDeploy = func() { rig.sim.setSuspend(true) }
+	rig.factory.mu.Unlock()
+	rig.worker.pass()
+
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 catch-up deploy", got)
+	}
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StatePaused || rec.Reason != readiness.ReasonPaused {
+		t.Fatalf("state/reason = %s/%s, want paused/paused (a suspension is never a demotion)", rec.State, rec.Reason)
+	}
+	if rig.reg.IsReady(key) {
+		t.Fatal("suspended relay admitted")
+	}
+
+	// The revival cadence holds: the ordinary backoff (≤15s at zero ready)
+	// would re-probe within two minutes; a paused relay must not.
+	probes := rig.factory.forCount()
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.forCount(); got != probes {
+		t.Fatalf("factory calls = %d after %d (a re-suspended relay must keep the revival cadence)", got, probes)
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want still 1 (no deploy is ever fired at a suspension)", got)
+	}
+}
+
 // --- credential problems ---
 
 func TestPassCredentialRejectionNeverDeploys(t *testing.T) {

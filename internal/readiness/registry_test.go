@@ -485,6 +485,47 @@ func TestFailingKeepsPausedRelaysPaused(t *testing.T) {
 	}
 }
 
+// A sync pass runs Enter(discovering) before every probe — including the
+// revival probe of a suspended relay. Routine progress must not clobber the
+// pause marker, or a transport blip during revival finds the relay
+// mid-discover, Failing labels it failed, and the ordinary backoff erodes
+// the revival cadence. Definitive transitions (a deploy) still leave the
+// pause.
+func TestEnterKeepsPausedRelaysPausedThroughRoutineProgress(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	r.Sync([]Key{keyA})
+	gen := generationOf(t, r, keyA)
+	r.Pause(keyA, gen, ReasonPaused)
+
+	r.Enter(keyA, gen, StateDiscovering, "")
+	r.Enter(keyA, gen, StateVerifying, "")
+	if rec, _ := r.StateOf(keyA); rec.State != StatePaused {
+		t.Fatalf("state = %s after routine progress, want paused", rec.State)
+	}
+
+	// The blip: with the marker intact, Failing keeps the paused label and
+	// the PauseRetry gate instead of the ordinary backoff.
+	r.Failing(keyA, gen, ReasonUnreachable, 0)
+	if rec, _ := r.StateOf(keyA); rec.State != StatePaused {
+		t.Fatalf("state = %s after a blip during revival, want paused", rec.State)
+	}
+	c.Advance(2 * time.Minute) // past every ordinary backoff ceiling here (4s)
+	if r.Allow(keyA) {
+		t.Fatal("routine progress eroded the paused revival gate into the ordinary backoff")
+	}
+	c.Advance(8 * time.Minute)
+	if !r.Allow(keyA) {
+		t.Fatal("pause gate did not release at the revival cadence")
+	}
+
+	// A deploy is definitive: it takes the relay out of the pause.
+	r.Enter(keyA, gen, StateDeploying, "")
+	if rec, _ := r.StateOf(keyA); rec.State != StateDeploying {
+		t.Fatalf("state = %s after Enter(deploying), want deploying", rec.State)
+	}
+}
+
 func TestDeleteLifecycleGuardsAndPurge(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)

@@ -446,6 +446,17 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 		return
 	}
 	v := w.verify(result.URL, relayKey)
+	if v.kind == verifySuspended {
+		// The deploy switched the production URL and the platform suspended
+		// the project behind it (a re-suspension during a catch-up deploy of
+		// a previously paused relay). No deploy lifts a suspension — pause on
+		// the revival cadence; a demotion would label it failed with the
+		// ordinary backoff armed, re-probing a suspended platform every few
+		// seconds instead.
+		w.reg.Pause(key, gen, readiness.ReasonPaused)
+		w.logWarn("rollout: new worker answered with a suspension page; paused on the revival cadence", key)
+		return
+	}
 	if v.kind != verifyOK {
 		// The platform switched the production URL and the new worker cannot
 		// be trusted. The old worker no longer exists behind that URL, so

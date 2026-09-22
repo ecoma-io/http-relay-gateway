@@ -437,7 +437,12 @@ func (r *Registry) Allow(key Key) bool {
 
 // Enter moves key to an explicit phase (discovering, deploying, verifying,
 // …) without touching admission: a relay being replaced keeps serving under
-// its previous verification, and a relay that never verified stays out.
+// its previous verification, and a relay that never verified stays out. A
+// paused relay stays paused through the routine phases (discovering,
+// verifying): a sync pass runs Enter(discovering) before every probe, and a
+// transport blip during revival must not relabel the suspension as an
+// ordinary failure — the revival cadence owns the relay until a definitive
+// verdict (ready, a deploy, a missing worker) changes it.
 // Stale completions (generation moved on) are discarded. Only the deploying
 // phase counts as a genuinely fresh attempt — it clears the failure streak
 // and reopens the backoff gate. Routine verification (verifying) must NOT
@@ -457,6 +462,9 @@ func (r *Registry) Enter(key Key, generation uint64, state State, reason string)
 	e := r.current(key, generation)
 	if e == nil {
 		return // stale completion: the incarnation moved on
+	}
+	if e.record.State == StatePaused && (state == StateDiscovering || state == StateVerifying) {
+		return // routine progress must not clobber the pause marker
 	}
 	changed := e.record.State != state || e.record.Reason != reason
 	e.record.State = state
