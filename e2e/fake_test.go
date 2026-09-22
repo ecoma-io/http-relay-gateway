@@ -35,7 +35,10 @@ type fakeEdge struct {
 	require  map[string]string       // provider -> required bearer token ("" accepts any)
 	projects map[string]*fakeProject // slug -> state
 	calls    []fakeCall
-	closed   bool
+	// denoPolls counts GET /deployments/{id} polls per deployment id so the
+	// status walk can model the platform's pending→success transition.
+	denoPolls map[string]int
+	closed    bool
 }
 
 type fakeCall struct {
@@ -73,12 +76,13 @@ func newFakeEdge(t *testing.T) *fakeEdge {
 		t.Fatalf("fake platform listen: %v", err)
 	}
 	f := &fakeEdge{
-		t:        t,
-		base:     "http://" + ln.Addr().String(),
-		ln:       ln,
-		require:  map[string]string{},
-		projects: map[string]*fakeProject{},
-		client:   &http.Client{Timeout: 30 * time.Second},
+		t:         t,
+		base:      "http://" + ln.Addr().String(),
+		ln:        ln,
+		require:   map[string]string{},
+		projects:  map[string]*fakeProject{},
+		denoPolls: map[string]int{},
+		client:    &http.Client{Timeout: 30 * time.Second},
 	}
 	f.srv = &http.Server{Handler: f, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = f.srv.Serve(ln) }()
@@ -621,22 +625,33 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 		f.record("deno", "deploy", slug, r)
 		p := f.waitGate("deno", slug)
 		f.completeDeploy(p, payload.EnvVars["RELAY_VERSION"], payload.EnvVars["RELAY_AUTH_TOKEN"], source)
+		// The build is asynchronous on the platform: create answers pending
+		// and the status poll below observes the pending→success walk.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":        "dep-" + slugHash(slug),
 			"projectId": parts[2],
-			"status":    "success",
+			"status":    "pending",
 			"databases": map[string]any{},
 			"createdAt": "2026-01-01T00:00:00Z",
 			"updatedAt": "2026-01-01T00:00:00Z",
 		})
 
-	// GET /v1/deployments/{deploymentId} — the client's status poll.
+	// GET /v1/deployments/{deploymentId} — the client's status poll: the
+	// first GET after create still reports pending, the second success.
 	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "deployments":
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"id": parts[2], "status": "success"})
+		f.mu.Lock()
+		n := f.denoPolls[parts[2]]
+		f.denoPolls[parts[2]] = n + 1
+		f.mu.Unlock()
+		status := "pending"
+		if n > 0 {
+			status = "success"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": parts[2], "status": status})
 
 	// DELETE /v1/projects/{projectId} — by UUID only.
 	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "projects":

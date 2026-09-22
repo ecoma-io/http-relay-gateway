@@ -910,6 +910,9 @@ func TestDenoDiscoverMatrix(t *testing.T) {
 			}
 			call := f.callFor(t, http.MethodGet, denoProjectsPath())
 			requireBearer(t, call, "tok")
+			if call.RawQuery != "q=web-relay&page=1&limit=100" {
+				t.Errorf("list query = %q, want the spec's q name filter with paged full pages", call.RawQuery)
+			}
 		})
 	}
 }
@@ -920,7 +923,8 @@ func TestDenoDiscoverWalksPagesUntilMatch(t *testing.T) {
 			writeJSON(w, http.StatusOK, `[{"id":"`+denoTestProjectID+`","name":"web-relay"}]`)
 			return
 		}
-		// A full first page of strangers: the walk must continue.
+		// A full first page of strangers — a server that ignores the q
+		// filter: the walk must continue and the match stay client-side.
 		var b strings.Builder
 		b.WriteByte('[')
 		for i := 0; i < 100; i++ {
@@ -952,8 +956,8 @@ func TestDenoDiscoverWalksPagesUntilMatch(t *testing.T) {
 		}
 		listCalls++
 		requireBearer(t, call, "tok")
-		if call.RawQuery != "page=1&limit=100" && call.RawQuery != "page=2&limit=100" {
-			t.Errorf("list query = %q, want paged full-page requests", call.RawQuery)
+		if call.RawQuery != "q=web-relay&page=1&limit=100" && call.RawQuery != "q=web-relay&page=2&limit=100" {
+			t.Errorf("list query = %q, want the q filter on every paged request", call.RawQuery)
 		}
 	}
 	if listCalls != 2 {

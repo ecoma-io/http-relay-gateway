@@ -141,14 +141,20 @@ func (c *denoClient) Discover(ctx context.Context, project string) (Discovery, e
 	return Discovery{Exists: true, URL: denoStableURL(found.Name)}, nil
 }
 
-// findProject walks the organization's project list for an exact name match,
-// returning nil when the org holds no such project. The walk is the scope
-// pin: only a project found under the relay's own slug in the pinned
+// findProject resolves the organization's project with the exact given name,
+// returning nil when the org holds no such project. The request carries the
+// spec's `q` filter ("Query by project name or project ID") so a compliant
+// server returns a page of candidates instead of the whole organization — a
+// full page of Project objects (descriptions may be up to 1000 chars) can
+// outgrow any sane read bound. The filter is an optimization, never the
+// verdict: the walk paginates on (a server may ignore or loosely interpret
+// `q`) and the exact name match happens client-side. The walk is also the
+// scope pin: only a project found under the relay's own slug in the pinned
 // organization is ever addressed again.
 func (c *denoClient) findProject(ctx context.Context, name string) (*denoProject, error) {
 	for page := 1; page <= denoListPageMax; page++ {
-		listURL := fmt.Sprintf("%s/v1/organizations/%s/projects?page=%d&limit=%d",
-			c.base, url.PathEscape(c.cred.Organization), page, denoListLimit)
+		listURL := fmt.Sprintf("%s/v1/organizations/%s/projects?q=%s&page=%d&limit=%d",
+			c.base, url.PathEscape(c.cred.Organization), url.QueryEscape(name), page, denoListLimit)
 		var projects []denoProject
 		err := platformCall(ctx, c.http, http.MethodGet, listURL, c.cred.Token, "", nil, &projects)
 		if err != nil {

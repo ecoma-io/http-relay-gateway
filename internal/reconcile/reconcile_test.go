@@ -845,6 +845,44 @@ func TestRemoveWithoutMemoizedCredentialPurgesAnyway(t *testing.T) {
 	}
 }
 
+// A delete that fails because the credential cannot address the remote scope
+// (the deno client refuses every call without the organization pin) is
+// operator data: the pending delete is dropped with a warning — the remote
+// stays behind, like a vanished credential — instead of retrying forever.
+func TestRemoveUnaddressableScopeDropsPendingDelete(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformDeno, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	client.deleteErr = fmt.Errorf("deno delete: %w", deploy.ErrAmbiguousScope)
+	var log bytes.Buffer
+	rig.worker.log = zerolog.New(&log)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformDeno, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before removal")
+	}
+
+	rig.desired.Relays = nil
+	rig.worker.pass()
+
+	if got := rig.factory.deleteCount(); got != 1 {
+		t.Fatalf("deletes = %d, want 1", got)
+	}
+	if _, ok := rig.reg.StateOf(key); ok {
+		t.Fatal("an unaddressable scope must drop the pending delete, not leave it removing")
+	}
+	if !strings.Contains(log.String(), "remote left behind") {
+		t.Errorf("log = %q, want the remote-left-behind warning", log.String())
+	}
+
+	// Dropped, not deferred: no later pass retries the delete.
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.deleteCount(); got != 1 {
+		t.Fatalf("deletes = %d, want 1 (a scope problem is dropped, never retried)", got)
+	}
+}
+
 // --- stale delete vs re-add: the incarnation guarantee ---
 
 func TestStaleDeleteBlocksReaddedIdentityUntilOldProjectGone(t *testing.T) {
