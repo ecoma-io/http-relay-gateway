@@ -1,0 +1,65 @@
+# http-relay-gateway — desired-state reference layout.
+#
+# Copy this file to config.yaml (gitignored) and edit the copy; the poller
+# re-reads it every second and reconciles the fleet to match:
+#
+#   cp config.example.yaml config.yaml
+#
+# Provider credentials never live in this file in clear text: they ride the
+# environment through ${VAR} references (an unset or empty variable rejects
+# the load) or live in a secret file named by token_file whose trimmed
+# content is re-read on every pass. Never commit config.yaml.
+#
+# Identity is (provider, name); the platform project slug and the serving
+# URL derive from the identity — never configured. Unknown keys, duplicate
+# names, slug collisions on one provider, and unset ${VAR} references are
+# all load errors.
+
+# Runtime settings — every key optional; uncomment to override, the
+# documented default is shown for each. Malformed values are load errors,
+# never silent defaults.
+#settings:
+#  log_level: info               # debug | info | warn | error
+#  max_retries: 2                # failover attempts beyond the first (0–16)
+#  failure_threshold: 3          # consecutive passive failures before cooldown
+#  cooldown: 30s                 # passive-health cooldown after the failure threshold
+#  stream_threshold_bytes: 0     # bodies above this stream through; 0 = always buffer
+#  dial_timeout: 5s              # outbound dial timeout (relay legs and probes)
+#  response_header_timeout: 0    # response-header timeout; 0 = off
+#  verify_interval: 60s          # readiness re-verification cadence
+#  revive_scan_interval: 10m     # paused-relay revival probe cadence
+#  verify_backoff_base: 5s       # first verification-failure retry delay
+#  verify_backoff_max: 5m        # exponential retry ceiling
+#  verify_recover_max: 15s       # retry ceiling while no relay is ready
+#  verify_demote_after: 3        # consecutive verification failures before a serving relay demotes
+
+# The relay fleet. Entries below are placeholders — uncomment the ones you
+# want and replace the names. An empty relays list is valid: the gateway
+# boots with an empty fleet (/readyz answers 503) and reconciles the moment
+# entries appear.
+relays:
+  # vercel: team pins the scope when the token can reach more than one team
+  # (vercel only, optional — discovery never guesses).
+  # - name: example-vercel
+  #   provider: vercel
+  #   token: ${VERCEL_TOKEN}
+  #   team: ${VERCEL_TEAM_ID}
+
+  # cloudflare: account pins the account id when the token can reach more
+  # than exactly one account (cloudflare only, optional).
+  # - name: example-cloudflare
+  #   provider: cloudflare
+  #   token: ${CLOUDFLARE_API_TOKEN}
+  #   account: ${CLOUDFLARE_ACCOUNT_ID}
+
+  # deno deploy: user-scoped, no pin.
+  # - name: example-deno
+  #   provider: deno
+  #   token: ${DENO_DEPLOY_TOKEN}
+
+  # any provider may read its credential from a secret file instead of the
+  # environment — token and token_file are mutually exclusive; rotate by
+  # atomically replacing the file, no restart needed.
+  # - name: example-vercel-file
+  #   provider: vercel
+  #   token_file: ./relay-token.secret
