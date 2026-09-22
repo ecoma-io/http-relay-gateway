@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -818,6 +819,81 @@ func TestVerifyClassifiesProbeAnswers(t *testing.T) {
 }
 
 // --- shutdown at the settle barrier ---
+
+// --- shutdown inside the grace budget ---
+
+// A rollout parked in the in-flight drain behind a stalled stream must
+// unwind inside the budget handed to Stop — not the full QuiesceTimeout on
+// top of it. Stop publishes the budget, and cancels the drain tree at the
+// budget's deadline so a wait already parked inside AwaitIdle (which cannot
+// re-read the published deadline) still ends inside the budget.
+func TestStopBoundsTheInFlightDrainToTheBudget(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before the replacement")
+	}
+
+	// Version drift parks the replacement in the drain behind a stream that
+	// never ends on its own.
+	rig.sim.setVersion("0.0.1-stale")
+	parked := &budgetDrainer{entered: make(chan struct{})}
+	rig.worker.drainer = parked
+	passDone := make(chan struct{})
+	go func() {
+		defer close(passDone)
+		rig.worker.pass()
+	}()
+	<-parked.entered
+
+	budget := 250 * time.Millisecond // far below the rig's 5s quiesce timeout
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	started := time.Now()
+	rig.worker.Stop(ctx)
+	took := time.Since(started)
+	if took > 2*time.Second {
+		t.Fatalf("Stop took %s with a %s budget — the parked drain ran on its own timer, not the budget", took, budget)
+	}
+	select {
+	case <-passDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the parked pass did not unwind after the budget expired")
+	}
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a shutting-down process never deploys)", got)
+	}
+	rec, _ := rig.reg.StateOf(key)
+	if rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing (the replacement defers to the next process)", rec.State, rec.Reason)
+	}
+}
+
+// A drain that starts after Stop published the budget clamps its wait to
+// whatever remains of it — the quiesce timeout may never exceed the
+// whole-process grace.
+func TestAwaitIdleClampsToTheRemainingBudget(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	rig.worker.budgetMu.Lock()
+	rig.worker.budget = ctx
+	rig.worker.budgetMu.Unlock()
+
+	rig.drainer.setIdle(true)
+	if !rig.worker.awaitIdle("vercel", "edge-a") {
+		t.Fatal("an idle identity must report drained regardless of the budget")
+	}
+	got := rig.drainer.timeouts[len(rig.drainer.timeouts)-1]
+	if got > 100*time.Millisecond {
+		t.Fatalf("drain timeout = %s, want it clamped to the remaining budget", got)
+	}
+}
 
 // A process that receives its shutdown signal mid-rollout cannot wait on the
 // settle barrier: the applier loop has left its select and the barrier will

@@ -216,7 +216,14 @@ func run() error {
 		Settle:   settle,
 		Log:      log,
 	})
-	defer rec.Stop()
+	// The deferred stop takes a fresh grace budget at exit time — it only
+	// runs on the early-return paths that never reached shutdown(), and it
+	// is a no-op once shutdown() already stopped the worker.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), bootstrap.ShutdownGrace)
+		defer cancel()
+		rec.Stop(ctx)
+	}()
 
 	reloaded := make(chan struct{}, 1)
 	go store.watch(bootstrap.ConfigFile, log, func() {
@@ -253,17 +260,19 @@ func run() error {
 	// Shutdown releases a rollout parked on the settle barrier first — the
 	// applier loop is about to leave its select, so without this broadcast
 	// a mid-replacement Stop() would wait for a barrier nobody will ever
-	// satisfy. Then it cancels fleet work: a deploy mid-flight must not eat
-	// the whole-process drain budget. Then the data plane drains its
-	// in-flight requests against one whole-process grace budget.
+	// satisfy. Then it cancels fleet work and drains the data plane — both
+	// inside ONE whole-process grace budget, taken before the reconciler
+	// stops: rec.Stop must not consume an unbounded quiesce window first
+	// and starve the HTTP drain of its share. When the budget is spent,
+	// process exit closes whatever is left.
 	shutdown := func() {
 		applyMu.Lock()
 		shutting = true
 		cond.Broadcast()
 		applyMu.Unlock()
-		rec.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrap.ShutdownGrace)
 		defer cancel()
+		rec.Stop(ctx)
 		_ = srv.Shutdown(ctx)
 	}
 

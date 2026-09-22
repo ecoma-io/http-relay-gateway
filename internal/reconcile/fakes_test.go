@@ -270,7 +270,8 @@ func (c *recordedClient) Delete(_ context.Context, project string) error {
 
 // fakeDrainer records drain calls and answers with a controllable verdict.
 // At call time it logs whether the identity was still serving — the proof
-// that Strategy A demotes before draining.
+// that Strategy A demotes before draining. The context is ignored: the
+// verdict flips when the test says so, not on time.
 type fakeDrainer struct {
 	mu       sync.Mutex
 	log      *eventLog
@@ -282,7 +283,7 @@ type fakeDrainer struct {
 
 func (d *fakeDrainer) setIdle(idle bool) { d.mu.Lock(); d.idle = idle; d.mu.Unlock() }
 
-func (d *fakeDrainer) AwaitIdle(provider, name string, timeout time.Duration) bool {
+func (d *fakeDrainer) AwaitIdle(_ context.Context, provider, name string, timeout time.Duration) bool {
 	d.mu.Lock()
 	serving := d.reg.IsReady(deploy.RelayKey{Provider: provider, Name: name})
 	d.calls = append(d.calls, provider+"/"+name)
@@ -291,6 +292,25 @@ func (d *fakeDrainer) AwaitIdle(provider, name string, timeout time.Duration) bo
 	d.mu.Unlock()
 	d.log.add(fmt.Sprintf("drain:%s:serving=%t:idle=%t", provider+"/"+name, serving, idle))
 	return idle
+}
+
+// budgetDrainer models the real gateway's shutdown behavior: the wait ends
+// when its context does, reporting the drain incomplete. It records the
+// context and timeout of its first (the test's only) call.
+type budgetDrainer struct {
+	entered chan struct{}
+	once    sync.Once
+	ctx     context.Context
+	timeout time.Duration
+}
+
+func (d *budgetDrainer) AwaitIdle(ctx context.Context, _, _ string, timeout time.Duration) bool {
+	d.once.Do(func() {
+		d.ctx, d.timeout = ctx, timeout
+		close(d.entered)
+	})
+	<-ctx.Done()
+	return false
 }
 
 // testRig assembles one synchronous worker plus everything needed to
@@ -349,6 +369,8 @@ func (r *testRig) newWorker() *Worker {
 		return true
 	}
 	relayKey := func() (string, error) { return testRelayKey, nil }
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	r.t.Cleanup(drainCancel)
 	w := &Worker{
 		cfg: Config{
 			Desired:        func() *config.Config { return r.desired },
@@ -371,6 +393,9 @@ func (r *testRig) newWorker() *Worker {
 		ctx:           context.Background(),
 		cancel:        func() {},
 		done:          make(chan struct{}),
+		budget:        context.Background(),
+		drainCtx:      drainCtx,
+		drainCancel:   drainCancel,
 	}
 	return w
 }
