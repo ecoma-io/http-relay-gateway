@@ -416,18 +416,50 @@ func TestStrategyADrainTimeoutDefersReplacement(t *testing.T) {
 	if rig.reg.IsReady(key) {
 		t.Fatal("a demoted relay with a pending replacement must not serve")
 	}
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d, want 1 on the deferring pass", got)
+	}
 
-	// The stream ends; the backoff gate must not hot-loop, but the next pass
-	// after it elapses completes the replacement.
+	// The stream still lives past the backoff gate: the retry pass must
+	// settle and drain AGAIN before any deploy — deploying under the
+	// straggler is exactly the race the ordering exists to remove.
 	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (the retry pass must not deploy under a live stream)", got)
+	}
+	if got := len(rig.drainer.calls); got != 2 {
+		t.Fatalf("drains = %d across the passes, want 2 (a resumed replacement re-drains)", got)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want still unready/replacing after the second deferral", rec.State, rec.Reason)
+	}
+
+	// The stream ends; the next pass completes the replacement behind a
+	// third drain, and the deploy follows it.
 	rig.drainer.setIdle(true)
 	rig.worker.pass()
-
+	if got := len(rig.drainer.calls); got != 3 {
+		t.Fatalf("drains = %d, want 3 across the passes", got)
+	}
 	if got := rig.factory.deployCount(); got != 1 {
-		t.Fatalf("deploys = %d, want 1 on the retried pass", got)
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
 	}
 	if !rig.reg.IsReady(key) {
 		t.Fatal("deferred replacement not completed")
+	}
+	events := rig.log.all()
+	lastDrain, deployAt := -1, -1
+	for i, e := range events {
+		if len(e) > 5 && e[:5] == "drain" {
+			lastDrain = i
+		}
+		if e == "deploy" && deployAt < 0 {
+			deployAt = i
+		}
+	}
+	if lastDrain < 0 || deployAt < 0 || lastDrain > deployAt {
+		t.Fatalf("the completing pass deployed before its drain: %v", events)
 	}
 }
 

@@ -286,6 +286,15 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 	}
 	project := deploy.ProjectName(rel.Name)
 	wasReady := w.reg.IsReady(key)
+	// A replacement an earlier pass deferred at the drain timeout leaves the
+	// relay unready/replacing; a pass that resumes it must settle and drain
+	// again before deploying. Capture the marker now — Enter(discovering)
+	// below overwrites the record, and IsReady alone is already false (the
+	// first pass demoted the relay).
+	resuming := false
+	if rec, ok := w.reg.StateOf(key); ok {
+		resuming = rec.State == readiness.StateUnready && rec.Reason == readiness.ReasonReplacing
+	}
 
 	w.reg.Enter(key, gen, readiness.StateDiscovering, "")
 	disc, err := client.Discover(w.ctx, project)
@@ -305,7 +314,7 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		// No deployment for this identity: a first bring-up, or the remote
 		// was deleted out-of-band. Either way the fix is a deploy.
 		w.reg.Enter(key, gen, readiness.StateDiscovered, readiness.ReasonMissing)
-		w.rollout(rel, key, gen, relayKey, client, project, wasReady)
+		w.rollout(rel, key, gen, relayKey, client, project, wasReady, resuming)
 		return
 	}
 
@@ -321,7 +330,7 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		// Drift a deploy fixes: stale worker version, rejected relay key
 		// (rotate the key → every relay redeploys), or no worker behind the
 		// URL at all.
-		w.rollout(rel, key, gen, relayKey, client, project, wasReady)
+		w.rollout(rel, key, gen, relayKey, client, project, wasReady, resuming)
 	case verifySuspended:
 		// The platform answers instead of the worker — a suspension page.
 		// No deploy lifts it: pause, and let the revival cadence re-probe.
@@ -339,10 +348,19 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 // rollout is Strategy A: demote, settle the pool swap, drain in-flight
 // requests — and only then deploy, because the platform switches the
 // production URL mid-deploy and an old admission left standing would serve
-// whatever lands on that URL next.
-func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady bool) {
+// whatever lands on that URL next. The settle+drain gate also covers a
+// replacement an earlier pass deferred at the drain timeout (resuming): the
+// retry pass re-runs both before deploying — the same discipline the delete
+// path applies on every retry.
+func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady, resuming bool) {
+	// Gating the drain on wasReady alone skips it on the retry pass — the
+	// first pass already demoted the relay, so IsReady is false from there
+	// on — and the deploy would fire under the very straggler the ordering
+	// exists to protect.
 	if wasReady {
 		w.reg.Demote(key, gen, readiness.ReasonReplacing)
+	}
+	if wasReady || resuming {
 		if !w.settle() {
 			// The process is shutting down and the applier will never
 			// satisfy the barrier. The demotion stands; the replacement is
