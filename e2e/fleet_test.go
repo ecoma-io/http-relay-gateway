@@ -312,7 +312,9 @@ func TestE2E_VersionDriftRedeploys(t *testing.T) {
 	release := fake.armDeployGate("v-rel")
 	fake.project("v-rel").sim.setMode(simStale)
 
-	g.waitForLifecycle(t, "vercel", "v-rel", "unready", "replacing", 15*time.Second)
+	// The deploy is gated immediately after the required demotion, so the
+	// durable observable is zero admission rather than the transient
+	// pre-deploy lifecycle phase.
 	g.waitForZeroReady(t, 5*time.Second)
 	if n := fake.deployCount("v-rel"); n != 1 {
 		t.Fatalf("completed deploys while replacement gated = %d, want 1", n)

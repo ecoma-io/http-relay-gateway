@@ -63,7 +63,9 @@ func TestE2E_ReplacementRolloutStrategyA(t *testing.T) {
 	releaseDeploy := fake.armDeployGate("v-rel")
 	fake.project("v-rel").sim.setMode(simStale)
 
-	g.waitForLifecycle(t, "vercel", "v-rel", "unready", "replacing", 15*time.Second)
+	// The demoted phase is intentionally short when the drain completes, so
+	// observe the durable safety boundary instead: no relay is admitted before
+	// the replacement deploy may start.
 	g.waitForZeroReady(t, 5*time.Second)
 
 	// The settle barrier: no deploy may start while the old worker still

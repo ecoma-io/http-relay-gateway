@@ -391,6 +391,13 @@ func (r *Registry) Allow(key Key) bool {
 // reset them: a serving relay that starts failing racks up its DemoteAfter
 // streak across consecutive scan ticks, and a failing relay's backoff keeps
 // the scan from hot-looping it.
+//
+// A phase that actually changed notifies so the operator view (/stats
+// renders the lifecycle from the applied generation) follows it — with one
+// exception: entering the discovering phase never notifies, because every
+// scan pass re-enters it for every relay, healthy ones included, and
+// notifying it would rebuild the serving view on every pass. A repeated
+// Enter of the phase already held is always silent.
 func (r *Registry) Enter(key Key, generation uint64, state State, reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -398,9 +405,13 @@ func (r *Registry) Enter(key Key, generation uint64, state State, reason string)
 	if e == nil {
 		return // stale completion: the incarnation moved on
 	}
+	changed := e.record.State != state || e.record.Reason != reason
 	e.record.State = state
 	e.record.Reason = reason
 	e.record.Since = r.cfg.Now()
+	if changed && state != StateDiscovering {
+		r.notifyLocked()
+	}
 	if state == StateDeploying {
 		e.record.FailStreak = 0
 		e.nextTry = time.Time{}

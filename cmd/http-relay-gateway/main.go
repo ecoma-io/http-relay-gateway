@@ -315,7 +315,6 @@ func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.L
 		// alive (zero-ready answers 503) instead of panicking the data plane.
 		p, _ = pool.New(pool.Input{})
 	}
-
 	snapshot := reg.Snapshot()
 	lifecycle := make([]gateway.LifecycleRow, 0, len(snapshot))
 	for _, record := range snapshot {
@@ -340,22 +339,33 @@ func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.L
 
 // desiredStore holds the last successfully loaded configuration behind an
 // atomic pointer, re-reading the file on a short poll. Only a successful
-// load ever replaces the stored state: a missing or invalid file logs once
-// per distinct condition and leaves the last-known-good serving.
+// load ever replaces the stored state — and only when the content differs
+// from what is already applied: a missing or invalid file logs once per
+// distinct condition and leaves the last-known-good serving, and an
+// unchanged file is a no-op.
 type desiredStore struct {
 	p atomic.Pointer[config.Config]
 	// lastKey deduplicates poll observations so a persistent problem logs
 	// once, not once per tick: the file's content hash when valid, a
 	// sanitized description of the problem otherwise.
 	lastKey string
+	// appliedKey is the observation key of the stored configuration — the
+	// change gate. A valid parse of identical content is not a change: no
+	// re-publish, no reconciler wake, no pool rebuild, so passive health,
+	// counters and the round-robin cursors survive an idle tick. Only a
+	// successful load ever moves it, so good A → invalid B → good A stays
+	// one logical load of A.
+	appliedKey string
 }
 
 func newDesiredStore() *desiredStore { return &desiredStore{} }
 
 func (s *desiredStore) get() *config.Config { return s.p.Load() }
 
-// poll reads the file once; watch calls it on the reload interval and fires
-// onChange whenever a new valid configuration replaced the stored one.
+// poll reads the file once; watch calls it on the reload interval. It
+// reports true only when a valid parse replaced the stored desired state:
+// content identity is the gate (never file metadata), and unreadable or
+// invalid files never count.
 func (s *desiredStore) poll(path string, log zerolog.Logger) bool {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -378,7 +388,15 @@ func (s *desiredStore) poll(path string, log zerolog.Logger) bool {
 		}
 		return false
 	}
-	s.lastKey = "hash: " + hex.EncodeToString(sum[:])
+	key := "hash: " + hex.EncodeToString(sum[:])
+	s.lastKey = key
+	if key == s.appliedKey {
+		// Content-identical to the applied desired state: not a change.
+		// The reconciler keeps its own cadence; the serving pool is left
+		// exactly as it is.
+		return false
+	}
+	s.appliedKey = key
 	s.p.Store(cfg)
 	return true
 }
