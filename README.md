@@ -318,7 +318,7 @@ relays:
   - name: relay-c
     provider: deno
     token: ${DENO_TOKEN}
-    organization: 84d9bce6-0785-43a8-8651-7c3f7f8fa41b # required deno organization pin (UUID)
+    organization: ${DENO_ORG_ID} # required deno organization pin (UUID; ${VAR} resolved like token)
 ```
 
 Start from the committed reference layout: `cp config.example.yaml

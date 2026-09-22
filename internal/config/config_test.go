@@ -428,6 +428,73 @@ func TestInlineTokenTrimmedAndBlankRejected(t *testing.T) {
 	})
 }
 
+func TestRelayOrganizationInterpolationAndShape(t *testing.T) {
+	const orgRelay = "name: edge-relay-deno\n    provider: deno\n    token: t\n    organization: "
+	cases := []struct {
+		name    string
+		pin     string
+		env     string // value of RELAY_TEST_DENO_ORG; unset when absent
+		set     bool
+		wantPin string
+		wantErr string
+	}{
+		{
+			name:    "reference resolves to a UUID",
+			pin:     "${RELAY_TEST_DENO_ORG}",
+			env:     "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			set:     true,
+			wantPin: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+		},
+		{
+			name:    "literal UUID passes through",
+			pin:     "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			wantPin: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+		},
+		{
+			name:    "unset reference",
+			pin:     "${RELAY_TEST_DENO_ORG}",
+			wantErr: "organization: environment variable RELAY_TEST_DENO_ORG is not set",
+		},
+		{
+			name:    "reference resolving to whitespace only",
+			pin:     "${RELAY_TEST_DENO_ORG}",
+			env:     "   ",
+			set:     true,
+			wantErr: "organization must not resolve to an empty value",
+		},
+		{
+			name:    "malformed UUID",
+			pin:     "not-a-uuid",
+			wantErr: `organization "not-a-uuid" is not a Deno Deploy organization id (UUID)`,
+		},
+		{
+			name:    "UUID-shaped but wrong group layout",
+			pin:     "a0eebc999c0b4ef8bb6d6bb9bd380a11",
+			wantErr: "is not a Deno Deploy organization id",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("RELAY_TEST_DENO_ORG", tc.env)
+			}
+			cfg, err := Load(writeConfig(t, "relays:\n  - "+orgRelay+tc.pin+"\n"))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.Relays[0].Organization; got != tc.wantPin {
+				t.Errorf("organization = %q, want %q", got, tc.wantPin)
+			}
+		})
+	}
+}
+
 func TestRelayNameLengthBound(t *testing.T) {
 	long := strings.Repeat("a", 129)
 	_, err := Load(writeConfig(t, "relays:\n  - name: "+long+"\n    provider: vercel\n    token: t\n"))

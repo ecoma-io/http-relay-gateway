@@ -384,7 +384,48 @@ func (fr fileRelay) resolve() (Relay, error) {
 	default:
 		return Relay{}, errors.New("a provider credential is required: set token (with ${VAR} references) or token_file")
 	}
+	// The organization pin interpolates exactly like the token — operators
+	// keep environment-shaped values in the environment — and must resolve to
+	// a non-empty UUID: the Deploy API types organization ids as UUIDs, and a
+	// typo'd pin would otherwise surface only as endless unreachable retries.
+	if relay.Organization != "" {
+		org, err := interpolate(relay.Organization)
+		if err != nil {
+			return Relay{}, fmt.Errorf("organization: %w", err)
+		}
+		if org = strings.TrimSpace(org); org == "" {
+			return Relay{}, errors.New("organization must not resolve to an empty value")
+		}
+		if !validUUID(org) {
+			return Relay{}, fmt.Errorf("organization %q is not a Deno Deploy organization id (UUID)", org)
+		}
+		relay.Organization = org
+	}
 	return relay, nil
+}
+
+// validUUID reports whether s is shaped like the UUIDs the Deno Deploy API
+// addresses organizations and projects by: 8-4-4-4-12 hex groups. It is a
+// shape check, not a liveness check — the platform is the final judge.
+func validUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if s[i] != '-' {
+				return false
+			}
+		default:
+			c := s[i]
+			isHex := c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ResolveToken returns the relay's provider credential, reading the secret
