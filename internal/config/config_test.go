@@ -206,6 +206,9 @@ func TestExampleConfigLoads(t *testing.T) {
 	} {
 		t.Setenv(name, "stub-"+strings.ToLower(name))
 	}
+	// The deno organization pin must resolve to a UUID-shaped value (the
+	// load validates the shape), so its stub is a UUID, not a bare string.
+	t.Setenv("DENO_ORG_ID", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
 
 	// go test runs the binary in the package directory; the example lives
 	// two levels up, next to compose.yaml.

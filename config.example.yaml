@@ -52,10 +52,13 @@ relays:
   #   token: ${CLOUDFLARE_API_TOKEN}
   #   account: ${CLOUDFLARE_ACCOUNT_ID}
 
-  # deno deploy: user-scoped, no pin.
+  # deno deploy: organization pins the org id (deno only, required — the
+  # deploy api addresses projects by organization and offers no route that
+  # resolves it from the token; a uuid, resolved like the token).
   # - name: example-deno
   #   provider: deno
   #   token: ${DENO_DEPLOY_TOKEN}
+  #   organization: ${DENO_ORG_ID}
 
   # any provider may read its credential from a secret file instead of the
   # environment — token and token_file are mutually exclusive; rotate by
