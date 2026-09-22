@@ -1018,6 +1018,7 @@ const (
 	simNotWorker       = "notWorker"       // someone else's app on the URL
 	simStale           = "staleVersion"    // worker answers an old version
 	simProbe500        = "probeFailed"     // worker forwards, upstream leg fails (its 502)
+	simResetLeg        = "resetLeg"        // relay leg accepted then reset without an answer
 )
 
 // hopByHop mirrors the connection-scoped header set the worker strips.
@@ -1199,6 +1200,21 @@ func (s *simState) serveHTTP(w http.ResponseWriter, r *http.Request, f *fakeEdge
 		// The worker is current and its key accepted, but its own upstream
 		// fetch fails — exactly the shape its 502 answer has.
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream fetch failed"})
+		return
+	}
+	if mode == simResetLeg {
+		// Accept the relay leg and reset the connection without answering —
+		// the abrupt transport failure whose net.OpError text carries both
+		// endpoints. Unlike simHang this is a true worker-level mode: the
+		// unauthenticated version/healthz routes above still answer, so
+		// admission and probes are untouched while the data plane burns.
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+		time.Sleep(45 * time.Second)
 		return
 	}
 

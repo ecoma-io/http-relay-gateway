@@ -451,3 +451,71 @@ func TestE2E_UnpinnedPinValuesRoundRobin(t *testing.T) {
 		t.Fatalf("the target saw %d requests, want %d", n, len(pins))
 	}
 }
+
+// TestE2E_AbruptRelayCloseIsSanitizedOnEverySurface: a relay that accepts a
+// live-relayed request body and resets the connection without answering
+// produces the "<op> tcp A->B:" error family — net.OpError's read/write
+// forms and the readfrom wrapper a declared-length body write adds — and
+// every layer carries both endpoint addresses. The sanitized text is what
+// may reach the client's 502 body, /stats lastError, and the structured
+// log — ports stay, addresses do not. This is the shape the hang-mode tests
+// above deliberately avoid (their timeout errors are address-free by
+// construction); it was the redaction gap the security follow-up closed.
+func TestE2E_AbruptRelayCloseIsSanitizedOnEverySurface(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, ct := freshIdentity("rs-s")
+	fake.setToken("cloudflare", ct)
+	g := startGateway(t, fake, gwOptions{
+		key: key,
+		config: configYAMLOverrides(t, map[string]string{
+			// Live-relay the body (one attempt, no failover) and keep the
+			// verified-readiness layer quiet: the reset is a data-plane
+			// event and must not demote the relay mid-test.
+			"stream_threshold_bytes": "65536",
+			"verify_interval":        "1h",
+		}, relayBlock("c-rel", "cloudflare", tokenEnvLine("E2E_CT"))),
+		extraEnv: map[string]string{"E2E_CT": ct},
+	})
+	g.waitForStats(t, 20*time.Second, "the relay to admit", func(d *statsDoc) bool {
+		return d.Readiness.ReadyRelays == 1
+	})
+
+	fake.project("c-rel").sim.setMode(simResetLeg)
+
+	// Well past the loopback socket buffers, so the relay's close lands
+	// mid-write and the transport error is deterministic.
+	body := bytes.Repeat([]byte("x"), 8<<20)
+	resp, raw := g.do(t, http.MethodPost, "/", map[string]string{
+		"X-Relay-Provider": "cloudflare",
+		"X-Relay-Target":   echo.base,
+		"X-Relay-Path":     "/reset",
+		"X-Marker":         "reset-leg",
+	}, body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("streamed request against a reset relay leg = %d (%s), want 502", resp.StatusCode, raw)
+	}
+	assertNoLeaks(t, "502 body", g, fake, raw)
+	if bytes.Contains(raw, []byte("127.0.0.1")) {
+		t.Fatalf("502 body carries a literal endpoint address: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte("[redacted]")) {
+		t.Fatalf("502 body lost the sanitized transport-error shape: %s", raw)
+	}
+
+	d := g.waitForStats(t, 10*time.Second, "the passive failure to record", func(d *statsDoc) bool {
+		row, ok := relayRow(d, "cloudflare", "c-rel")
+		return ok && row.Failures >= 1 && row.LastError != ""
+	})
+	row, _ := relayRow(d, "cloudflare", "c-rel")
+	if !strings.Contains(row.LastError, "[redacted]") || strings.Contains(row.LastError, "127.0.0.1") {
+		t.Fatalf("/stats lastError is not the sanitized OpError shape: %s", row.LastError)
+	}
+	assertNoLeaks(t, "/stats lastError", g, fake, []byte(row.LastError))
+
+	log := g.logDump()
+	assertNoLeaks(t, "gateway log", g, fake, []byte(log))
+	if !strings.Contains(log, " tcp [redacted]") {
+		t.Fatal("gateway log never records the sanitized transport-error shape for the reset")
+	}
+}
