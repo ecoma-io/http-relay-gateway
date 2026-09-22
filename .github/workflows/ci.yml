@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           dir="$RUNNER_TEMP/golangci-lint"
           mkdir -p "$dir"
-          url="https://github.com/golangci/golangci-lint/releases/download/v2.12.2"
+          url="https://github.com/golangci/golangci-lint/releases/download/v2.13.2"
           version="${url##*/v}"
           asset="golangci-lint-${version}-linux-amd64.tar.gz"
           curl --silent --show-error --fail --location \
