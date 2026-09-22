@@ -109,7 +109,7 @@ func TestInterpolationErrors(t *testing.T) {
 		{
 			name:    "unclosed reference",
 			value:   "prefix-${RELAY_TEST_A",
-			wantErr: `unclosed ${ reference in "prefix-${RELAY_T…"`,
+			wantErr: `unclosed ${ reference in "[redacted value: 21 bytes]"`,
 		},
 		{
 			name:    "empty reference",
@@ -127,20 +127,19 @@ func TestInterpolationErrors(t *testing.T) {
 	}
 }
 
-func TestInterpolationErrorRedactsLongSecrets(t *testing.T) {
-	// The raw value stands in for a credential with a typo'd reference: the
-	// error must show only its first 16 characters, never the whole secret.
-	raw := "supersecret-token-value-${RELAY_TEST_UNSET_VAR"
+func TestInterpolationErrorRedactsSecretValues(t *testing.T) {
+	fixture := "supersecret-token-value"
+	raw := fixture + "-${RELAY_TEST_UNSET_VAR"
 	_, err := interpolate(raw)
 	if err == nil {
 		t.Fatal("interpolate: want an error for the unset reference")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "supersecret-toke…") {
-		t.Errorf("error %q does not carry the 16-char redacted shape", msg)
+	if strings.Contains(msg, fixture) {
+		t.Error("interpolation error leaks the secret fixture")
 	}
-	if strings.Contains(msg, raw) {
-		t.Errorf("error %q leaks the full raw value", msg)
+	if !strings.Contains(msg, "[redacted value:") {
+		t.Errorf("error %q does not carry the redacted shape", msg)
 	}
 }
 
