@@ -110,7 +110,7 @@ rejected, which classifies as drift a deploy fixes).
 ```json
 {
   "version": "0.1.0-dev",
-  "relayVersion": "1.0.0",
+  "relayVersion": "0.1.0",
   "relays": [
     {
       "name": "relay-a",
