@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// Vercel client. One project per relay, deployed from one inline file
-// (api/relay.js) with the version and relay key riding as deployment env.
-// The stable URL is the project's default production domain
+// Vercel client. One project per relay, deployed from two inline files
+// (api/relay.js + vercel.json) with the version and relay key riding as
+// deployment env. The stable URL is the project's default production domain
 // (<project>.vercel.app) — derived deterministically, identical across
 // redeploys, and never the per-deployment URL, which changes on every push.
 //
@@ -26,8 +26,17 @@ const (
 	vercelReadyTimeout = 2 * time.Minute
 	vercelLiveTimeout  = 30 * time.Second
 	vercelWorkerPath   = "api/relay.js"
+	vercelConfigPath   = "vercel.json"
 	vercelStatusPoll   = time.Second
 )
+
+// vercelConfig routes every request to the worker. Files under api/ serve
+// only at /api/* on Vercel, while every gateway probe and every relayed
+// request targets the project root — without this rewrite the worker is
+// unreachable (#21). The catch-all is Vercel's documented SPA fallback
+// shape, and rewrites run only after the filesystem check, so /api/relay
+// itself still resolves to the function and the rewrite never loops.
+const vercelConfig = `{"rewrites":[{"source":"/(.*)","destination":"/api/relay"}]}`
 
 type vercelClient struct {
 	base string
@@ -100,11 +109,18 @@ func (c *vercelClient) Deploy(ctx context.Context, spec Spec) (Result, error) {
 	payload := map[string]any{
 		"name":   spec.Project,
 		"target": "production",
-		"files": []vercelFile{{
-			File:     vercelWorkerPath,
-			Data:     base64.StdEncoding.EncodeToString([]byte(spec.Source)),
-			Encoding: "base64",
-		}},
+		"files": []vercelFile{
+			{
+				File:     vercelWorkerPath,
+				Data:     base64.StdEncoding.EncodeToString([]byte(spec.Source)),
+				Encoding: "base64",
+			},
+			{
+				File:     vercelConfigPath,
+				Data:     base64.StdEncoding.EncodeToString([]byte(vercelConfig)),
+				Encoding: "base64",
+			},
+		},
 		// No framework: the worker is a bare edge function, not an app.
 		"projectSettings": map[string]any{"framework": nil},
 		// A public relay must never sit behind the SSO wall.

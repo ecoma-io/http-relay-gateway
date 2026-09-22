@@ -335,13 +335,33 @@ func TestVercelDeployRecordsProductionDeployment(t *testing.T) {
 	if payload.Name != "web-relay" || payload.Target != "production" {
 		t.Errorf("payload name/target = %q/%q, want web-relay/production", payload.Name, payload.Target)
 	}
-	if len(payload.Files) != 1 || payload.Files[0].File != "api/relay.js" || payload.Files[0].Encoding != "base64" {
-		t.Fatalf("files = %+v, want one base64 api/relay.js entry", payload.Files)
+
+	// Two files: the worker and the vercel.json that routes the project
+	// root to it. The rewrite is pinned byte for byte — it is what makes
+	// every root probe and relayed request reach the worker (#21).
+	if len(payload.Files) != 2 {
+		t.Fatalf("files = %+v, want the worker and vercel.json", payload.Files)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(payload.Files[0].Data)
-	if err != nil || string(decoded) != spec.Source {
-		t.Errorf("file data = %q (%v), want the worker source", decoded, err)
+	uploaded := map[string]string{}
+	for _, fl := range payload.Files {
+		if fl.Encoding != "base64" {
+			t.Errorf("file %q encoding = %q, want base64", fl.File, fl.Encoding)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fl.Data)
+		if err != nil {
+			t.Errorf("file %q data: %v", fl.File, err)
+			continue
+		}
+		uploaded[fl.File] = string(decoded)
 	}
+	if uploaded["api/relay.js"] != spec.Source {
+		t.Errorf("api/relay.js = %q, want the worker source", uploaded["api/relay.js"])
+	}
+	const wantRewrite = `{"rewrites":[{"source":"/(.*)","destination":"/api/relay"}]}`
+	if uploaded["vercel.json"] != wantRewrite {
+		t.Errorf("vercel.json = %q, want the catch-all rewrite %q", uploaded["vercel.json"], wantRewrite)
+	}
+
 	if v, ok := payload.ProjectSettings["framework"]; !ok || v != nil {
 		t.Errorf("projectSettings.framework = %v (present %v), want explicit null", v, ok)
 	}

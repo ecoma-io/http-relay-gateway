@@ -60,7 +60,9 @@ type deployRecord struct {
 
 type fakeProject struct {
 	provider   string
+	slug       string
 	exists     bool
+	rootRoutes bool // vercel only: a deployment shipped the root rewrite
 	sim        *simState
 	deploys    []deployRecord
 	deletes    []time.Time
@@ -134,6 +136,14 @@ func (f *fakeEdge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no route"})
 			return
 		}
+		// Vercel models platform routing: the zero-config api/ function
+		// answers only at its own path, every other path falls through to
+		// Vercel's 404 — unless the deployment shipped the vercel.json
+		// catch-all rewrite, which routes every path to the function.
+		if p.provider == "vercel" && !p.servesPath(path) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "NOT_FOUND"})
+			return
+		}
 		p.sim.serveHTTP(w, r, f)
 	}
 }
@@ -184,13 +194,27 @@ func (f *fakeEdge) project(slug string) *fakeProject {
 	return f.projects[slug]
 }
 
+// servesPath models Vercel's request routing for one path on the shared
+// fake origin: the api/ function answers only at /api/relay until a
+// deployment ships the vercel.json catch-all rewrite, and every other path
+// is Vercel's 404. Other platforms route every path to the worker, so only
+// the vercel check consults this.
+func (p *fakeProject) servesPath(path string) bool {
+	if p.rootRoutes {
+		return true
+	}
+	eff := strings.TrimPrefix(path, "/"+p.slug)
+	return eff == "/api/relay" || eff == "/api/relay/"
+}
+
 // addProject pre-registers a project as existing on its platform, with a
 // fresh sim in the given initial mode (the caller then sets the deployed
-// version/token or the mode).
+// version/token or the mode). A pre-registered vercel project models an
+// already-serving deployment, so its root routes.
 func (f *fakeEdge) addProject(provider, slug, mode string) *fakeProject {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := &fakeProject{provider: provider, exists: true, sim: newSim(slug, mode)}
+	p := &fakeProject{provider: provider, slug: slug, exists: true, rootRoutes: true, sim: newSim(slug, mode)}
 	f.projects[slug] = p
 	return p
 }
@@ -246,7 +270,7 @@ func (f *fakeEdge) armDeployGate(slug string) (release func()) {
 	defer f.mu.Unlock()
 	p, ok := f.projects[slug]
 	if !ok {
-		p = &fakeProject{sim: newSim(slug, simOK)}
+		p = &fakeProject{slug: slug, sim: newSim(slug, simOK)}
 		f.projects[slug] = p
 	}
 	gate := make(chan struct{})
@@ -260,7 +284,7 @@ func (f *fakeEdge) armDeleteGate(slug string) (release func()) {
 	defer f.mu.Unlock()
 	p, ok := f.projects[slug]
 	if !ok {
-		p = &fakeProject{sim: newSim(slug, simOK)}
+		p = &fakeProject{slug: slug, sim: newSim(slug, simOK)}
 		f.projects[slug] = p
 	}
 	gate := make(chan struct{})
@@ -301,15 +325,66 @@ func (f *fakeEdge) markerLabel(marker string) string {
 
 // --- vercel API ---
 
+// vercelPayloadFile is one inlined deployment file.
+type vercelPayloadFile struct {
+	File     string `json:"file"`
+	Data     string `json:"data"`
+	Encoding string `json:"encoding"`
+}
+
 type vercelPayload struct {
-	Name  string `json:"name"`
-	Files []struct {
-		Data string `json:"data"`
-	} `json:"files"`
-	Env []struct {
+	Name  string              `json:"name"`
+	Files []vercelPayloadFile `json:"files"`
+	Env   []struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	} `json:"env"`
+}
+
+// vercelRewrites is the vercel.json content as the fake decodes it.
+type vercelRewrites struct {
+	Rewrites []struct {
+		Source      string `json:"source"`
+		Destination string `json:"destination"`
+	} `json:"rewrites"`
+}
+
+// routesRoot reports whether the deployment's files carry the vercel.json
+// catch-all rewrite to the worker: without it Vercel serves the api/
+// function only at /api/relay and every root probe dies on Vercel's 404.
+func (p *vercelPayload) routesRoot() bool {
+	for _, fl := range p.Files {
+		if fl.File != "vercel.json" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(fl.Data)
+		if err != nil {
+			continue
+		}
+		var cfg vercelRewrites
+		if json.Unmarshal(raw, &cfg) != nil {
+			continue
+		}
+		for _, rw := range cfg.Rewrites {
+			if (rw.Source == "/(.*)" || rw.Source == "/") && rw.Destination == "/api/relay" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// workerSource returns the api/relay.js content.
+func (p *vercelPayload) workerSource() string {
+	for _, fl := range p.Files {
+		if fl.File != "api/relay.js" {
+			continue
+		}
+		if raw, err := base64.StdEncoding.DecodeString(fl.Data); err == nil {
+			return string(raw)
+		}
+	}
+	return ""
 }
 
 func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
@@ -337,7 +412,7 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "BAD_REQUEST"})
 			return
 		}
-		var version, token, source string
+		var version, token string
 		for _, e := range payload.Env {
 			switch e.Key {
 			case "RELAY_VERSION":
@@ -346,14 +421,12 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 				token = e.Value
 			}
 		}
-		if len(payload.Files) > 0 {
-			if decoded, err := base64.StdEncoding.DecodeString(payload.Files[0].Data); err == nil {
-				source = string(decoded)
-			}
-		}
 		f.record("vercel", "deploy", payload.Name, r)
 		p := f.waitGate("vercel", payload.Name)
-		f.completeDeploy(p, version, token, source)
+		// rootRoutes records whether the deployment shipped the vercel.json
+		// rewrite: without it the worker answers only at /api/relay and
+		// every root probe dies on Vercel's 404.
+		f.completeDeploy(p, version, token, payload.workerSource(), payload.routesRoot())
 		writeJSON(w, http.StatusOK, map[string]any{"id": "dpl-" + slugHash(payload.Name), "readyState": "READY"})
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/v9/projects/"):
@@ -449,7 +522,7 @@ func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 		}
 		f.record("cloudflare", "deploy", slug, r)
 		p := f.waitGate("cloudflare", slug)
-		f.completeDeploy(p, version, token, source)
+		f.completeDeploy(p, version, token, source, true)
 		writeJSON(w, http.StatusOK, map[string]any{"success": true, "result": map[string]string{}})
 
 	case r.Method == http.MethodPost && len(parts) == 6 && parts[5] == "subdomain":
@@ -624,7 +697,7 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 		}
 		f.record("deno", "deploy", slug, r)
 		p := f.waitGate("deno", slug)
-		f.completeDeploy(p, payload.EnvVars["RELAY_VERSION"], payload.EnvVars["RELAY_AUTH_TOKEN"], source)
+		f.completeDeploy(p, payload.EnvVars["RELAY_VERSION"], payload.EnvVars["RELAY_AUTH_TOKEN"], source, true)
 		// The build is asynchronous on the platform: create answers pending
 		// and the status poll below observes the pending→success walk.
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -706,7 +779,7 @@ func (f *fakeEdge) waitGate(provider, slug string) *fakeProject {
 	f.mu.Lock()
 	p, ok := f.projects[slug]
 	if !ok {
-		p = &fakeProject{provider: provider, sim: newSim(slug, simOK)}
+		p = &fakeProject{provider: provider, slug: slug, sim: newSim(slug, simOK)}
 		f.projects[slug] = p
 	}
 	gate := p.gate
@@ -722,11 +795,14 @@ func (f *fakeEdge) waitGate(provider, slug string) *fakeProject {
 
 // completeDeploy finishes a deployment: the project now exists and its sim
 // serves the just-deployed version/token — exactly what a platform switching
-// the production URL to the new worker means.
-func (f *fakeEdge) completeDeploy(p *fakeProject, version, token, source string) {
+// the production URL to the new worker means. rootRoutes records whether
+// the deployment made the project root reach the worker (vercel: only with
+// the shipped rewrite; the other platforms always route every path).
+func (f *fakeEdge) completeDeploy(p *fakeProject, version, token, source string, rootRoutes bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p.exists = true
+	p.rootRoutes = rootRoutes
 	p.deploys = append(p.deploys, deployRecord{Version: version, Token: token, Source: source, At: time.Now()})
 	p.sim.setDeployed(version, token)
 }
