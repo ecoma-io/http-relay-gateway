@@ -38,14 +38,18 @@ relays:
     provider: cloudflare
     token_file: /run/secrets/cf-token
     account: acc_123
+  - name: edge-relay-deno
+    provider: deno
+    token: deno_secret
+    organization: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 `)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Relays) != 2 {
-		t.Fatalf("got %d relays, want 2", len(cfg.Relays))
+	if len(cfg.Relays) != 3 {
+		t.Fatalf("got %d relays, want 3", len(cfg.Relays))
 	}
 	first := cfg.Relays[0]
 	if first.Name != "web-relay" || first.Provider != "vercel" {
@@ -64,6 +68,12 @@ relays:
 	}
 	if second.TokenFile != "/run/secrets/cf-token" {
 		t.Errorf("relay 1 token_file = %q, want /run/secrets/cf-token", second.TokenFile)
+	}
+	third := cfg.Relays[2]
+	if third.Provider != "deno" ||
+		third.Organization != "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" {
+		t.Errorf("relay 2 = %s/%s organization %q, want deno/edge-relay-deno with the org pin",
+			third.Provider, third.Name, third.Organization)
 	}
 
 	// Keys absent from the file keep their documented defaults.
@@ -330,6 +340,16 @@ func TestRelayValidationFailures(t *testing.T) {
 			name:    "account on vercel",
 			relay:   "name: web-relay\n    provider: vercel\n    token: t\n    account: acc_1",
 			wantErr: "account is a cloudflare scope pin",
+		},
+		{
+			name:    "organization on vercel",
+			relay:   "name: web-relay\n    provider: vercel\n    token: t\n    organization: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			wantErr: "organization is a deno scope pin",
+		},
+		{
+			name:    "organization on cloudflare",
+			relay:   "name: web-relay\n    provider: cloudflare\n    token: t\n    organization: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			wantErr: "organization is a deno scope pin",
 		},
 		{
 			name:    "both token and token_file",

@@ -74,6 +74,11 @@ type Credential struct {
 	// Account pins the Cloudflare account; empty means "resolve from the
 	// token", which succeeds only when the token sees exactly one account.
 	Account string
+	// Organization pins the Deno Deploy organization id. Unlike the other
+	// pins it has no empty-means-resolve mode: the Deploy API addresses
+	// projects by organization and offers no route that resolves the
+	// organization from a token, so every deno call requires the pin.
+	Organization string
 }
 
 // SameScope reports whether two credentials address the same platform
@@ -82,7 +87,8 @@ type Credential struct {
 // account; the deployment the old scope hosted is unreachable from the
 // desired state from then on.
 func (c Credential) SameScope(other Credential) bool {
-	return c.Team == other.Team && c.Account == other.Account
+	return c.Team == other.Team && c.Account == other.Account &&
+		c.Organization == other.Organization
 }
 
 // Discovery reports what provider discovery found for one project name.

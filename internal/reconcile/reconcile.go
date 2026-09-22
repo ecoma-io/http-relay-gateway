@@ -285,7 +285,8 @@ func (w *Worker) memoCredentials(cfg *config.Config) {
 			continue // ensureRelay reports the credential problem for this relay
 		}
 		key := deploy.RelayKey{Provider: rel.Provider, Name: rel.Name}
-		cred := deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account}
+		cred := deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account,
+			Organization: rel.Organization}
 		if prev, ok := w.credentials[key]; ok && !prev.SameScope(cred) {
 			// The scope pin moved under a stable identity: this pass
 			// discovers and deploys in the NEW scope, and the deployment the
@@ -325,7 +326,8 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		return
 	}
 	client, err := w.cfg.Factory.For(rel.Provider,
-		deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account})
+		deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account,
+			Organization: rel.Organization})
 	if err != nil {
 		w.reg.Failing(key, gen, readiness.ReasonCredentials, 0)
 		w.logError(err, "ensure: build platform client")
