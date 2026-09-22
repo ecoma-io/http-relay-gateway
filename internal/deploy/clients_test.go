@@ -274,7 +274,8 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 	path := r.URL.Path
 	envPath := strings.HasPrefix(path, "/v10/projects/") && strings.HasSuffix(path, "/env")
 	patchPath := r.Method == http.MethodPatch && strings.HasPrefix(path, "/v9/projects/") && strings.Contains(path, "/env/")
-	if !((r.Method == http.MethodGet || r.Method == http.MethodPost) && envPath) && !patchPath {
+	envCall := (r.Method == http.MethodGet || r.Method == http.MethodPost) && envPath
+	if !envCall && !patchPath {
 		return false
 	}
 	body := f.lastBody()
@@ -284,8 +285,8 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, `{"error":{"code":"not_found","message":"project not found"}}`)
 		return true
 	}
-	switch {
-	case r.Method == http.MethodGet:
+	switch r.Method {
+	case http.MethodGet:
 		keys := make([]string, 0, len(e.ids))
 		for key := range e.ids {
 			keys = append(keys, key)
@@ -297,7 +298,7 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 		}
 		raw, _ := json.Marshal(map[string]any{"envs": envs, "pagination": map[string]any{"count": len(envs)}})
 		writeJSON(w, http.StatusOK, string(raw))
-	case r.Method == http.MethodPost:
+	case http.MethodPost:
 		var create struct {
 			Key    string   `json:"key"`
 			Value  string   `json:"value"`
@@ -329,7 +330,7 @@ func (e *vercelEnvAPI) route(f *fakeAPI, w http.ResponseWriter, r *http.Request)
 			"failed":  []any{},
 		})
 		writeJSON(w, http.StatusCreated, string(raw))
-	case r.Method == http.MethodPatch:
+	case http.MethodPatch:
 		id := path[strings.LastIndex(path, "/env/")+len("/env/"):]
 		var key string
 		for k, v := range e.ids {
