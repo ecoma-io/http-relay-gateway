@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.2.0](https://github.com/ecoma-io/http-relay-gateway/compare/v0.1.0...v0.2.0) (2026-09-22)
+
+
+### Features
+
+* **ci:** cache Go modules and the build cache across Docker builds ([cf25834](https://github.com/ecoma-io/http-relay-gateway/commit/cf2583465c06c46a7e92d481f29edc2d332e5dd8)), closes [#16](https://github.com/ecoma-io/http-relay-gateway/issues/16)
+* **config:** add config.example.yaml reference layout ([#39](https://github.com/ecoma-io/http-relay-gateway/issues/39)) ([d1d4393](https://github.com/ecoma-io/http-relay-gateway/commit/d1d4393051a74d6686f3437e871195cba52d327b)), closes [#38](https://github.com/ecoma-io/http-relay-gateway/issues/38)
+
+
+### Bug Fixes
+
+* **ci:** prettier-ignore the release-please changelog ([b46cf7f](https://github.com/ecoma-io/http-relay-gateway/commit/b46cf7fa060e8d6c24fafdeb470f04db4dc61965))
+* **ci:** prettier-ignore the release-please changelog ([8c4bab4](https://github.com/ecoma-io/http-relay-gateway/commit/8c4bab4b51e6c50e1202991f9f2682d070e3e199))
+* **deploy:** rewrite the deno client against the real deploy api ([#41](https://github.com/ecoma-io/http-relay-gateway/issues/41)) ([767da7f](https://github.com/ecoma-io/http-relay-gateway/commit/767da7f21ff1e9ce6c6e97e14f151b8b81fe0374))
+* **deploy:** route Vercel root traffic and configure relay env ([#44](https://github.com/ecoma-io/http-relay-gateway/issues/44)) ([03fa9a7](https://github.com/ecoma-io/http-relay-gateway/commit/03fa9a761419fac72cf3c54a0e07b98e11b8add9))
+* lifecycle drain — deferred re-drain, shutdown budget, pause cadence ([#43](https://github.com/ecoma-io/http-relay-gateway/issues/43)) ([6e352a2](https://github.com/ecoma-io/http-relay-gateway/commit/6e352a2baafddb683bb78eef3ff65385156d0632))
+* preserve relay-leg bytes, cloudflare deletes, and worker multi-value headers ([#40](https://github.com/ecoma-io/http-relay-gateway/issues/40)) ([f0eeb01](https://github.com/ecoma-io/http-relay-gateway/commit/f0eeb010f4ac4fb048e41da805edadbb268be325))
+* reload signals only on real change; verification settings apply live ([#46](https://github.com/ecoma-io/http-relay-gateway/issues/46)) ([bb5dd38](https://github.com/ecoma-io/http-relay-gateway/commit/bb5dd38b4bc8b016cef8c4d5d978285d48d92986)), closes [#25](https://github.com/ecoma-io/http-relay-gateway/issues/25)
+* **sanitize:** redact relay addresses and close redaction gaps ([#47](https://github.com/ecoma-io/http-relay-gateway/issues/47)) ([28d7f2d](https://github.com/ecoma-io/http-relay-gateway/commit/28d7f2ddfc8c34ced052de8c24b55e720315c23e))
+* subcommand arg handling, token hygiene, worker version pin, and deploy wiring ([#42](https://github.com/ecoma-io/http-relay-gateway/issues/42)) ([a62a0eb](https://github.com/ecoma-io/http-relay-gateway/commit/a62a0eb8bedafb2ac230a03c7199c30b2063264f))
+
+
+### Documentation
+
+* list the deno organization pin among relay.env variables ([#48](https://github.com/ecoma-io/http-relay-gateway/issues/48)) ([4967295](https://github.com/ecoma-io/http-relay-gateway/commit/49672951ed089a465b970734c71ae26f6aa09ab4))
+
 ## 0.1.0 (2026-09-20)
 
 
