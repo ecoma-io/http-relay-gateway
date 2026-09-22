@@ -333,14 +333,14 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 	}
 	project := deploy.ProjectName(rel.Name)
 	wasReady := w.reg.IsReady(key)
-	// A replacement an earlier pass deferred at the drain timeout leaves the
-	// relay unready/replacing; a pass that resumes it must settle and drain
-	// again before deploying. Capture the marker now — Enter(discovering)
-	// below overwrites the record, and IsReady alone is already false (the
-	// first pass demoted the relay).
-	resuming := false
+	// A replacement an earlier pass deferred at the drain timeout keeps an
+	// incarnation-scoped marker; a pass that resumes it must settle and drain
+	// again before deploying. The marker — unlike the (state, reason) pair,
+	// which Failing and Pause rewrite between passes — survives that churn
+	// until the barrier completes or the incarnation changes.
+	drainPending := false
 	if rec, ok := w.reg.StateOf(key); ok {
-		resuming = rec.State == readiness.StateUnready && rec.Reason == readiness.ReasonReplacing
+		drainPending = rec.DrainPending
 	}
 
 	w.reg.Enter(key, gen, readiness.StateDiscovering, "")
@@ -361,7 +361,7 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		// No deployment for this identity: a first bring-up, or the remote
 		// was deleted out-of-band. Either way the fix is a deploy.
 		w.reg.Enter(key, gen, readiness.StateDiscovered, readiness.ReasonMissing)
-		w.rollout(rel, key, gen, relayKey, client, project, wasReady, resuming)
+		w.rollout(rel, key, gen, relayKey, client, project, wasReady, drainPending)
 		return
 	}
 
@@ -377,7 +377,7 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 		// Drift a deploy fixes: stale worker version, rejected relay key
 		// (rotate the key → every relay redeploys), or no worker behind the
 		// URL at all.
-		w.rollout(rel, key, gen, relayKey, client, project, wasReady, resuming)
+		w.rollout(rel, key, gen, relayKey, client, project, wasReady, drainPending)
 	case verifySuspended:
 		// The platform answers instead of the worker — a suspension page.
 		// No deploy lifts it: pause, and let the revival cadence re-probe.
@@ -396,10 +396,10 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 // requests — and only then deploy, because the platform switches the
 // production URL mid-deploy and an old admission left standing would serve
 // whatever lands on that URL next. The settle+drain gate also covers a
-// replacement an earlier pass deferred at the drain timeout (resuming): the
-// retry pass re-runs both before deploying — the same discipline the delete
-// path applies on every retry.
-func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady, resuming bool) {
+// replacement an earlier pass deferred at the drain timeout (the incarnation-
+// scoped drainPending marker): the retry pass re-runs both before deploying —
+// the same discipline the delete path applies on every retry.
+func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady, drainPending bool) {
 	// Gating the drain on wasReady alone skips it on the retry pass — the
 	// first pass already demoted the relay, so IsReady is false from there
 	// on — and the deploy would fire under the very straggler the ordering
@@ -407,7 +407,7 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 	if wasReady {
 		w.reg.Demote(key, gen, readiness.ReasonReplacing)
 	}
-	if wasReady || resuming {
+	if wasReady || drainPending {
 		if !w.settle() {
 			// The process is shutting down and the applier will never
 			// satisfy the barrier. The demotion stands; the replacement is
@@ -420,11 +420,17 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 			// deploying now would cut its upstream mid-flight. The relay
 			// stays demoted (its URL is about to change — serving it would
 			// be the exact race this design removes) and the next pass
-			// retries the drain.
+			// retries the drain. The marker carries the deferral across
+			// any Failing/Pause relabeling in between.
 			w.reg.Enter(key, gen, readiness.StateUnready, readiness.ReasonReplacing)
+			w.reg.DeferDrain(key, gen)
 			w.logWarn("rollout: in-flight drain timed out; replacement deferred to the next pass", key)
 			return
 		}
+		// The barrier passed and the old incarnation is quiet. Deploy
+		// retries from here no longer re-drain: admission stays revoked, so
+		// in-flight traffic can only shrink.
+		w.reg.DrainCompleted(key, gen)
 	}
 	w.reg.Enter(key, gen, readiness.StateDeploying, "")
 	mu := w.platformLocks[rel.Provider]

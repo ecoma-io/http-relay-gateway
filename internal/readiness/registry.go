@@ -91,6 +91,13 @@ type Record struct {
 	LastAttempt time.Time     // when the last verification (or deploy) ended
 	LastResult  time.Duration // how long the last attempt took
 	FailStreak  int           // consecutive failed verifications
+	// DrainPending reports a replacement deferred at the drain timeout: this
+	// incarnation's next rollout must re-run the settle+drain barrier before
+	// deploying. It is deliberately not carried by the (state, reason) pair
+	// — Failing refreshes the reason and Pause replaces the phase between
+	// passes — and it clears only when the barrier completes, the relay is
+	// re-admitted, or the incarnation changes.
+	DrainPending bool
 }
 
 // Serving is one relay's verified admission: the identity, and the exact
@@ -259,6 +266,7 @@ func (r *Registry) Sync(present []Key) {
 			e.record.State = StateConfigured
 			e.record.Reason = ""
 			e.record.FailStreak = 0
+			e.record.DrainPending = false
 			e.nextTry = time.Time{}
 			e.record.Since = now
 			r.notifyLocked()
@@ -279,6 +287,7 @@ func (r *Registry) Sync(present []Key) {
 			e.record.State = StateRemoving
 			e.record.Reason = ""
 			e.record.Generation++
+			e.record.DrainPending = false // the incarnation's replacement story ends here
 			e.record.Since = now
 			r.notifyLocked()
 		}
@@ -500,6 +509,7 @@ func (r *Registry) Ready(key Key, generation uint64, url, token string, duration
 	e.record.LastAttempt = now
 	e.record.LastResult = duration
 	e.record.FailStreak = 0
+	e.record.DrainPending = false // re-admission ends any deferred replacement
 	e.nextTry = time.Time{}
 	if !e.serving {
 		e.serving = true
@@ -635,6 +645,38 @@ func (r *Registry) Pause(key Key, generation uint64, reason string) {
 		r.readyCount--
 	}
 	r.notifyLocked()
+}
+
+// DeferDrain marks this incarnation's replacement as deferred at the drain
+// timeout: the retry pass must re-run the settle+drain barrier before
+// deploying. The marker is deliberately NOT the (state, reason) pair —
+// Failing refreshes the reason and Pause replaces the phase between passes,
+// and either would silently drop the barrier and let the deploy fire under
+// the very straggler the ordering exists to protect. It survives that churn
+// and clears on DrainCompleted, Ready, or an incarnation change. Stale
+// completions are discarded.
+func (r *Registry) DeferDrain(key Key, generation uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.current(key, generation)
+	if e == nil {
+		return // stale completion: the incarnation moved on
+	}
+	e.record.DrainPending = true
+}
+
+// DrainCompleted clears the deferred-drain marker: the settle+drain barrier
+// passed and the old incarnation is quiet. Deploy retries from here no
+// longer re-drain — admission stays revoked, so in-flight traffic can only
+// shrink. Stale completions are discarded.
+func (r *Registry) DrainCompleted(key Key, generation uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.current(key, generation)
+	if e == nil {
+		return // stale completion: the incarnation moved on
+	}
+	e.record.DrainPending = false
 }
 
 // DeleteDone purges key after its remote delete completed under the given

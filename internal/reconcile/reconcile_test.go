@@ -573,6 +573,121 @@ func TestStrategyADrainTimeoutDefersReplacement(t *testing.T) {
 	}
 }
 
+func TestStrategyADeferralSurvivesAFailingBetweenPasses(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+
+	// A replacement defers at the drain timeout: the straggler keeps
+	// streaming and the relay sits demoted, replacement deferred.
+	rig.sim.setVersion("0.0.1-stale")
+	rig.drainer.setIdle(false)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d, want 1 on the deferring pass", got)
+	}
+
+	// Between the passes the probe transport-fails: Failing keeps the
+	// unready phase but overwrites the reason. The deferral must not ride
+	// on that (state, reason) pair.
+	client.url = rig.server.URL + "-closed"
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	rec, _ := rig.reg.StateOf(key)
+	if rec.Reason != readiness.ReasonUnreachable {
+		t.Fatalf("reason = %q, want %q (the blip must actually churn the reason)", rec.Reason, readiness.ReasonUnreachable)
+	}
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d after the blip pass, want 1 (no rollout ran)", got)
+	}
+
+	// The retry pass must still settle and drain again before any deploy.
+	client.url = rig.server.URL
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a churned reason must not drop the drain barrier)", got)
+	}
+	if got := len(rig.drainer.calls); got != 2 {
+		t.Fatalf("drains = %d, want 2 (the resumed replacement re-drains)", got)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing after the retry deferral", rec.State, rec.Reason)
+	}
+
+	// The stream ends and the replacement completes behind a third drain.
+	rig.drainer.setIdle(true)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 3 {
+		t.Fatalf("drains = %d, want 3 across the passes", got)
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("deferred replacement not completed")
+	}
+}
+
+func TestStrategyADeferralSurvivesAPauseBetweenPasses(t *testing.T) {
+	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+
+	// A replacement defers at the drain timeout.
+	rig.sim.setVersion("0.0.1-stale")
+	rig.drainer.setIdle(false)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 1 {
+		t.Fatalf("drains = %d, want 1 on the deferring pass", got)
+	}
+
+	// The platform suspends the relay while the replacement waits: the next
+	// pass pauses it — no deploy is ever fired at a suspension.
+	rig.sim.setSuspend(true)
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StatePaused {
+		t.Fatalf("state = %s, want paused", rec.State)
+	}
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 at a suspension", got)
+	}
+
+	// The suspension lifts but the worker is still stale: the revival
+	// queues the catch-up replacement, and it must still drain before
+	// deploying — the pause replaced the phase the deferral sat in.
+	rig.sim.setSuspend(false)
+	rig.clock.Advance(10*time.Minute + time.Second) // past the PauseRetry cadence
+	rig.worker.pass()
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a pause must not drop the drain barrier)", got)
+	}
+	if got := len(rig.drainer.calls); got != 2 {
+		t.Fatalf("drains = %d, want 2 (the resumed replacement re-drains)", got)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.State != readiness.StateUnready || rec.Reason != readiness.ReasonReplacing {
+		t.Fatalf("state/reason = %s/%s, want unready/replacing after the revival deferral", rec.State, rec.Reason)
+	}
+
+	// The stream ends and the replacement completes behind a third drain.
+	rig.drainer.setIdle(true)
+	rig.worker.pass()
+	if got := len(rig.drainer.calls); got != 3 {
+		t.Fatalf("drains = %d, want 3 across the passes", got)
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("deferred replacement not completed")
+	}
+}
+
 func TestStrategyAReplacementVerifyFailureKeepsServingOff(t *testing.T) {
 	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
 	rig.sim.setVersion(deploy.RelayVersion)
