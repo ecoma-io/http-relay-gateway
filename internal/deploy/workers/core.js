@@ -16,16 +16,20 @@
 //   - Bodies and responses stream through untouched; an upstream transport
 //     failure is a 502.
 
-const HOP_BY_HOP = {
-  connection: true,
-  "keep-alive": true,
-  "proxy-authenticate": true,
-  "proxy-authorization": true,
-  te: true,
-  trailer: true,
-  "transfer-encoding": true,
-  upgrade: true,
-};
+// Hop-by-hop headers are connection-scoped and never forwarded. The lookup
+// must be a Set: a plain object would answer truthy for prototype-named
+// inbound headers ("constructor", "toString", "__proto__") and silently
+// drop them as if they were hop-by-hop.
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 function relayConfig(env) {
   const version =
@@ -105,11 +109,14 @@ async function relayFetch(request, env) {
   const headers = new Headers();
   for (const [name, value] of request.headers) {
     const lower = name.toLowerCase();
-    if (HOP_BY_HOP[lower]) continue;
+    if (HOP_BY_HOP.has(lower)) continue;
     if (lower === "host" || lower === "content-length") continue;
     if (lower === "x-relay-target" || lower === "x-relay-path") continue;
     if (lower === "x-relay-provider" || lower === "x-relay-token") continue;
-    headers.set(name, value);
+    // append, never set: iteration yields each name once with its values
+    // joined (set-cookie iterates per value) — set would collapse a
+    // per-value-iterated name to its last value, append keeps every value.
+    headers.append(name, value);
   }
 
   const init = { method: request.method, headers, redirect: "manual" };

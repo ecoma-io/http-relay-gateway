@@ -273,15 +273,27 @@ func (c *cloudflareClient) Delete(ctx context.Context, project string) error {
 	if err != nil {
 		return err
 	}
+	var answer cloudflareAnswer
 	err = platformCall(ctx, c.http, http.MethodDelete,
 		c.base+"/accounts/"+url.PathEscape(account)+"/workers/scripts/"+url.PathEscape(project),
-		c.cred.Token, "", nil, nil)
+		c.cred.Token, "", nil, &answer)
 	switch {
-	case err == nil, notFound(err):
+	case notFound(err):
 		return nil
 	case credentialsRejected(err):
 		return fmt.Errorf("cloudflare delete: %w", ErrCredentials)
-	default:
+	case err != nil:
 		return fmt.Errorf("cloudflare delete: %w", err)
 	}
+	// A 200 can still carry failure: the envelope is the API's real verdict,
+	// and a delete that reports success:false must never read as a purge
+	// while the script lives on. The envelope's not-found code (7003) is the
+	// desired end state itself, exactly as in Discover.
+	if !answer.Success {
+		if isCloudflareNotFound(answer) {
+			return nil
+		}
+		return fmt.Errorf("cloudflare delete: %w", answer.err())
+	}
+	return nil
 }

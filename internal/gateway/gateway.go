@@ -109,11 +109,15 @@ type Gateway struct {
 // NewTransport builds the shared outbound transport from the timeout
 // settings: keep-alive pooled (TLS handshakes amortize to zero), HTTP/2
 // where available, and Proxy: nil so relay traffic can never leak through
-// HTTP_PROXY/HTTPS_PROXY env vars.
+// HTTP_PROXY/HTTPS_PROXY env vars. DisableCompression keeps the relay leg a
+// dumb pipe: the transport must neither advertise Accept-Encoding: gzip the
+// client never sent nor transparently decode a compressed relay answer —
+// the client sees the relay's exact bytes with Content-Encoding intact.
 func NewTransport(dialTimeout, responseHeaderTimeout time.Duration) *http.Transport {
 	return &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		DisableCompression:    true,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,

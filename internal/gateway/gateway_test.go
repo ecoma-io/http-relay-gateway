@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net"
@@ -212,6 +214,51 @@ func TestRelayForwardsSpecVerbatim(t *testing.T) {
 	}
 	if rec.Header().Get("X-Upstream") != "yes" {
 		t.Fatal("end-to-end response header was dropped")
+	}
+}
+
+// The relay leg is a dumb pipe for compression: the transport must neither
+// advertise gzip the client never asked for nor transparently decode a
+// compressed relay answer — the client receives the relay's exact bytes with
+// Content-Encoding intact. Go's transport does both by default
+// (DisableCompression unset), which twice breaks the verbatim contract.
+func TestRelayLegForwardsCompressionVerbatim(t *testing.T) {
+	var packed bytes.Buffer
+	zw := gzip.NewWriter(&packed)
+	if _, err := zw.Write([]byte("gzip-me")); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	gz := packed.Bytes()
+
+	up, _, got := newUpstream(t, http.StatusOK, string(gz),
+		http.Header{"Content-Encoding": []string{"gzip"}})
+	g := newGateway(t, &State{
+		Pool: buildPool(t, []relaySpec{
+			{name: "alpha", provider: "vercel", rawURL: up.URL, maxBody: bufferBytes()},
+		}),
+		MaxRetries:     1,
+		MaxBufferBytes: bufferBytes(),
+	})
+
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, relayRequest(t, http.MethodGet, "/", "", specHeaders()))
+
+	// The client sent no Accept-Encoding, so the relay leg must not invent one.
+	c := readCapture(t, got)
+	if ae := c.req.Header.Get("Accept-Encoding"); ae != "" {
+		t.Fatalf("relay leg sent Accept-Encoding = %q; the client sent none", ae)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if enc := rec.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("client Content-Encoding = %q, want the relay's gzip passed through", enc)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), gz) {
+		t.Fatalf("client body = % x, want the relay's %d gzip bytes verbatim", rec.Body.Bytes(), len(gz))
 	}
 }
 

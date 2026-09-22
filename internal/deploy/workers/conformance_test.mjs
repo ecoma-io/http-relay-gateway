@@ -29,8 +29,10 @@ function relayRequest(path, init) {
   return new Request(`https://relay.example${path}`, init);
 }
 
-// Local upstream the worker fetches into; it echoes what it saw.
-async function withUpstream(run) {
+// Local upstream the worker fetches into; it echoes what it saw. resHeaders
+// optionally ride on its answer — an array value stays one header line per
+// value, which is what the set-cookie pass-through case asserts against.
+async function withUpstream(run, resHeaders) {
   let seen = null;
   const upstream = createServer((req, res) => {
     const chunks = [];
@@ -42,7 +44,11 @@ async function withUpstream(run) {
         headers: req.headers,
         body: Buffer.concat(chunks).toString("utf8"),
       };
-      res.writeHead(203, { "x-upstream": "yes", "content-type": "application/json" });
+      res.writeHead(203, {
+        "x-upstream": "yes",
+        "content-type": "application/json",
+        ...resHeaders,
+      });
       res.end(JSON.stringify({ served: true }));
     });
   });
@@ -160,6 +166,86 @@ for (const platform of PLATFORMS) {
       // header themselves.
       assert.equal(JSON.parse(got.body).question, 42);
     });
+  });
+
+  test(`${platform}: multi-value request headers forward with every value`, async () => {
+    await withUpstream(async (upstreamBase, seen) => {
+      const res = await mod.handle(
+        relayRequest("/x", {
+          headers: [
+            ["x-relay-token", env.RELAY_AUTH_TOKEN],
+            ["x-relay-target", upstreamBase],
+            ["x-relay-path", "/multi"],
+            ["cookie", "a=1"],
+            ["cookie", "b=2"],
+            ["set-cookie", "x=1"],
+            ["set-cookie", "y=2"],
+            ["x-multi", "one"],
+            ["x-multi", "two"],
+          ],
+        }),
+        env,
+      );
+      assert.equal(res.status, 203);
+      const got = seen();
+      // Headers iteration hands the worker each name once with its values
+      // joined (set-cookie iterates per value); every value must reach the
+      // origin — the copy appends and never re-sets, so nothing collapses
+      // to the last value. The exact join separator stays the runtime's.
+      const both = (name, v1, v2) => {
+        const raw = got.headers[name];
+        const joined = Array.isArray(raw) ? raw.join("\n") : String(raw);
+        assert.ok(
+          joined.includes(v1) && joined.includes(v2),
+          `${name} = ${JSON.stringify(raw)}, want both ${v1} and ${v2}`,
+        );
+      };
+      both("cookie", "a=1", "b=2");
+      both("set-cookie", "x=1", "y=2");
+      both("x-multi", "one", "two");
+    });
+  });
+
+  test(`${platform}: prototype-named headers forward, not mistaken for hop-by-hop`, async () => {
+    await withUpstream(async (upstreamBase, seen) => {
+      const res = await mod.handle(
+        relayRequest("/x", {
+          headers: {
+            "x-relay-token": env.RELAY_AUTH_TOKEN,
+            "x-relay-target": upstreamBase,
+            constructor: "built-by",
+            ToString: "rendered",
+            hasOwnProperty: "owned",
+          },
+        }),
+        env,
+      );
+      assert.equal(res.status, 203);
+      const got = seen();
+      // Node's incoming headers are a null-prototype object, so these reads
+      // see the forwarded header or nothing — never an inherited value.
+      assert.equal(got.headers.constructor, "built-by");
+      assert.equal(got.headers.tostring, "rendered");
+      assert.equal(got.headers.hasownproperty, "owned");
+    });
+  });
+
+  test(`${platform}: response set-cookie values pass through per value`, async () => {
+    await withUpstream(
+      async (upstreamBase) => {
+        const res = await mod.handle(
+          relayRequest("/x", {
+            headers: { "x-relay-token": env.RELAY_AUTH_TOKEN, "x-relay-target": upstreamBase },
+          }),
+          env,
+        );
+        assert.equal(res.status, 203);
+        // The worker hands the upstream response through untouched: the
+        // values must stay separate, never joined into one cookie line.
+        assert.deepEqual(res.headers.getSetCookie(), ["a=1", "b=2"]);
+      },
+      { "set-cookie": ["a=1", "b=2"] },
+    );
   });
 
   test(`${platform}: default path is / and query comes from x-relay-path only`, async () => {
