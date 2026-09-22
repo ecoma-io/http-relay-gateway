@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/ecoma-io/http-relay-gateway/compare/v0.2.1...v0.2.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* **sanitize:** redact net.OpError read/write relay addresses ([#53](https://github.com/ecoma-io/http-relay-gateway/issues/53)) ([2a4a448](https://github.com/ecoma-io/http-relay-gateway/commit/2a4a4480c25c8cbd730ddc53fa92807e61be3c2d))
+* **sanitize:** redact the readfrom body-write wrapper; pin surfaces e2e ([#55](https://github.com/ecoma-io/http-relay-gateway/issues/55)) ([0b18d72](https://github.com/ecoma-io/http-relay-gateway/commit/0b18d725a181bd251bbab680ca3cdfb860a64b04))
+
 ## [0.2.1](https://github.com/ecoma-io/http-relay-gateway/compare/v0.2.0...v0.2.1) (2026-09-22)
 
 
