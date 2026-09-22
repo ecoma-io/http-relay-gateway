@@ -49,21 +49,64 @@ var version = "0.1.0-dev"
 var fatalLog = logging.New(os.Stdout)
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "version":
-			fmt.Println(version)
-			return
-		case "healthcheck":
-			os.Exit(healthcheck("/healthz", "ok\n"))
-		case "readinesscheck":
-			os.Exit(healthcheck("/readyz", ""))
+	if code, handled := dispatch(os.Stdout, os.Stderr, os.Args[1:]); handled {
+		if code != 0 {
+			os.Exit(code)
 		}
+		return
 	}
 	if err := run(); err != nil {
 		fatalLog.Error().Str("error", sanitize.ErrorString(err)).Msg("fatal")
 		os.Exit(1)
 	}
+}
+
+// dispatch handles the subcommand surface. It reports whether an argument
+// was recognized (subcommands, help — anything else must never fall through
+// to run(): a typo like `healthchek` silently starting the relay gateway is
+// the failure this exists to prevent) and the process exit code to use.
+// stdout/stderr are parameters so tests can see the output; the healthcheck
+// subcommand's own diagnostics still go to the process stderr. No arguments
+// at all starts the gateway proper.
+func dispatch(stdout, stderr io.Writer, args []string) (code int, handled bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	switch args[0] {
+	case "version":
+		_, _ = fmt.Fprintln(stdout, version)
+		return 0, true
+	case "healthcheck":
+		return healthcheck("/healthz", "ok\n"), true
+	case "readinesscheck":
+		return healthcheck("/readyz", ""), true
+	case "-h", "--help":
+		usage(stdout)
+		return 0, true
+	default:
+		_, _ = fmt.Fprintln(stderr, "unknown argument:", args[0])
+		usage(stderr)
+		return 2, true
+	}
+}
+
+// usageText is the subcommand surface. Subcommands are the container's
+// healthcheck path and the first thing an operator types; the bare command
+// is the relay gateway itself.
+const usageText = `usage: http-relay-gateway [version | healthcheck | readinesscheck]
+
+  version          print the build version and exit
+  healthcheck      probe /healthz on LISTEN_ADDR (the Docker HEALTHCHECK)
+  readinesscheck   probe /readyz on LISTEN_ADDR (gate traffic on a verified fleet)
+
+With no subcommand the relay gateway starts.
+`
+
+// usage prints usageText to w in one write. Unlike the process streams, a
+// generic io.Writer's error is not on errcheck's default exclusion list, so
+// the return is taken and discarded explicitly.
+func usage(w io.Writer) {
+	_, _ = fmt.Fprint(w, usageText)
 }
 
 // healthcheck probes the data-plane listener. path selects the probe:
@@ -74,14 +117,21 @@ func main() {
 // doing, it does not re-run config validation. The scratch image has no
 // shell, so these subcommands are what the container runs. wantBody pins the
 // expected body when non-empty (/healthz answers "ok\n"); /readyz matches on
-// status alone.
+// status alone. A malformed LISTEN_ADDR is reported as a single sanitized
+// line and a non-zero code — a healthcheck is operator-facing output, never
+// a stack trace.
 func healthcheck(path, wantBody string) int {
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = config.DefaultListenAddr
 	}
+	target, err := probeURL(addr, path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", sanitize.ErrorString(err))
+		return 1
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(probeURL(addr, path))
+	resp, err := client.Get(target)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck:", sanitize.ErrorString(err))
 		return 1
@@ -96,11 +146,13 @@ func healthcheck(path, wantBody string) int {
 }
 
 // probeURL turns a listen address into the loopback URL a same-container
-// probe reaches it on.
-func probeURL(addr, path string) string {
+// probe reaches it on. An address that is not host:port is an error, not a
+// panic: the probe subcommands bypass bootstrap validation, so this is where
+// a malformed LISTEN_ADDR surfaces.
+func probeURL(addr, path string) (string, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		panic(fmt.Sprintf("probeURL requires a host:port address: %q", addr))
+		return "", fmt.Errorf("LISTEN_ADDR %q is not a host:port address", addr)
 	}
 	switch host {
 	case "", "0.0.0.0":
@@ -108,7 +160,7 @@ func probeURL(addr, path string) string {
 	case "::":
 		host = "::1"
 	}
-	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: path}).String()
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: path}).String(), nil
 }
 
 func run() error {

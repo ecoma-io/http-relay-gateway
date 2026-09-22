@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -377,8 +378,89 @@ func TestProbeURL(t *testing.T) {
 		{"[::1]:8080", "http://[::1]:8080/x"},
 	}
 	for _, tc := range cases {
-		if got := probeURL(tc.addr, "/x"); got != tc.want {
+		got, err := probeURL(tc.addr, "/x")
+		if err != nil {
+			t.Fatalf("probeURL(%q) error = %v", tc.addr, err)
+		}
+		if got != tc.want {
 			t.Fatalf("probeURL(%q) = %q, want %q", tc.addr, got, tc.want)
+		}
+	}
+}
+
+// A malformed LISTEN_ADDR must surface as an error the subcommand reports,
+// never a panic — the probe path is what a Docker HEALTHCHECK runs.
+func TestProbeURLRejectsMalformedAddresses(t *testing.T) {
+	for _, addr := range []string{"8080", "127.0.0.1", "http://127.0.0.1:8080", "1:2:3:4"} {
+		got, err := probeURL(addr, "/x")
+		if err == nil {
+			t.Fatalf("probeURL(%q) = %q, want an error for a non-host:port address", addr, got)
+		}
+		if !strings.Contains(err.Error(), "LISTEN_ADDR") {
+			t.Fatalf("probeURL(%q) error = %v, want it to name LISTEN_ADDR", addr, err)
+		}
+		if got != "" {
+			t.Fatalf("probeURL(%q) returned %q alongside the error", addr, got)
+		}
+	}
+}
+
+// --- dispatch ---
+
+// dispatch is the gate between subcommands and the server: anything it does
+// not recognize must never fall through to run().
+func TestDispatch(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code, handled := dispatch(&out, &errOut, nil); handled || code != 0 {
+		t.Fatalf("dispatch(nil) = %d, %v; no arguments must fall through to run()", code, handled)
+	}
+	if code, handled := dispatch(&out, &errOut, []string{"version"}); !handled || code != 0 {
+		t.Fatalf("dispatch(version) = %d, %v; want handled with exit 0", code, handled)
+	}
+	if out.String() != version+"\n" {
+		t.Fatalf("dispatch(version) wrote %q, want the build version", out.String())
+	}
+	if errOut.String() != "" {
+		t.Fatalf("dispatch(version) wrote %q to stderr, want it silent", errOut.String())
+	}
+}
+
+// A typo or an unrecognized flag must print usage to stderr and report exit
+// code 2 — never start the gateway.
+func TestDispatchUnknownArgumentIsRejected(t *testing.T) {
+	for _, arg := range []string{"healthchek", "--help-typo", "serve"} {
+		var out, errOut bytes.Buffer
+		code, handled := dispatch(&out, &errOut, []string{arg})
+		if !handled {
+			t.Fatalf("dispatch(%q) not handled; unknown arguments must never reach run()", arg)
+		}
+		if code != 2 {
+			t.Fatalf("dispatch(%q) = %d, want exit code 2", arg, code)
+		}
+		if out.String() != "" {
+			t.Fatalf("dispatch(%q) wrote to stdout %q, want usage on stderr only", arg, out.String())
+		}
+		diagnostic := errOut.String()
+		for _, want := range []string{"unknown argument: " + arg, "usage:", "version", "healthcheck", "readinesscheck"} {
+			if !strings.Contains(diagnostic, want) {
+				t.Fatalf("dispatch(%q) stderr %q must mention %q", arg, diagnostic, want)
+			}
+		}
+	}
+}
+
+func TestDispatchHelpPrintsUsage(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code, handled := dispatch(&out, &errOut, []string{"--help"})
+	if !handled || code != 0 {
+		t.Fatalf("dispatch(--help) = %d, %v; want handled with exit 0", code, handled)
+	}
+	if errOut.String() != "" {
+		t.Fatalf("dispatch(--help) wrote %q to stderr, want it silent", errOut.String())
+	}
+	for _, want := range []string{"usage:", "version", "healthcheck", "readinesscheck"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("--help output %q must mention %q", out.String(), want)
 		}
 	}
 }
@@ -453,5 +535,42 @@ func TestHealthcheckUnreachable(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", "127.0.0.1:1")
 	if got := healthcheck("/healthz", "ok\n"); got != 1 {
 		t.Fatalf("healthcheck on a dead port = %d, want 1", got)
+	}
+}
+
+// A malformed LISTEN_ADDR must fail the probe with a single line on stderr —
+// the subcommand is what a Docker HEALTHCHECK runs, and a panic trace there
+// is operator noise (and a stack trace where the address may appear).
+func TestHealthcheckMalformedListenAddr(t *testing.T) {
+	var stderr bytes.Buffer
+	saved := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = saved })
+
+	done := make(chan string, 1)
+	go func() {
+		raw, _ := io.ReadAll(r)
+		done <- string(raw)
+	}()
+
+	t.Setenv("LISTEN_ADDR", "8080") // missing the host:port colon
+	code := healthcheck("/healthz", "ok\n")
+
+	_ = w.Close()
+	os.Stderr = saved
+	if code != 1 {
+		t.Fatalf("healthcheck on a malformed LISTEN_ADDR = %d, want 1", code)
+	}
+	stderr.WriteString(<-done)
+	if !strings.Contains(stderr.String(), "healthcheck:") ||
+		!strings.Contains(stderr.String(), "LISTEN_ADDR") {
+		t.Fatalf("healthcheck stderr = %q, want a single line naming LISTEN_ADDR", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "panic") {
+		t.Fatalf("healthcheck stderr = %q, want no panic trace", stderr.String())
 	}
 }
