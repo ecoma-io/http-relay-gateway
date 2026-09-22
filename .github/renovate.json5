@@ -36,12 +36,16 @@
   customManagers: [
     {
       // The pinned golangci-lint in ci.yml is downloaded by URL — not
-      // anything Renovate tracks by default — so this manager owns it. URL
-      // and version appear in one string; keep them bumping together.
+      // anything Renovate tracks by default — so this manager owns it. The
+      // URL's vX.Y.Z is the one version literal in the workflow: the asset
+      // name and its digest derive from it at run time, so a bump edits this
+      // single occurrence and nothing else. Capture the version ONLY — a
+      // match that reached into an asset filename would leave Renovate
+      // rewriting half of a two-occurrence pin (the #49 failure mode).
       customType: "regex",
       fileMatch: ["^\\.github/workflows/ci\\.ya?ml$"],
       matchStrings: [
-        "https://github.com/golangci/golangci-lint/releases/download/v(?<currentValue>[^/]+)/golangci-lint",
+        "https://github\\.com/golangci/golangci-lint/releases/download/v(?<currentValue>[0-9.]+)",
       ],
       depNameTemplate: "golangci/golangci-lint",
       datasourceTemplate: "github-releases",
@@ -51,7 +55,7 @@
       customType: "regex",
       fileMatch: ["^\\.github/workflows/analysis\\.ya?ml$"],
       matchStrings: [
-        "https://github.com/zricethezav/gitleaks/releases/download/v(?<currentValue>[^/]+)/gitleaks",
+        "https://github\\.com/zricethezav/gitleaks/releases/download/v(?<currentValue>[0-9.]+)",
       ],
       depNameTemplate: "zricethezav/gitleaks",
       datasourceTemplate: "github-releases",
