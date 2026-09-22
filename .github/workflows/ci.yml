@@ -69,25 +69,36 @@ jobs:
 
       # Downloaded and checksum-pinned rather than taken from the runner image
       # (whose copy moves underneath every job) and rather than an installer
-      # action (a second moving piece when the release tarball's digest is
-      # already the pin). The download itself retries bounded — a transient
-      # 5xx from the release endpoint must not fail the pipeline on an
-      # unchanged tree. The checksum line stays OUTSIDE the retry on purpose:
-      # it fails loudly on a wrong or partial download, and a retry must
-      # never paper over bytes that do not match the pin. Renovate bumps the
-      # URL via the regex custom manager in renovate.json5.
+      # action (a second moving piece). The vX.Y.Z in `url` is the ONE place
+      # the version appears — the asset name and its digest derive from that
+      # pin at run time, with the digest verified against the release's own
+      # checksums.txt asset of the same tag. A frozen in-repo digest could
+      # never be bumped: release assets expose no digest lookup, so Renovate
+      # has nothing to resolve a currentDigest against. The tarball download
+      # retries bounded — a transient 5xx from the release endpoint must not
+      # fail the pipeline on an unchanged tree. The checksum verification
+      # stays OUTSIDE the retry on purpose: it fails loudly on a wrong or
+      # partial download, and a retry must never paper over bytes that do not
+      # match the pin. Renovate bumps the URL via the regex custom manager in
+      # renovate.json5.
       - name: Install the pinned golangci-lint
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/golangci-lint"
           mkdir -p "$dir"
+          url="https://github.com/golangci/golangci-lint/releases/download/v2.12.2"
+          version="${url##*/v}"
+          asset="golangci-lint-${version}-linux-amd64.tar.gz"
           curl --silent --show-error --fail --location \
             --retry 3 --retry-all-errors --retry-delay 10 \
-            --output "$dir/golangci-lint.tar.gz" \
-            "https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-linux-amd64.tar.gz"
-          echo "8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553  $dir/golangci-lint.tar.gz" | sha256sum --check --strict
-          tar -xzf "$dir/golangci-lint.tar.gz" -C "$dir"
-          sudo mv "$dir/golangci-lint-2.12.2-linux-amd64/golangci-lint" /usr/local/bin/golangci-lint
+            --output "$dir/$asset" \
+            "${url}/${asset}"
+          curl --fail --silent --show-error --location \
+            "${url}/golangci-lint-${version}-checksums.txt" \
+            | awk -v a="$asset" -v p="$dir/$asset" '$2 == a { print $1 "  " p }' \
+            | sha256sum --check --strict -
+          tar -xzf "$dir/$asset" -C "$dir"
+          sudo mv "$dir/${asset%.tar.gz}/golangci-lint" /usr/local/bin/golangci-lint
 
       - name: Lint
         run: golangci-lint run ./...
