@@ -3,6 +3,7 @@ package sanitize
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"testing"
@@ -166,6 +167,84 @@ func TestSanitizeRedactsDialAddresses(t *testing.T) {
 				t.Error("sanitized diagnostic leaks the sentinel address")
 			}
 		})
+	}
+}
+
+func TestSanitizeRedactsConnIOAddresses(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		want   string
+		secret string
+	}{
+		{
+			name:   "mid-body reset keeps both ports and the cause",
+			in:     `read tcp 127.0.0.1:52400->127.0.0.1:443: read: connection reset by peer`,
+			want:   `read tcp [redacted]:52400->[redacted]:443: read: connection reset by peer`,
+			secret: "127.0.0.1",
+		},
+		{
+			name:   "write broken pipe keeps both ports and the cause",
+			in:     `write tcp 10.123.45.67:51000->10.0.0.1:8443: write: broken pipe`,
+			want:   `write tcp [redacted]:51000->[redacted]:8443: write: broken pipe`,
+			secret: "10.123.45.67",
+		},
+		{
+			name:   "read IPv6 keeps both ports and the cause",
+			in:     `read tcp [fd00::42]:50000->[2001:db8::1]:443: use of closed network connection`,
+			want:   `read tcp [redacted]:50000->[redacted]:443: use of closed network connection`,
+			secret: "fd00::42",
+		},
+		{
+			name:   "OpError without a source endpoint still redacts the peer",
+			in:     `write tcp 10.0.0.1:443: write: broken pipe`,
+			want:   `write tcp [redacted]:443: write: broken pipe`,
+			secret: "10.0.0.1",
+		},
+		{
+			name:   "redaction is idempotent",
+			in:     `read tcp [redacted]:52400->[redacted]:443: read: connection reset by peer`,
+			want:   `read tcp [redacted]:52400->[redacted]:443: read: connection reset by peer`,
+			secret: "",
+		},
+		{
+			name:   "arrow-shaped text without an OpError prefix stays unchanged",
+			in:     `route a:1->b:2 denotes the mapping`,
+			want:   `route a:1->b:2 denotes the mapping`,
+			secret: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Sanitize(tt.in)
+			if got != tt.want {
+				t.Errorf("Sanitize(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if tt.secret != "" && strings.Contains(got, tt.secret) {
+				t.Error("sanitized diagnostic leaks the sentinel address")
+			}
+		})
+	}
+}
+
+// The real error reaches Sanitize through net.OpError's own formatting, not a
+// hand-typed string — pin that the constructed form sanitizes too.
+func TestErrorStringRedactsNetOpError(t *testing.T) {
+	err := &net.OpError{
+		Op:     "read",
+		Net:    "tcp",
+		Source: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 52400},
+		Addr:   &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443},
+		Err:    errors.New("read: connection reset by peer"),
+	}
+	got := ErrorString(err)
+	want := `read tcp [redacted]:52400->[redacted]:443: read: connection reset by peer`
+	if got != want {
+		t.Errorf("ErrorString = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "127.0.0.1") {
+		t.Error("sanitized OpError leaks the endpoint address")
 	}
 }
 
