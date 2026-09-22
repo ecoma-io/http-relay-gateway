@@ -126,6 +126,10 @@ rejected, which classifies as drift a deploy fixes).
 }
 ```
 
+A relay row also carries `lastError` — the sanitized label of the most
+recent passive transport failure (never a URL) — omitted entirely while
+the relay has never failed.
+
 ## Readiness gate
 
 A relay serves traffic only after it _proves_ it can. The proof, in order:
@@ -153,7 +157,6 @@ Lifecycle is tracked in memory and rendered on `/stats`:
 | `discovering` | Resolving the deployment from the provider                   |
 | `discovered`  | Deployment located; verification pending                     |
 | `deploying`   | A deploy/redeploy is in flight (single-flight per relay)     |
-| `verifying`   | Version + forwarded probe in progress                        |
 | `ready`       | Gate passed; admitted to the pool; round-robins traffic      |
 | `unready`     | Was serving; verification failed `verify_demote_after` times |
 | `failed`      | Never verified; retries under backoff                        |
@@ -356,10 +359,12 @@ state; byte-identical content is not a change — no reconciler wake, no pool
 rebuild; an invalid file is logged and ignored, so the last-known-good
 fleet keeps serving. The file
 being absent at boot is fine: the gateway starts with an empty fleet
-(`/readyz` answers `503`) and reconciles the moment the file appears.
-Delete the file mid-run and the fleet treats every relay as removed (see
-[Removal](#removal)) — back the file up; it plus the referenced
-environment is the whole system.
+(`/readyz` answers `503`) and reconciles the moment the file appears. A
+file that disappears or turns invalid mid-run is a rejected reload, not a
+fleet change — the last-known-good fleet keeps serving and the log warns
+until a valid file returns. Removal happens by deleting a relay entry from
+a valid file (see [Removal](#removal)) — back the file up; it plus the
+referenced environment is the whole system.
 
 ### Settings
 
