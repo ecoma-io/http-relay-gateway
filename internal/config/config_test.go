@@ -183,6 +183,38 @@ func TestLoadMissingFile(t *testing.T) {
 	}
 }
 
+// TestExampleConfigLoads guards the committed reference layout: whatever is
+// commented out in it, config.example.yaml must parse through the same
+// strict loader a hand-written config.yaml goes through. The stub
+// environment carries a non-empty value for every ${VAR} the example
+// references, so the load also stays valid with entries uncommented — the
+// test pins the file's YAML syntax, not its comment state.
+func TestExampleConfigLoads(t *testing.T) {
+	for _, name := range []string{
+		"VERCEL_TOKEN", "VERCEL_TEAM_ID",
+		"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+		"DENO_DEPLOY_TOKEN",
+	} {
+		t.Setenv(name, "stub-"+strings.ToLower(name))
+	}
+
+	// go test runs the binary in the package directory; the example lives
+	// two levels up, next to compose.yaml.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	cfg, err := Load(filepath.Join(wd, "..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatalf("Load(config.example.yaml): %v", err)
+	}
+	// The settings block ships fully commented out, so the example loads
+	// with the documented defaults.
+	if cfg.Settings != DefaultSettings() {
+		t.Errorf("settings = %+v, want the documented defaults %+v", cfg.Settings, DefaultSettings())
+	}
+}
+
 func TestSettingsAllKeysOverride(t *testing.T) {
 	path := writeConfig(t, `
 settings:

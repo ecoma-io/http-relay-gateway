@@ -316,6 +316,10 @@ relays:
     token: ${DENO_TOKEN}
 ```
 
+Start from the committed reference layout: `cp config.example.yaml
+config.yaml` (the copy is gitignored; every key ships commented out with
+its default).
+
 A relay is exactly four things: its **name** (identity, ≤ 128 chars), its
 **provider** (`vercel` | `cloudflare` | `deno` — hard-coded), the provider
 credential that manages its deployment, and an optional scope pin.

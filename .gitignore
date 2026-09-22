@@ -9,4 +9,6 @@ node_modules/
 # every real deployment names its own file. Never committed.
 config.yaml
 config.*.yaml
+# The committed reference layout is the one deliberate exception.
+!config.example.yaml
 /data/
