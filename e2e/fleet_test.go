@@ -69,6 +69,47 @@ func TestE2E_BootstrapNoConfig(t *testing.T) {
 	}
 }
 
+// TestE2E_ReadinessCheckSubcommand: the readinesscheck subcommand gates on
+// a verified fleet — non-zero while nothing is admitted, zero once one is,
+// against the real running listener — and healthcheck answers for the live
+// process throughout, fleet or no fleet.
+func TestE2E_ReadinessCheckSubcommand(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, vt := freshIdentity("rc")
+	fake.setToken("vercel", vt)
+
+	g := startGateway(t, fake, gwOptions{
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
+	})
+
+	// The empty fleet: the process is alive, but nothing is verified — the
+	// readiness gate must refuse to hand traffic over.
+	if code, out := runSubcommand(t, g, "readinesscheck"); code == 0 {
+		t.Fatalf("readinesscheck with an empty fleet exited %d (%s), want failure", code, out)
+	}
+	if code, out := runSubcommand(t, g, "healthcheck"); code != 0 {
+		t.Fatalf("healthcheck with an empty fleet exited %d (%s), want 0", code, out)
+	}
+
+	// A relay verifies; the same subcommand now admits traffic.
+	g.writeConfig(configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))))
+	g.waitForReady(t, 20*time.Second)
+	if code, out := runSubcommand(t, g, "readinesscheck"); code != 0 {
+		t.Fatalf("readinesscheck with a verified relay exited %d (%s), want 0", code, out)
+	}
+	if code, out := runSubcommand(t, g, "healthcheck"); code != 0 {
+		t.Fatalf("healthcheck with a verified relay exited %d (%s), want 0", code, out)
+	}
+	resp, body := g.do(t, http.MethodPost, "/", map[string]string{
+		"X-Relay-Target": echo.base, "X-Relay-Path": "/after-check",
+	}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("relay after readinesscheck = %d (%s)", resp.StatusCode, body)
+	}
+}
+
 // TestE2E_FirstRelayAdmission pins the first bring-up contract: discover
 // honoring the scope pin, then exactly one deploy carrying the current
 // worker version and the relay key; the deployed relay forwards end to end
