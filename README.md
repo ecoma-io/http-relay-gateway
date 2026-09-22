@@ -203,9 +203,10 @@ transient, so they demote and back off — a redeploy is never fired on a
 hunch. Version drift, a missing worker, and a rejected key are exact, known
 fixes, so they queue a replacement. A platform suspension cannot be lifted
 by any deploy, so the relay pauses instead: no client is ever served the
-platform's page, and the revival scan (`revive_scan_interval`) re-probes
-until the worker answers again — the relay rejoins automatically, or queues
-a catch-up redeploy first if the fleet version moved on while it was dark.
+platform's page, and its own pause gate (`revive_scan_interval`) re-probes
+it on the ordinary pass until the worker answers again — the relay rejoins
+automatically, or queues a catch-up redeploy first if the fleet version
+moved on while it was dark.
 
 ### Two layers of health
 
@@ -346,8 +347,10 @@ manually.
 
 The poller re-reads the file every second and compares content hashes — a
 design, not a gap: no inotify, and unlike a watcher it cannot miss events
-on bind mounts. A valid new file becomes the desired state; an invalid one
-is logged and ignored, so the last-known-good fleet keeps serving. The file
+on bind mounts. A valid parse whose content differs becomes the desired
+state; byte-identical content is not a change — no reconciler wake, no pool
+rebuild; an invalid file is logged and ignored, so the last-known-good
+fleet keeps serving. The file
 being absent at boot is fine: the gateway starts with an empty fleet
 (`/readyz` answers `503`) and reconciles the moment the file appears.
 Delete the file mid-run and the fleet treats every relay as removed (see
@@ -357,7 +360,10 @@ environment is the whole system.
 ### Settings
 
 Every key is optional; absent keys take the default. Malformed values are
-load errors, never silent defaults.
+load errors, never silent defaults. Every key applies on the next accepted
+reload — no restart: the verification knobs reach the registry at once
+(already-armed retry gates are recomputed from the failed attempt), the
+rest land with the serving-generation rebuild.
 
 | Key                       | Default | Meaning                                                          |
 | ------------------------- | ------- | ---------------------------------------------------------------- |
@@ -475,7 +481,8 @@ binary `healthcheck` subcommand (no shell in the image).
 - `internal/readiness` — the in-memory admission gate: lifecycle states,
   incarnations, single-flight, backoff, the verified serving snapshot
 - `internal/reconcile` — the desired-state worker: sync, deletes,
-  probe classification, redeploys, Strategy A replacements, the revival scan
+  probe classification, redeploys, Strategy A replacements, paused-relay
+  revival
 - `internal/gateway` — HTTP data plane: pinning, bounded failover,
   streaming pass-through, in-flight drain, `/healthz` + `/readyz` + `/stats`
 - `internal/pool` — the serving set: per-selector round-robin cursors,

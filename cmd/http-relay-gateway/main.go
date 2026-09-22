@@ -126,9 +126,9 @@ func run() error {
 	store.poll(bootstrap.ConfigFile, log)
 
 	// Boot-time tuning comes from the file when it loaded, from the defaults
-	// otherwise. The registry's backoff knobs are read here once (they shape
-	// in-flight retry state; changing them mid-run is a restart); cadences
-	// stay live through the store.
+	// otherwise. The registry's retry gates are seeded here once and re-pushed
+	// on every accepted reload (apply does it); the scan cadences stay live
+	// through the store.
 	settings := config.DefaultSettings()
 	if cfg := store.get(); cfg != nil {
 		settings = cfg.Settings
@@ -168,6 +168,18 @@ func run() error {
 		s := config.DefaultSettings()
 		if cfg != nil {
 			s = cfg.Settings
+		}
+		if source == "config" {
+			// These settings are owned by the readiness registry rather than
+			// the HTTP data plane. Push every accepted desired-state reload:
+			// UpdateSettings is synchronized and only changes retry gates.
+			reg.UpdateSettings(readiness.Settings{
+				BackoffBase: s.VerifyBackoffBase,
+				BackoffMax:  s.VerifyBackoffMax,
+				RecoverMax:  s.VerifyRecoverMax,
+				PauseRetry:  s.ReviveScanInterval,
+				DemoteAfter: s.VerifyDemoteAfter,
+			})
 		}
 		g.Swap(buildState(reg, s, log))
 		zerolog.SetGlobalLevel(parseZerologLevel(s.LogLevel))

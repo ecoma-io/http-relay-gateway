@@ -104,9 +104,9 @@ type Serving struct {
 	Version uint64
 }
 
-// Config tunes retry/backoff behavior. Zero fields take the defaults;
-// tests shrink them (and inject time) to drive transitions deterministically.
-type Config struct {
+// Settings are the live-updatable retry and readiness thresholds. Every
+// field must be positive; UpdateSettings leaves a non-positive field as-is.
+type Settings struct {
 	// BackoffBase is the retry delay after the first failure. Default 5s.
 	BackoffBase time.Duration
 	// BackoffMax caps the exponential growth. Default 5m.
@@ -124,6 +124,17 @@ type Config struct {
 	// relay loses admission. Below it transient blips leave it serving —
 	// passive pool health is the fast layer, this is the verified one.
 	// Default 3.
+	DemoteAfter int
+}
+
+// Config tunes retry/backoff behavior at construction. Zero fields take the
+// defaults; tests shrink them (and inject time) to drive transitions
+// deterministically.
+type Config struct {
+	BackoffBase time.Duration
+	BackoffMax  time.Duration
+	RecoverMax  time.Duration
+	PauseRetry  time.Duration
 	DemoteAfter int
 	// Now is the clock; tests inject a fake. Defaults to time.Now.
 	Now func() time.Time
@@ -172,6 +183,48 @@ func New(cfg Config) *Registry {
 		cfg.Now = time.Now
 	}
 	return &Registry{cfg: cfg, entries: map[Key]*entry{}, changes: make(chan struct{}, 1)}
+}
+
+// UpdateSettings applies retry and readiness settings from a successful
+// desired-state reload. It is safe to call concurrently with all registry
+// transitions. Existing failed and paused entries have their gates recomputed
+// from LastAttempt, so a lowered ceiling or revival cadence takes effect
+// without waiting for an unrelated future failure; a running verification
+// keeps its captured work and uses the new settings when it completes.
+//
+// The desired-state loader rejects non-positive values. The guards here make
+// the exported method defensive for other callers: a non-positive field keeps
+// the registry's current valid value.
+func (r *Registry) UpdateSettings(settings Settings) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if settings.BackoffBase > 0 {
+		r.cfg.BackoffBase = settings.BackoffBase
+	}
+	if settings.BackoffMax > 0 {
+		r.cfg.BackoffMax = settings.BackoffMax
+	}
+	if settings.RecoverMax > 0 {
+		r.cfg.RecoverMax = settings.RecoverMax
+	}
+	if settings.PauseRetry > 0 {
+		r.cfg.PauseRetry = settings.PauseRetry
+	}
+	if settings.DemoteAfter > 0 {
+		r.cfg.DemoteAfter = settings.DemoteAfter
+	}
+	for _, e := range r.entries {
+		if e.record.LastAttempt.IsZero() {
+			continue
+		}
+		if e.record.State == StatePaused {
+			e.nextTry = e.record.LastAttempt.Add(r.cfg.PauseRetry)
+			continue
+		}
+		if e.record.FailStreak > 0 {
+			r.backoffLocked(e, e.record.LastAttempt)
+		}
+	}
 }
 
 // Sync reconciles the registry with the desired relay set: keys that first
@@ -451,7 +504,7 @@ func (r *Registry) Ready(key Key, generation uint64, url, token string, duration
 // until DemoteAfter consecutive failures — transient blips are the passive
 // health layer's job, not this one's; past the threshold it loses admission
 // as unready. A relay that never verified goes to failed; a paused relay
-// stays paused (the revival scan owns it) with its reason refreshed. The
+// stays paused (the pause gate owns it) with its reason refreshed. The
 // backoff gate doubles with each failure, capped, and capped again harder
 // while nothing at all is serving so a total outage heals quickly. Stale
 // completions are discarded.
@@ -549,11 +602,11 @@ func (r *Registry) Demote(key Key, generation uint64, reason string) {
 
 // Pause revokes key's admission immediately and labels it paused: the
 // platform answered instead of the worker (a suspension page), and no
-// client may ever see that page through the gateway. Revival is the
-// revival scan's job — no deploy can lift a platform suspension — so the
-// retry gate is armed at the revival cadence, not the ordinary backoff: the
-// scan re-probes on its own schedule and the relay rejoins automatically
-// when the worker answers again. Stale completions are discarded.
+// client may ever see that page through the gateway. No deploy can lift a
+// platform suspension, so revival is just the ordinary pass re-probing
+// once the pause gate opens: the gate is armed at the revival cadence,
+// not the ordinary backoff, and the relay rejoins automatically when the
+// worker answers again. Stale completions are discarded.
 func (r *Registry) Pause(key Key, generation uint64, reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
