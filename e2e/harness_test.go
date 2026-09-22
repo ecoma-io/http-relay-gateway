@@ -474,9 +474,14 @@ func configYAML(relays ...string) string {
 }
 
 // relayBlock renders one relay entry; secret is the indented token or
-// token_file line(s).
+// token_file line(s). Deno relays carry the organization pin the Deploy API
+// requires — it has no route that resolves the organization from a token.
 func relayBlock(name, provider, secret string) string {
-	return fmt.Sprintf("  - name: %s\n    provider: %s\n%s", name, provider, secret)
+	org := ""
+	if provider == "deno" {
+		org = "    organization: " + e2eDenoOrgID + "\n"
+	}
+	return fmt.Sprintf("  - name: %s\n    provider: %s\n%s%s", name, provider, secret, org)
 }
 
 // tokenEnvLine is a ${VAR} credential reference resolved from the process
