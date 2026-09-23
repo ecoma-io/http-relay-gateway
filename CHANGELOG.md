@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0](https://github.com/ecoma-io/http-relay-gateway/compare/v0.2.2...v0.3.0) (2026-09-23)
+
+
+### Features
+
+* **deploy:** keep long SSE streams alive with heartbeat comments ([#73](https://github.com/ecoma-io/http-relay-gateway/issues/73)) ([ec377cc](https://github.com/ecoma-io/http-relay-gateway/commit/ec377cc929f4a7430a6b7a8e13b07e2a08f1f623))
+* **deploy:** open an SSE response before the origin answers, past a bounded grace ([#74](https://github.com/ecoma-io/http-relay-gateway/issues/74)) ([4bf1084](https://github.com/ecoma-io/http-relay-gateway/commit/4bf1084c52dbfe88fd0cbe0d39d8ebf0c456faed))
+
+
+### Bug Fixes
+
+* **gateway:** bind each attempt to one serving generation and classify every outcome ([#59](https://github.com/ecoma-io/http-relay-gateway/issues/59)) ([#61](https://github.com/ecoma-io/http-relay-gateway/issues/61)) ([21381e4](https://github.com/ecoma-io/http-relay-gateway/commit/21381e458424cfe10c5712d9b8d7a01761ae9854))
+* **gateway:** classify an EOF-flush abort; pin the data-plane invariants under test ([#66](https://github.com/ecoma-io/http-relay-gateway/issues/66)) ([3d47028](https://github.com/ecoma-io/http-relay-gateway/commit/3d470289e38c9690f16507c3366036aecb4faaaf))
+* **gateway:** classify EOF flush aborts and pin data-plane invariants ([3d47028](https://github.com/ecoma-io/http-relay-gateway/commit/3d470289e38c9690f16507c3366036aecb4faaaf))
+* **pool:** runtime passive health survives serving generation rebuilds ([#15](https://github.com/ecoma-io/http-relay-gateway/issues/15)) ([#57](https://github.com/ecoma-io/http-relay-gateway/issues/57)) ([6f9d676](https://github.com/ecoma-io/http-relay-gateway/commit/6f9d676b9972d1162af1ce16b50d5b548cad5c0f))
+* **readiness:** adopt the first resolved scope as baseline and pin the lifecycle contracts ([#65](https://github.com/ecoma-io/http-relay-gateway/issues/65)) ([afc127a](https://github.com/ecoma-io/http-relay-gateway/commit/afc127acaa55ee328924bc1e0e27655a8b7a8f3f))
+* **readiness:** scope pins are part of the deployment incarnation ([#14](https://github.com/ecoma-io/http-relay-gateway/issues/14)) ([#56](https://github.com/ecoma-io/http-relay-gateway/issues/56)) ([0d06712](https://github.com/ecoma-io/http-relay-gateway/commit/0d06712fe6f91e47b6c712c76bdfa47211c3b862))
+
+
+### Documentation
+
+* **readiness:** state generations restart after a purge and recreate ([#70](https://github.com/ecoma-io/http-relay-gateway/issues/70)) ([5af8032](https://github.com/ecoma-io/http-relay-gateway/commit/5af8032d852c0c7a4f446d704fd40b1edf9e2eb0))
+
 ## [0.2.2](https://github.com/ecoma-io/http-relay-gateway/compare/v0.2.1...v0.2.2) (2026-09-22)
 
 
