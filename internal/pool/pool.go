@@ -87,6 +87,12 @@ type Relay struct {
 	URL      *url.URL
 	Token    string
 	MaxBody  int64
+	// Incarnation is the admission generation this relay was verified under
+	// (the registry's `generation` for the identity, rendered on /stats
+	// lifecycle rows). It labels the hot path's structured log lines so an
+	// operator can tie an attempt to the exact incarnation that served it.
+	// Like every field here it is identity, never a secret.
+	Incarnation uint64
 }
 
 // StatsRow is a point-in-time snapshot for /stats. It carries no URL and no
@@ -126,6 +132,10 @@ type RelayInput struct {
 	URL      *url.URL
 	Token    string
 	MaxBody  int64
+	// Incarnation is the admission generation the relay was verified under;
+	// it rides the hot path's log lines. Zero is legal (a standalone build
+	// has no admission to quote).
+	Incarnation uint64
 	// Runtime is the endpoint key a RuntimeState attaches this relay's
 	// shared health by — the caller computes it from the same identity,
 	// URL and token as the fields above. New ignores it (fresh state every
@@ -181,12 +191,13 @@ func newPool(in Input, rt *RuntimeState) (*Pool, error) {
 	for i := range in.Relays {
 		r := in.Relays[i]
 		relay := &Relay{
-			RelayState: &RelayState{},
-			Name:       r.Name,
-			Provider:   r.Provider,
-			URL:        r.URL,
-			Token:      r.Token,
-			MaxBody:    r.MaxBody,
+			RelayState:  &RelayState{},
+			Name:        r.Name,
+			Provider:    r.Provider,
+			URL:         r.URL,
+			Token:       r.Token,
+			MaxBody:     r.MaxBody,
+			Incarnation: r.Incarnation,
 		}
 		if rt != nil {
 			relay.RelayState = rt.Attach(r.Runtime)
