@@ -205,7 +205,17 @@ func run() error {
 		PauseRetry:  settings.ReviveScanInterval,
 	})
 
-	g := gateway.New(buildState(reg, settings, log), version, deploy.RelayVersion, log)
+	// Runtime health and the outbound clients are process-lifetime objects,
+	// not per-generation ones: every rebuild re-attaches the same endpoint
+	// state (counters, cooldown, failure streak, rotation position) and
+	// reuses the same cached client, so an unrelated relay's registry
+	// notification or an accepted reload resets none of it (issue #15). The
+	// applier goroutine below is the single writer of both — Prune and the
+	// attaches all happen inside buildState on that path.
+	rt := pool.NewRuntimeState()
+	cc := gateway.NewClientCache()
+
+	g := gateway.New(buildState(reg, settings, log, rt, cc), version, deploy.RelayVersion, log)
 
 	// The apply loop is the only writer of the serving generation: registry
 	// notification (admission changed) or desired-state reload (settings
@@ -244,7 +254,13 @@ func run() error {
 				DemoteAfter: s.VerifyDemoteAfter,
 			})
 		}
-		g.Swap(buildState(reg, s, log))
+		// Relay identities that left the desired configuration lose their
+		// runtime state before the rebuild attaches the survivors: pruning
+		// is the applier's job (the single writer), and the last-known-good
+		// configuration — not the registry's view — is what defines "still
+		// desired".
+		rt.Prune(desiredIdentities(cfg))
+		g.Swap(buildState(reg, s, log, rt, cc))
 		zerolog.SetGlobalLevel(parseZerologLevel(s.LogLevel))
 		applyMu.Lock()
 		if seq > applied {
@@ -337,6 +353,10 @@ func run() error {
 		defer cancel()
 		rec.Stop(ctx)
 		_ = srv.Shutdown(ctx)
+		// The drain is over: close whatever keep-alive sockets the shared
+		// outbound clients still hold instead of leaving them to process
+		// exit. The cache stays usable, so a late apply cannot panic.
+		cc.CloseAll()
 	}
 
 	for {
@@ -361,7 +381,14 @@ func run() error {
 // here means verified for the current incarnation, and the URL+key pair is
 // the exact one that passed verification. Everything the hot path would
 // otherwise re-derive is resolved here: body limits, transport timeouts.
-func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.Logger) *gateway.State {
+//
+// rt and cc are the process-lifetime runtime state and client cache: the
+// relays attach their endpoint state (counters, cooldown, failure streak,
+// rotation position) and share their client, so an unrelated rebuild — a
+// sibling's notification, an accepted reload — resets none of it (issue
+// #15). Only an endpoint change (scope pin, URL, relay key) or a Prune for
+// an identity that left the desired configuration starts one clean.
+func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.Logger, rt *pool.RuntimeState, cc *gateway.ClientCache) *gateway.State {
 	serving := reg.Serving()
 	in := pool.Input{
 		FailureThreshold: settings.FailureThreshold,
@@ -388,16 +415,28 @@ func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.L
 			URL:      u,
 			Token:    s.Token,
 			MaxBody:  maxBody,
+			// The endpoint identity runtime health keys by: the serving
+			// relay's recorded scope fingerprint plus the exact URL and
+			// relay key that passed verification. The readiness generation
+			// is deliberately absent — a rebuild is not an endpoint change.
+			Runtime: pool.RuntimeKey{
+				Provider: s.Key.Provider,
+				Name:     s.Key.Name,
+				ScopeFP:  s.ScopeFP,
+				URL:      u.String(),
+				TokenFP:  pool.TokenFingerprint(s.Token),
+			},
 		})
 		if maxBody > maxBuffer {
 			maxBuffer = maxBody
 		}
 	}
-	p, err := pool.New(in)
+	p, err := pool.NewAttached(in, rt)
 	if err != nil {
-		// pool.New is infallible today; an empty pool keeps the process
-		// alive (zero-ready answers 503) instead of panicking the data plane.
-		p, _ = pool.New(pool.Input{})
+		// pool.NewAttached is infallible today; an empty pool keeps the
+		// process alive (zero-ready answers 503) instead of panicking the
+		// data plane.
+		p, _ = pool.NewAttached(pool.Input{}, rt)
 	}
 	snapshot := reg.Snapshot()
 	lifecycle := make([]gateway.LifecycleRow, 0, len(snapshot))
@@ -411,14 +450,30 @@ func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.L
 		})
 	}
 	return &gateway.State{
-		Pool: p,
-		Client: gateway.NewClient(gateway.NewTransport(
-			settings.DialTimeout, settings.ResponseHeaderTimeout)),
+		Pool:                 p,
+		Client:               cc.Client(settings.DialTimeout, settings.ResponseHeaderTimeout),
 		MaxRetries:           settings.MaxRetries,
 		MaxBufferBytes:       maxBuffer,
 		StreamThresholdBytes: settings.StreamThresholdBytes,
 		Lifecycle:            lifecycle,
 	}
+}
+
+// desiredIdentities extracts the "provider/name" set of the last-known-good
+// desired state — the identities runtime health may still carry state for.
+// Prune filters by this, so a relay that left the configuration loses its
+// counters and cooldown while everything still configured keeps them. A nil
+// configuration (the legal empty-fleet boot) desires nothing.
+func desiredIdentities(cfg *config.Config) map[string]struct{} {
+	var relays []config.Relay
+	if cfg != nil {
+		relays = cfg.Relays
+	}
+	out := make(map[string]struct{}, len(relays))
+	for _, r := range relays {
+		out[r.Provider+"/"+r.Name] = struct{}{}
+	}
+	return out
 }
 
 // desiredStore holds the last successfully loaded configuration behind an

@@ -109,6 +109,16 @@ type Serving struct {
 	URL     string
 	Token   string
 	Version uint64
+	// ScopeFP is the non-reversible fingerprint of the provider scope this
+	// admission was verified under — the resolved credential pins, recorded
+	// with the entry alongside the serving snapshot. It is empty until the
+	// registry has recorded a scope (the scope-incarnation change wires the
+	// recording), and empty must publish as empty: "scope unknown" attaches
+	// in the pool's runtime keying, it must not read as a scope change that
+	// resets a relay's passive health on every rebuild. The pool builder
+	// folds the fingerprint into the relay's runtime key so passive health
+	// never crosses a scope move under an unchanged relay name.
+	ScopeFP string
 }
 
 // Settings are the live-updatable retry and readiness thresholds. Every
@@ -152,6 +162,10 @@ type entry struct {
 	serving bool
 	url     string // the verified serving snapshot, published with admission
 	token   string
+	// scopeFP is the fingerprint of the credential scope the entry's
+	// serving snapshot was verified under, recorded with admission. Empty
+	// until a scope has been recorded for this incarnation.
+	scopeFP string
 	busy    bool      // single-flight: a verifier/deployer/deleter holds this relay
 	nextTry time.Time // backoff gate for the next attempt
 }
@@ -321,7 +335,10 @@ func (r *Registry) Serving() []Serving {
 	out := make([]Serving, 0, r.readyCount)
 	for _, e := range r.entries {
 		if e.serving {
-			out = append(out, Serving{Key: e.record.Key, URL: e.url, Token: e.token, Version: e.record.Generation})
+			out = append(out, Serving{
+				Key: e.record.Key, URL: e.url, Token: e.token,
+				Version: e.record.Generation, ScopeFP: e.scopeFP,
+			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

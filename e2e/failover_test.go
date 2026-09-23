@@ -519,3 +519,123 @@ func TestE2E_AbruptRelayCloseIsSanitizedOnEverySurface(t *testing.T) {
 		t.Fatal("gateway log never records the sanitized transport-error shape for the reset")
 	}
 }
+
+// TestE2E_PassiveHealthSurvivesAnUnrelatedReload is the issue #15 black-box
+// pin: serving generations rebuild constantly (every registry notification,
+// every accepted reload), and the rebuild used to construct brand-new
+// per-relay state — counters zeroed, an active cooldown wiped, the
+// round-robin rotation restarted at the first relay. Here c-rel goes on
+// cooldown through real transport failures, an unrelated third relay then
+// joins the desired state, and the rebuild must carry c-rel's cooldown and
+// failures through it, keep the rotation where it was, and still bring the
+// new relay into rotation.
+func TestE2E_PassiveHealthSurvivesAnUnrelatedReload(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, vt := freshIdentity("rh-v")
+	ct := "cf-tok-" + randSuffix(12)
+	dt := "deno-tok-" + randSuffix(12)
+	fake.setToken("vercel", vt)
+	fake.setToken("cloudflare", ct)
+	fake.setToken("deno", dt)
+	overrides := map[string]string{
+		// One transport failure is a cooldown, and the cooldown outlives the
+		// reload window; the verified layer stays out of the way — the
+		// subject is the passive one. max_retries 0 keeps the counters
+		// one-per-request: each pinned request is exactly one attempt.
+		"failure_threshold":       "1",
+		"cooldown":                "30s",
+		"max_retries":             "0",
+		"response_header_timeout": "300ms",
+		"verify_interval":         "1h",
+	}
+	// The deno credential rides from boot (unused until the reload), so the
+	// reload below is a pure config change — no env race to stage.
+	g := startGateway(t, fake, gwOptions{
+		key: key,
+		config: configYAMLOverrides(t, overrides,
+			relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT")),
+			relayBlock("c-rel", "cloudflare", tokenEnvLine("E2E_CT")),
+		),
+		extraEnv: map[string]string{"E2E_VT": vt, "E2E_CT": ct, "E2E_DT": dt},
+	})
+	g.waitForStats(t, 20*time.Second, "both relays to admit", func(d *statsDoc) bool {
+		return d.Readiness.ReadyRelays == 2
+	})
+
+	// Two unpinned successes pin the served order — c-rel, then v-rel — and
+	// leave the all-providers cursor past both.
+	for _, marker := range []string{"w1", "w2"} {
+		relayTo(t, g, echo, "/", marker, []byte("warm"), http.StatusOK)
+	}
+
+	// c-rel goes silent and is driven onto cooldown with real transport
+	// failures: each pinned attempt times out before a response byte.
+	fake.project("c-rel").sim.setMode(simHang)
+	relayTo(t, g, echo, "/cloudflare", "k1", nil, http.StatusBadGateway)
+	relayTo(t, g, echo, "/cloudflare", "k2", nil, http.StatusBadGateway)
+	g.waitForStats(t, 10*time.Second, "c-rel to go on cooldown", func(d *statsDoc) bool {
+		row, ok := relayRow(d, "cloudflare", "c-rel")
+		return ok && !row.Healthy && row.Failures == 2
+	})
+
+	// One unpinned request: the cooled c-rel is skipped and v-rel serves,
+	// leaving the all-cursor mid-rotation (the value the rebuild must
+	// carry).
+	relayTo(t, g, echo, "/", "u1", []byte("skip"), http.StatusOK)
+	if got := fake.project("v-rel").sim.markers(); !equalStrings(got, []string{"w2", "u1"}) {
+		t.Fatalf("v-rel served %v, want [w2 u1]", got)
+	}
+
+	// The unrelated reload: a third relay joins the desired state. Nothing
+	// about c-rel or v-rel changed — least of all their runtime health.
+	g.writeConfig(configYAMLOverrides(t, overrides,
+		relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT")),
+		relayBlock("c-rel", "cloudflare", tokenEnvLine("E2E_CT")),
+		relayBlock("d-rel", "deno", tokenEnvLine("E2E_DT")),
+	))
+	doc := g.waitForStats(t, 30*time.Second, "d-rel to admit into the serving pool", func(d *statsDoc) bool {
+		_, ok := relayRow(d, "deno", "d-rel")
+		return d.Readiness.ReadyRelays == 3 && ok
+	})
+
+	// c-rel's passive state survived the rebuild: still cooled, both
+	// failures still counted, same relay identity in the pool.
+	row, ok := relayRow(doc, "cloudflare", "c-rel")
+	if !ok || row.Healthy || row.Failures != 2 || row.LastError == "" {
+		t.Fatalf("c-rel after the rebuild = %+v (ok=%v), want the cooldown and failures carried through", row, ok)
+	}
+	if row, ok := relayRow(doc, "deno", "d-rel"); !ok || !row.Healthy || row.Requests != 0 || row.Failures != 0 {
+		t.Fatalf("d-rel after admission = %+v (ok=%v), want a clean, healthy new member", row, ok)
+	}
+	// The rebuild was a rebuild — not a redeploy of the existing fleet.
+	if n := fake.deployCount("c-rel"); n != 1 {
+		t.Fatalf("c-rel deploys = %d, want 1 (admission only)", n)
+	}
+	if n := fake.deployCount("v-rel"); n != 1 {
+		t.Fatalf("v-rel deploys = %d, want 1 (admission only)", n)
+	}
+
+	// Rotation does not restart at the first relay after the rebuild: the
+	// carried cursor over the healthy pair [d-rel, v-rel] lands on v-rel,
+	// where a restarted rotation would have served d-rel first.
+	relayTo(t, g, echo, "/", "u2", []byte("carried"), http.StatusOK)
+	if fake.project("d-rel").sim.markerSeen("u2") {
+		t.Fatal("the rebuilt pool restarted its rotation at the first relay")
+	}
+	if !fake.project("v-rel").sim.markerSeen("u2") {
+		t.Fatal("v-rel must serve the request the carried rotation points at")
+	}
+
+	// And the new relay is serving: the next rotation step reaches d-rel.
+	relayTo(t, g, echo, "/", "u3", []byte("new-relay"), http.StatusOK)
+	if !fake.project("d-rel").sim.markerSeen("u3") {
+		t.Fatalf("d-rel served %v, want u3 — the new relay must be in rotation", fake.project("d-rel").sim.markers())
+	}
+
+	// The carried cooldown still holds after all of it: c-rel was never
+	// picked and never recovered by the churn.
+	if row, _ := relayRow(g.stats(t), "cloudflare", "c-rel"); row.Healthy || row.Failures != 2 {
+		t.Fatalf("c-rel after the rotation = %+v, want the cooldown untouched", row)
+	}
+}

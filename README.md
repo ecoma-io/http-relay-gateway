@@ -222,6 +222,19 @@ relay — they never change membership; the verified layer owns that. When
 every candidate is down, the pool still returns one (best effort beats a
 `503` when the whole fleet is having a bad minute).
 
+Passive health belongs to the **endpoint**, not to the serving generation.
+The counters, the failure streak, the cooldown and the per-selector
+round-robin position are keyed by relay identity (provider, name) plus the
+exact endpoint they were earned against (scope pin fingerprint, URL,
+relay-key fingerprint), so a rebuild — a registry notification for an
+unrelated relay, an accepted reload, a replacement rollout — carries them
+instead of resetting them, and rotation continues where it stopped rather
+than restarting at the first relay. Runtime state resets only when the
+identity leaves the desired configuration (see [Removal](#removal)), when
+the endpoint itself changes (a moved scope pin, a different URL, a rotated
+relay key — a different worker behind the same name), or when the process
+restarts: nothing is persisted.
+
 ### Replacements (Strategy A)
 
 When a serving relay must be redeployed — version drift, key rotation, a
@@ -369,13 +382,24 @@ until a valid file returns. Removal happens by deleting a relay entry from
 a valid file (see [Removal](#removal)) — back the file up; it plus the
 referenced environment is the whole system.
 
+A rebuild is a membership event, not a health event: the relays a reload
+keeps take their passive health, counters and rotation position with them
+(see [Two layers of health](#two-layers-of-health)) — adding an unrelated
+relay, or a replacement rollout on one member, never resets the others. A
+removed relay's runtime state is dropped, so re-adding its name starts
+clean.
+
 ### Settings
 
 Every key is optional; absent keys take the default. Malformed values are
 load errors, never silent defaults. Every key applies on the next accepted
 reload — no restart: the verification knobs reach the registry at once
 (already-armed retry gates are recomputed from the failed attempt), the
-rest land with the serving-generation rebuild.
+rest land with the serving-generation rebuild. The timeout pair
+`dial_timeout` / `response_header_timeout` is the one change that moves
+the data plane onto a different outbound client (and retires the old one's
+pooled connections); every other rebuild reuses the shared client, so its
+keep-alive connections survive.
 
 | Key                       | Default | Meaning                                                          |
 | ------------------------- | ------- | ---------------------------------------------------------------- |
