@@ -880,3 +880,27 @@ func TestDrainPendingMarkerSurvivesChurnAndClearsAtTheBarrier(t *testing.T) {
 		t.Fatalf("generation = %d, want %d (removal + re-add)", rec.Generation, gen+2)
 	}
 }
+
+// TestServingCarriesTheRecordedScopeFingerprint: the serving snapshot is
+// what the pool builder keys a relay's runtime health by, so it must carry
+// the scope fingerprint recorded with the entry. Until a scope is recorded
+// (the reconciler records it with admission, in the scope-incarnation
+// change) the field publishes empty — and empty must stay empty, not read
+// as a scope change that would reset passive health on every rebuild.
+func TestServingCarriesTheRecordedScopeFingerprint(t *testing.T) {
+	r := New(Config{})
+	keyA := Key{Provider: "vercel", Name: "alpha"}
+	r.Sync([]Key{keyA})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+
+	if got := r.Serving()[0].ScopeFP; got != "" {
+		t.Fatalf("ScopeFP with nothing recorded = %q, want empty", got)
+	}
+
+	r.mu.Lock()
+	r.entries[keyA].scopeFP = "scope-fp-1"
+	r.mu.Unlock()
+	if got := r.Serving()[0].ScopeFP; got != "scope-fp-1" {
+		t.Fatalf("Serving ScopeFP = %q, want the recorded fingerprint", got)
+	}
+}
