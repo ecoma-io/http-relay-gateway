@@ -99,6 +99,14 @@ type Gateway struct {
 	// rollout: a relay being replaced must not receive new traffic while
 	// its old incarnation still carries requests.
 	inflight inflight
+	// draining flips when shutdown begins (BeginDrain). It is deliberately
+	// nothing but operator context on log lines: shutdown drains in-flight
+	// requests — streaming included — under their normal classification,
+	// because http.Server.Shutdown does not cancel request contexts, so a
+	// failure during the drain means exactly what it means mid-flight. A
+	// special shutdown classification would invent evidence that does not
+	// exist (and punish relays for a process that is merely exiting).
+	draining atomic.Bool
 
 	version string
 	// relayVersion is the worker generation this binary deploys; /stats
@@ -166,6 +174,11 @@ func (g *Gateway) Swap(st *State) {
 		old.Client.CloseIdleConnections()
 	}
 }
+
+// BeginDrain marks the process as draining. Idempotent, and deliberately
+// only a log-line label — see the draining field above for why shutdown
+// never special-cases classification or health.
+func (g *Gateway) BeginDrain() { g.draining.Store(true) }
 
 // AwaitIdle blocks until the relay identity (provider, name) carries no
 // in-flight request, the timeout expires, or ctx ends — whichever comes
@@ -302,11 +315,21 @@ func (g *Gateway) handleRelay(w http.ResponseWriter, r *http.Request, log zerolo
 // acquisition with failover replay, provider size skips, streaming
 // pass-through.
 func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logger, provider string) {
+	// Shutdown context only: BeginDrain is a label, never a decision. The
+	// attempts below classify exactly as they would mid-flight (see the
+	// draining field above); the flag just marks the lines that ran inside
+	// the drain so an operator reading the log can tell them apart.
+	if g.draining.Load() {
+		log = log.With().Bool("draining", true).Logger()
+	}
 	st := g.st.Load()
 
-	// Zero-ready short-circuit before body acquisition: with no verified
-	// relay the buffer cap is 0, so any body would 413 on the cap check —
-	// the honest answer is retryable 503, never 413.
+	// Zero-ready short-circuit before body acquisition, on the ENTRY
+	// snapshot: with no verified relay the buffer cap is 0, so any body
+	// would 413 on the cap check — the honest answer is the retryable 503,
+	// before spending the memory. It deliberately does not re-check per
+	// attempt: a pool that empties after a Swap surfaces below as a nil
+	// pick, which answers the same 503.
 	key := provider
 	if key == "" {
 		key = pool.KeyAll
@@ -315,11 +338,14 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		jsonError(w, http.StatusServiceUnavailable, "no relay configured for "+key)
 		return
 	}
-	// Body acquisition. Below StreamThresholdBytes (or with streaming off,
-	// the default) the body is buffered so failover can replay it; at or
-	// above the threshold it streams through untouched — a single attempt,
-	// no failover (the body is consumed), and the gateway never invents a
-	// 413 for it.
+	// Body acquisition — the one decision that legitimately freezes at
+	// entry, because the bytes read here cannot be re-read: a later Swap may
+	// change which generation serves the request, never whether it is
+	// replayable. Below StreamThresholdBytes (or with streaming off, the
+	// default) the body is buffered so failover can replay it; at or above
+	// the threshold it streams through untouched — a single attempt, no
+	// failover (the body is consumed), and the gateway never invents a 413
+	// for it.
 	var body []byte
 	var liveBody io.ReadCloser
 	streaming := false
@@ -351,14 +377,10 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		}
 	}
 
-	attempts := st.MaxRetries + 1
-
-	if streaming {
-		attempts = 1
-	}
-	var lastErr error
+	attemptsMade := 0
 	skippedBySize := 0
-	for attempt := range attempts {
+	var lastErr error
+	for {
 		// Pick and register in flight under one lock, from the CURRENT
 		// generation — not the snapshot taken at entry: a request that
 		// arrived before a Swap but picks after it (body buffering can hold
@@ -368,8 +390,27 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		// Serializing the load with Swap inside the same mutex that guards
 		// inflight keeps that window closed: every post-Swap pick is visible
 		// to AwaitIdle before the Swap returns.
+		//
+		// Each attempt binds to exactly one State: pool, client, retry
+		// budget, limits and passive-health recording all come from this
+		// single load; Swap serializes with it, so AwaitIdle stays exact.
 		g.mu.Lock()
-		relay := g.st.Load().Pool.Pick(key)
+		cur := g.st.Load()
+		// The budget is the bound generation's, and it is what terminates
+		// the loop: settings churn mid-request may reshape the tail, but
+		// every pass below costs one counted attempt, so the loop always
+		// ends. Streaming bodies keep exactly one attempt — the entry
+		// decision above already consumed the body, and it cannot be
+		// replayed on a second relay.
+		budget := cur.MaxRetries + 1
+		if streaming {
+			budget = 1
+		}
+		if attemptsMade >= budget {
+			g.mu.Unlock()
+			break
+		}
+		relay := cur.Pool.Pick(key)
 		if relay != nil {
 			g.inflight.begin(relay.Provider, relay.Name)
 		}
@@ -378,28 +419,53 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 			jsonError(w, http.StatusServiceUnavailable, "no relay configured for "+key)
 			return
 		}
+		attemptsMade++
 		// Provider body limits are only enforceable on a buffered body; a
 		// streaming body goes to the picked relay as-is by design.
 		if !streaming && int64(len(body)) > relay.MaxBody {
 			g.inflight.end(relay.Provider, relay.Name)
 			skippedBySize++
 			log.Debug().Str("relay", relay.Name).Str("provider", relay.Provider).
+				Uint64("incarnation", relay.Incarnation).
 				Int64("body", int64(len(body))).Int64("maxBody", relay.MaxBody).
 				Msg("body exceeds provider limit; skipping relay")
 			continue
 		}
 		start := time.Now()
-		resp, err := g.roundTrip(st.Client, r, relay, body, liveBody)
+		resp, err := g.roundTrip(cur.Client, r, relay, body, liveBody)
 		if err != nil {
 			g.inflight.end(relay.Provider, relay.Name)
-			// The request never produced a response — health-recorded
-			// everywhere; replayed on the next relay only while the body was
-			// buffered. Once response bytes have reached the client, or the
-			// body is streaming, never retry.
-			st.Pool.RecordFailure(relay, err)
+			// Classify before recording anything. r.Context().Err() != nil is
+			// the evidence that the CLIENT is gone — http.Server.Shutdown
+			// never cancels request contexts, so a dead context during the
+			// shutdown drain means the caller went away, never that the
+			// process is stopping. A dead client has also torn down the
+			// upstream leg, so the error is the client's, not evidence
+			// against the relay: no passive failure, and no retry — every
+			// further attempt would fail the same way. Nobody is left to
+			// read a response, so none is written.
+			if r.Context().Err() != nil {
+				log.Info().Str("relay", relay.Name).Str("provider", relay.Provider).
+					Str("outcome", "client_aborted").
+					Uint64("incarnation", relay.Incarnation).
+					Int("attempt", attemptsMade).
+					Str("err", sanitize.ErrorString(err)).
+					Str("duration", time.Since(start).Round(time.Millisecond).String()).
+					Msg("relay attempt abandoned by the client")
+				return
+			}
+			// The request never produced a response — a transport failure of
+			// the relay leg, recorded everywhere; replayed on the next relay
+			// only while the body was buffered. Once response bytes have
+			// reached the client, or the body is streaming, never retry.
+			cur.Pool.RecordFailure(relay, err)
 			lastErr = err
 			log.Warn().Str("relay", relay.Name).Str("provider", relay.Provider).
-				Int("attempt", attempt+1).Str("err", sanitize.ErrorString(err)).
+				Str("outcome", "upstream_pre_response").
+				Uint64("incarnation", relay.Incarnation).
+				Int("attempt", attemptsMade).
+				Str("err", sanitize.ErrorString(err)).
+				Str("duration", time.Since(start).Round(time.Millisecond).String()).
 				Msg("relay attempt failed")
 			if streaming {
 				jsonError(w, http.StatusBadGateway, "streaming request failed: "+sanitize.ErrorString(lastErr))
@@ -407,20 +473,57 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 			}
 			continue
 		}
+		// An HTTP answer is transport-level success at header time — the
+		// counters book it here whatever the body does next. The never-retry
+		// rule from here on is structural, not a health verdict: the loop
+		// only ever continues on a client.Do error.
 		relay.Requests.Add(1)
 		// A success clears the failure streak: a flaky relay must not slide
 		// into cooldown across interleaved successes.
-		st.Pool.RecordSuccess(relay)
+		cur.Pool.RecordSuccess(relay)
 		log.Info().Str("method", r.Method).Str("provider", providerLabel(provider)).
-			Str("relay", relay.Name).Int("status", resp.StatusCode).
+			Str("relay", relay.Name).Str("outcome", "relayed").
+			Uint64("incarnation", relay.Incarnation).
+			Int("status", resp.StatusCode).
 			Int64("body", int64(len(body))).
 			Str("duration", time.Since(start).Round(time.Millisecond).String()).
 			Msg("relayed")
-		g.copyResponse(w, resp)
+		copyErr := g.copyResponse(w, resp)
 		g.inflight.end(relay.Provider, relay.Name)
+		if copyErr != nil {
+			// The relay answered, but the body did not survive the copy.
+			// Same evidence rule as above: a dead request context means the
+			// client left, which also tears down the upstream leg — that is
+			// not evidence against the relay, and the response simply ends.
+			if r.Context().Err() != nil {
+				log.Info().Str("relay", relay.Name).Str("provider", relay.Provider).
+					Str("outcome", "client_aborted").
+					Uint64("incarnation", relay.Incarnation).
+					Int("status", resp.StatusCode).
+					Str("err", sanitize.ErrorString(copyErr)).
+					Str("duration", time.Since(start).Round(time.Millisecond).String()).
+					Msg("response aborted by the client")
+				return
+			}
+			// A live context with a broken body is the relay's failure after
+			// it had already answered: counted (above), recorded as a
+			// passive failure plus the mid-stream signal, and never retried
+			// — the client already holds part of the body, so the honest
+			// ending is the truncated response, not an invented status that
+			// cannot replace the headers already sent.
+			cur.Pool.RecordFailure(relay, copyErr)
+			relay.MidstreamFailures.Add(1)
+			log.Warn().Str("relay", relay.Name).Str("provider", relay.Provider).
+				Str("outcome", "upstream_midstream").
+				Uint64("incarnation", relay.Incarnation).
+				Int("status", resp.StatusCode).
+				Str("err", sanitize.ErrorString(copyErr)).
+				Str("duration", time.Since(start).Round(time.Millisecond).String()).
+				Msg("response body failed mid-stream")
+		}
 		return
 	}
-	if skippedBySize == attempts && skippedBySize > 0 {
+	if skippedBySize == attemptsMade && skippedBySize > 0 {
 		jsonError(w, http.StatusRequestEntityTooLarge,
 			fmt.Sprintf("body of %d bytes exceeds the %s provider limit", len(body), key))
 		return
@@ -458,8 +561,11 @@ func (g *Gateway) roundTrip(client *http.Client, r *http.Request, relay *pool.Re
 }
 
 // copyResponse streams the relay response straight through, flushing after
-// every write — SSE chunks must reach the client immediately.
-func (g *Gateway) copyResponse(w http.ResponseWriter, resp *http.Response) {
+// every write — SSE chunks must reach the client immediately. The copy's
+// error is the caller's outcome signal: a relay leg that breaks mid-body (or
+// a client that stops reading) is exactly the event relay() classifies, so
+// the copy reports it instead of swallowing it.
+func (g *Gateway) copyResponse(w http.ResponseWriter, resp *http.Response) error {
 	// The Close error is discarded explicitly (errcheck): by the time this
 	// defer runs the body has been streamed or abandoned, and a Close error
 	// on a read-only response body carries no recovery the caller could
@@ -476,7 +582,8 @@ func (g *Gateway) copyResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(flushWriter{w}, resp.Body)
+	_, err := io.Copy(flushWriter{w}, resp.Body)
+	return err
 }
 
 type flushWriter struct{ w http.ResponseWriter }

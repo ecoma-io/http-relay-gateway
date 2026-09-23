@@ -138,6 +138,46 @@ func TestBuildStateServesOnlyVerified(t *testing.T) {
 	}
 }
 
+// TestBuildStateCarriesTheAdmissionIncarnation: the serving relay quotes the
+// admission generation it was verified under — the same number the lifecycle
+// row renders — so a hot-path log line can name the exact incarnation that
+// served an attempt. A re-added identity is a new incarnation, and the
+// rebuilt pool must quote the new one, never the old.
+func TestBuildStateCarriesTheAdmissionIncarnation(t *testing.T) {
+	reg := readiness.New(readiness.Config{})
+	k := readiness.Key{Provider: deploy.PlatformVercel, Name: "inc"}
+	reg.Sync([]readiness.Key{k})
+	admit(t, reg, k)
+
+	first := freshState(reg, config.DefaultSettings(), zerolog.Nop()).Pool.Pick(pool.KeyAll)
+	if first == nil || first.Incarnation != 1 {
+		t.Fatalf("first admission incarnation = %+v, want 1", first)
+	}
+
+	// Remove and re-add the identity: the registry bumps the incarnation,
+	// a fresh admission verifies it, and the rebuilt pool quotes it.
+	reg.Sync(nil)
+	reg.Sync([]readiness.Key{k})
+	admit(t, reg, k)
+
+	serving := reg.Serving()
+	if len(serving) != 1 {
+		t.Fatalf("serving entries = %d, want 1", len(serving))
+	}
+	rebuilt := freshState(reg, config.DefaultSettings(), zerolog.Nop()).Pool.Pick(pool.KeyAll)
+	if rebuilt == nil {
+		t.Fatal("rebuilt pool must serve the re-added relay")
+	}
+	if rebuilt.Incarnation != serving[0].Version {
+		t.Fatalf("rebuilt relay incarnation = %d, want the admission's %d",
+			rebuilt.Incarnation, serving[0].Version)
+	}
+	if rebuilt.Incarnation <= first.Incarnation {
+		t.Fatalf("re-added incarnation = %d, want a new one (was %d)",
+			rebuilt.Incarnation, first.Incarnation)
+	}
+}
+
 func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	v := readiness.Key{Provider: deploy.PlatformVercel, Name: "v"}
