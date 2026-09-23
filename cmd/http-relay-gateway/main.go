@@ -352,6 +352,11 @@ func run() error {
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrap.ShutdownGrace)
 		defer cancel()
 		rec.Stop(ctx)
+		// Operator context only: the drain below classifies every in-flight
+		// attempt exactly as it would mid-flight — http.Server.Shutdown does
+		// not cancel request contexts — and BeginDrain exists to mark the
+		// log lines, never to change a classification or a health decision.
+		g.BeginDrain()
 		_ = srv.Shutdown(ctx)
 		// The drain is over: close whatever keep-alive sockets the shared
 		// outbound clients still hold instead of leaving them to process
@@ -415,6 +420,12 @@ func buildState(reg *readiness.Registry, settings config.Settings, log zerolog.L
 			URL:      u,
 			Token:    s.Token,
 			MaxBody:  maxBody,
+			// The admission incarnation: the same generation the lifecycle
+			// row renders, so a log line can name the exact incarnation that
+			// served the attempt. Deliberately absent from the runtime key
+			// below — runtime health follows the endpoint, not control-plane
+			// churn.
+			Incarnation: s.Version,
 			// The endpoint identity runtime health keys by: the serving
 			// relay's recorded scope fingerprint plus the exact URL and
 			// relay key that passed verification. The readiness generation

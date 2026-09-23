@@ -3,6 +3,7 @@ package e2e
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -580,5 +581,143 @@ func TestE2E_SuspensionPausesAndRevives(t *testing.T) {
 	}, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("relay after revival = %d (%s)", resp.StatusCode, body)
+	}
+}
+
+// midstreamRow is one relay's /stats row decoded with the mid-stream
+// counter. The shared harness row predates the counter and stays shared
+// with the other in-flight PR, so this file decodes the field locally
+// instead of widening the shared type.
+type midstreamRow struct {
+	Name              string `json:"name"`
+	Requests          int64  `json:"requests"`
+	Failures          int64  `json:"failures"`
+	MidstreamFailures int64  `json:"midstreamFailures"`
+	Healthy           bool   `json:"healthy"`
+}
+
+func midstreamRowOf(t *testing.T, g *gatewayProc, name string) (midstreamRow, bool) {
+	t.Helper()
+	_, raw := g.do(t, http.MethodGet, "/stats", nil, nil)
+	var doc struct {
+		Relays []midstreamRow `json:"relays"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("/stats: decode %s: %v", raw, err)
+	}
+	for _, row := range doc.Relays {
+		if row.Name == name {
+			return row, true
+		}
+	}
+	return midstreamRow{}, false
+}
+
+// TestE2E_MidstreamFailureCountsOnceAndNeverRetries: a relay leg that dies
+// after the response headers have gone through is one counted attempt and
+// one passive failure whose streak accumulates toward the cooldown threshold
+// (no completed response intervenes to reset it) — never a replay (the
+// client already holds part of the body), and the truncated 200 simply ends
+// on the client instead of turning into an error status.
+func TestE2E_MidstreamFailureCountsOnceAndNeverRetries(t *testing.T) {
+	fake := newFakeEdge(t)
+	key, vt := freshIdentity("midcut")
+	fake.setToken("vercel", vt)
+	trickle := newTrickle(t, 150*time.Millisecond)
+
+	g := startGateway(t, fake, gwOptions{
+		config: configYAMLOverrides(t, map[string]string{
+			// The severed leg is a data-plane event and must stay one: a live
+			// verify tick would probe the dead origin, demote the relay and
+			// pull its row off /stats before the counters below are read.
+			"verify_interval": "1h",
+		}, relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
+	})
+	g.waitForReady(t, 20*time.Second)
+	sim := fake.project("v-rel").sim
+
+	req, err := http.NewRequest(http.MethodGet, g.base+"/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Relay-Target", trickle.base)
+	req.Header.Set("X-Relay-Path", "/stream")
+	req.Header.Set("X-Marker", "mid1")
+	resp, err := relayClient.Do(req)
+	if err != nil {
+		t.Fatalf("streaming request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("streaming request = %d, want 200", resp.StatusCode)
+	}
+
+	lines := make(chan string, 16)
+	readErr := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(resp.Body)
+		for {
+			line, rerr := br.ReadString('\n')
+			if rerr != nil {
+				readErr <- rerr
+				return
+			}
+			lines <- line
+		}
+	}()
+
+	// The response is live: the relay leg carried the request and the first
+	// chunk reached the client through it.
+	waitFor(t, 10*time.Second, "the relay leg to admit the request", func() bool {
+		return sim.markerSeen("mid1")
+	})
+	select {
+	case line := <-lines:
+		if line != "chunk-0\n" {
+			t.Fatalf("first chunk = %q, want chunk-0", line)
+		}
+	case rerr := <-readErr:
+		t.Fatalf("stream ended before the leg was severed: %v", rerr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no chunk reached the client within 10s")
+	}
+
+	// Sever the gateway↔relay leg mid-body. The worker sim re-frames an
+	// upstream that stops early as a complete chunked response, so the
+	// transport event the outcome classification owns has to happen on this
+	// leg itself: closing the fake origin force-closes the in-flight relay
+	// connection — the headers are long gone, the body is not.
+	fake.Close()
+
+	// Once the relay answered, the response streams through untouched and
+	// never turns into an error status: the truncated body just ends.
+	rest, rerr := io.ReadAll(resp.Body)
+	if rerr != nil {
+		t.Fatalf("truncated body did not end cleanly: %v (read %q)", rerr, rest)
+	}
+
+	// Never retried: the request reached the relay exactly once.
+	waitFor(t, 10*time.Second, "the sim's ingress to settle at one request", func() bool {
+		return len(sim.markers()) == 1
+	})
+	if got := sim.markers(); !equalStrings(got, []string{"mid1"}) {
+		t.Fatalf("relay served %v, want exactly [mid1] — a started response is never retried", got)
+	}
+
+	// The accounting: one counted attempt, one passive failure, the
+	// mid-stream counter up once — and the relay stays healthy, because the
+	// failure streak ACCUMULATES across completed-response-free attempts and
+	// a single one sits below the harness threshold of 2 (two in a row would
+	// trip the cooldown; nothing resets it in between, since no response
+	// completed).
+	waitFor(t, 10*time.Second, "/stats to count the mid-stream failure", func() bool {
+		row, ok := midstreamRowOf(t, g, "v-rel")
+		return ok && row.Requests == 1 && row.Failures == 1 && row.MidstreamFailures == 1
+	})
+	row, ok := midstreamRowOf(t, g, "v-rel")
+	if !ok || !row.Healthy {
+		t.Fatalf("v-rel stats row = %+v (ok=%v), want healthy after a single mid-stream failure", row, ok)
 	}
 }

@@ -294,6 +294,34 @@ func TestStatsRowsCarryNoSecrets(t *testing.T) {
 	}
 }
 
+// TestRelaysCarryTheirIncarnation pins the admission incarnation's ride
+// from RelayInput onto the serving relay: the hot path quotes it on every
+// attempt log line, so a build that dropped the field would silently
+// de-label them all.
+func TestRelaysCarryTheirIncarnation(t *testing.T) {
+	alpha := relayInput(t, "alpha", "vercel")
+	alpha.Incarnation = 7
+	in := Input{
+		FailureThreshold: 3,
+		Cooldown:         time.Second,
+		Relays:           []RelayInput{alpha},
+	}
+	if r := mustPool(t, in).Pick(KeyAll); r == nil || r.Incarnation != 7 {
+		t.Fatalf("standalone relay incarnation = %+v, want 7", r)
+	}
+
+	// The attached form is the one serving generations build with: same
+	// field, verbatim from the caller's admission snapshot.
+	in.Relays[0].Runtime = RuntimeKey{Provider: "vercel", Name: "alpha"}
+	p, err := NewAttached(in, NewRuntimeState())
+	if err != nil {
+		t.Fatalf("NewAttached: %v", err)
+	}
+	if r := p.Pick(KeyAll); r == nil || r.Incarnation != 7 {
+		t.Fatalf("attached relay incarnation = %+v, want 7", r)
+	}
+}
+
 func TestProviderMaxBody(t *testing.T) {
 	cases := []struct {
 		provider string

@@ -5,12 +5,15 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -123,6 +126,61 @@ func newGateway(t *testing.T, st *State) *Gateway {
 		st.Client = NewClient(NewTransport(time.Second, time.Second))
 	}
 	return New(st, "test-version", "worker-42", logging.Nop())
+}
+
+// captureLog is a mutex-guarded buffer the hot path's JSON attempt lines
+// land in: request goroutines write it while the test goroutine reads it.
+type captureLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *captureLog) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *captureLog) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+// newCapturingGateway is newGateway with the attempt log captured, so a test
+// can pin the outcome fields the hot path actually logged.
+func newCapturingGateway(t *testing.T, st *State) (*Gateway, *captureLog) {
+	t.Helper()
+	if st.Client == nil {
+		st.Client = NewClient(NewTransport(time.Second, time.Second))
+	}
+	lc := &captureLog{}
+	return New(st, "test-version", "worker-42", logging.New(lc)), lc
+}
+
+// waitForLog waits until the hot path has logged the given outcome. The log
+// write sits after the classification decision in every branch, so this is
+// the happens-before edge that lets the stats assertions below be exact
+// instead of racing the handler.
+func waitForLog(t *testing.T, lc *captureLog, outcome string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(lc.String(), `"outcome":"`+outcome+`"`) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("attempt log never recorded outcome %q; captured:\n%s", outcome, lc.String())
+}
+
+// relayStatsBy builds the name -> stats row view over one pool snapshot.
+func relayStatsBy(p *pool.Pool) map[string]pool.StatsRow {
+	byName := map[string]pool.StatsRow{}
+	for _, row := range p.Stats() {
+		byName[row.Name] = row
+	}
+	return byName
 }
 
 func relayRequest(t *testing.T, method, path, body string, header http.Header) *http.Request {
@@ -301,7 +359,7 @@ func TestCopyResponseStripsHopByHopAndLength(t *testing.T) {
 		},
 		Body: io.NopCloser(strings.NewReader("ok")),
 	}
-	g.copyResponse(rec, resp)
+	_ = g.copyResponse(rec, resp)
 	if rec.Header().Get("X-End-To-End") != "stay" {
 		t.Fatal("end-to-end response header was dropped")
 	}
@@ -312,6 +370,38 @@ func TestCopyResponseStripsHopByHopAndLength(t *testing.T) {
 	}
 	if rec.Body.String() != "ok" {
 		t.Fatalf("response body = %q, want ok", rec.Body.String())
+	}
+}
+
+// errReader yields nothing and fails immediately — the mid-body read failure
+// a relay leg produces when it breaks after the headers.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// TestCopyResponseReturnsTheCopyError pins the signature: the copy's error
+// is the outcome signal relay() classifies. A discarded error here is the
+// silent mid-stream success issue #59 describes — truncated client, full
+// success accounting, nothing in the log.
+func TestCopyResponseReturnsTheCopyError(t *testing.T) {
+	g := newGateway(t, &State{Pool: buildPool(t, nil)})
+	boom := errors.New("relay leg died mid-body")
+	rec := httptest.NewRecorder()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body: io.NopCloser(io.MultiReader(
+			strings.NewReader("partial"),
+			errReader{err: boom},
+		)),
+	}
+	if err := g.copyResponse(rec, resp); !errors.Is(err, boom) {
+		t.Fatalf("copyResponse error = %v, want the body's %v", err, boom)
+	}
+	// The bytes that made it through before the failure still reached the
+	// client — the copy ends, it does not unwind.
+	if got := rec.Body.String(); got != "partial" {
+		t.Fatalf("client body = %q, want the partial prefix", got)
 	}
 }
 
@@ -676,6 +766,425 @@ func TestResponseStartedIsNeverRetried(t *testing.T) {
 			t.Fatalf("an answered request is not a failure: %+v", row)
 		}
 	}
+}
+
+// TestMidstreamUpstreamErrorIsPassiveAndNeverRetried pins the issue #59
+// accounting and the issue #62 fix: a relay that answers and then breaks its
+// body mid-stream is a counted attempt AND a passive transport failure whose
+// streak ACCUMULATES across consecutive attempts (no header-time success
+// resets it), so threshold 2 trips on the second one — and the truncated
+// answer is never retried (the client already holds part of the body).
+func TestMidstreamUpstreamErrorIsPassiveAndNeverRetried(t *testing.T) {
+	hits := &atomic.Int64{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		// Answer, ship a prefix of the declared body, hard-close. A handler
+		// that merely returns early is re-framed into a complete chunked
+		// response by the server, so the hijack is what makes the leg
+		// actually break mid-body.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("upstream server does not support hijacking")
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// The Fprintf error is discarded explicitly (errcheck): the write
+		// target is the hijacked conn's own buffered writer, and the test's
+		// assertions below observe the client-visible effect either way.
+		_, _ = fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Length: 128\r\n"+
+			"Content-Type: text/plain\r\n\r\ntruncated-body")
+		if err := buf.Flush(); err != nil {
+			t.Errorf("flush truncated answer: %v", err)
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(up.Close)
+
+	// threshold 2: the second consecutive mid-stream failure must trip the
+	// cooldown. Under the pre-#62 ordering each attempt also recorded a
+	// header-time success that reset the streak first, so it never could —
+	// that is exactly the regression this pin guards.
+	in := pool.Input{FailureThreshold: 2, Cooldown: time.Second}
+	in.Relays = append(in.Relays, pool.RelayInput{
+		Name: "mid", Provider: "vercel", URL: relayURL(t, up.URL),
+		Token: "token-mid", MaxBody: bufferBytes(),
+	})
+	p, err := pool.New(in)
+	if err != nil {
+		t.Fatalf("pool.New: %v", err)
+	}
+	g, lc := newCapturingGateway(t, &State{
+		Pool:           p,
+		MaxRetries:     3, // available and never used: a started response is never retried
+		MaxBufferBytes: bufferBytes(),
+	})
+
+	for i := range 2 {
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, relayRequest(t, http.MethodPost, "/", "buffered", specHeaders()))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want the relay's original 200", i+1, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "truncated-body") {
+			t.Fatalf("request %d: client body = %q, want the truncated prefix", i+1, rec.Body.String())
+		}
+		waitForLog(t, lc, "upstream_midstream")
+
+		row := relayStatsBy(g.st.Load().Pool)["mid"]
+		if row.Requests != int64(i+1) || row.Failures != int64(i+1) || row.MidstreamFailures != int64(i+1) {
+			t.Fatalf("request %d: row = %+v, want %d requests, %d failures, %d mid-stream",
+				i+1, row, i+1, i+1, i+1)
+		}
+		if n := hits.Load(); n != int64(i+1) {
+			t.Fatalf("request %d: upstream hits = %d, want exactly one attempt per request", i+1, n)
+		}
+		// The streak accumulates: after the first failure the relay is still
+		// healthy (one failure below the threshold of 2), and only the second
+		// one trips the cooldown.
+		if want := i == 1; row.Healthy == want {
+			t.Fatalf("request %d: row = %+v, want healthy=%t — the mid-stream streak must accumulate",
+				i+1, row, !want)
+		}
+	}
+}
+
+// TestCompletedSuccessResetsTheMidstreamStreak pins the issue #62 evidence
+// rule from the success side: the passive-health success record belongs to a
+// COMPLETED response body, never to the header receipt. The pins, in order:
+// the reset lands only once the body finished copying (it is still pending
+// while the body is mid-flight), an interleaved completed response resets the
+// failure streak so a subsequent mid-stream failure sits below the threshold,
+// and a client aborted mid-copy records neither success nor failure — it must
+// not clear the previous failure's evidence.
+func TestCompletedSuccessResetsTheMidstreamStreak(t *testing.T) {
+	hits := &atomic.Int64{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch hits.Add(1) {
+		case 1, 3:
+			// Mid-stream break: prefix of the declared body, hard close.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("upstream server does not support hijacking")
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			// Fprintf's error is discarded explicitly (errcheck); the
+			// assertions observe the client-visible effect either way.
+			_, _ = fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Length: 128\r\n"+
+				"Content-Type: text/plain\r\n\r\ntruncated-body")
+			if err := buf.Flush(); err != nil {
+				t.Errorf("flush truncated answer: %v", err)
+			}
+			_ = conn.Close()
+		case 2:
+			// A complete answer whose body deliberately finishes late: the
+			// client already holds every byte while the relay body is still
+			// open — exactly the window where a header-time success would
+			// have recorded too early.
+			fl := w.(http.Flusher)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("whole"))
+			fl.Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(80 * time.Millisecond):
+			}
+		case 4:
+			// The client leaves mid-body: one flushed chunk, then wait.
+			fl := w.(http.Flusher)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("chunk-0\n"))
+			fl.Flush()
+			<-r.Context().Done()
+		}
+	}))
+	t.Cleanup(up.Close)
+
+	in := pool.Input{FailureThreshold: 2, Cooldown: time.Second}
+	in.Relays = append(in.Relays, pool.RelayInput{
+		Name: "solo", Provider: "vercel", URL: relayURL(t, up.URL),
+		Token: "token-solo", MaxBody: bufferBytes(),
+	})
+	p, err := pool.New(in)
+	if err != nil {
+		t.Fatalf("pool.New: %v", err)
+	}
+	g, lc := newCapturingGateway(t, &State{
+		Pool:           p,
+		MaxRetries:     0, // one attempt: a started response is never retried
+		MaxBufferBytes: bufferBytes(),
+	})
+	gwSrv := httptest.NewServer(g)
+	t.Cleanup(gwSrv.Close)
+
+	row := func() pool.StatsRow { return relayStatsBy(g.st.Load().Pool)["solo"] }
+
+	// 1. Mid-stream break: one counted attempt, one passive failure, and the
+	// failure's evidence on the row.
+	body := gwPost(t, gwSrv)
+	if !strings.HasPrefix(body, "truncated-body") {
+		t.Fatalf("body = %q, want the truncated prefix", body)
+	}
+	waitForLog(t, lc, "upstream_midstream")
+	if r := row(); r.Requests != 1 || r.Failures != 1 || r.MidstreamFailures != 1 ||
+		r.LastError == "" || !r.Healthy {
+		t.Fatalf("after the mid-stream break: row = %+v, want 1 request, 1 failure, 1 mid-stream, lastError set, healthy", r)
+	}
+
+	// 2. A complete answer whose body finishes late. Read its bytes WITHOUT
+	// waiting for the body EOF, and check the row mid-flight: the previous
+	// failure's evidence must still be there — the headers alone are no
+	// success. Only the completed copy resets the streak.
+	req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set(HeaderTarget, "https://target.example")
+	req.Header.Set(HeaderPath, "/v1")
+	resp, err := gwSrv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	prefix := make([]byte, len("whole"))
+	if _, err := io.ReadFull(resp.Body, prefix); err != nil {
+		t.Fatalf("read body prefix: %v", err)
+	}
+	if string(prefix) != "whole" {
+		t.Fatalf("body prefix = %q, want the complete answer's bytes", prefix)
+	}
+	// The relay body is still open here (the upstream holds it ~60ms more).
+	time.Sleep(20 * time.Millisecond)
+	if r := row(); r.LastError == "" || r.Failures != 1 {
+		t.Fatalf("mid-flight of the completed body: row = %+v, want lastError still set and still 1 failure — headers are not success evidence", r)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+	waitForStats(t, row, func(r pool.StatsRow) bool { return r.LastError == "" },
+		"the completed body to reset the streak")
+	if r := row(); r.Requests != 2 || r.Failures != 1 || r.MidstreamFailures != 1 || !r.Healthy {
+		t.Fatalf("after the completed body: row = %+v, want the streak reset, counters unchanged", r)
+	}
+
+	// 3. Another mid-stream break: it lands on a cleared streak, so the relay
+	// stays healthy — the completed response in between is what saved it. An
+	// unreset streak would have made this the second consecutive failure and
+	// tripped the threshold-2 cooldown.
+	body = gwPost(t, gwSrv)
+	if !strings.HasPrefix(body, "truncated-body") {
+		t.Fatalf("body = %q, want the truncated prefix", body)
+	}
+	waitForLog(t, lc, "upstream_midstream")
+	if r := row(); r.Requests != 3 || r.Failures != 2 || r.MidstreamFailures != 2 || !r.Healthy {
+		t.Fatalf("after the second break: row = %+v, want 2 failures on a healthy relay — the completed response reset the streak", r)
+	}
+
+	// 4. A client abort mid-copy: neither a success nor a failure. The old
+	// failure's evidence must survive it — a success recorded here would
+	// clear lastError and lift the streak.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
+	if reqErr != nil {
+		t.Fatalf("build request: %v", reqErr)
+	}
+	req.Header.Set(HeaderTarget, "https://target.example")
+	req.Header.Set(HeaderPath, "/v1")
+	done := make(chan struct{}, 1)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		resp, doErr := gwSrv.Client().Do(req)
+		if doErr != nil {
+			return // expected: the canceled request fails on the client
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	waitForStats(t, row, func(pool.StatsRow) bool { return hits.Load() >= 4 },
+		"the relay to answer the fourth request")
+	cancel() // the client goes away mid-body
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled request never returned")
+	}
+	waitForLog(t, lc, "client_aborted")
+	if r := row(); r.Requests != 4 || r.Failures != 2 || r.MidstreamFailures != 2 ||
+		r.LastError == "" || !r.Healthy {
+		t.Fatalf("after the client abort: row = %+v, want counters unchanged, lastError preserved, healthy — an abort is neither success nor failure", r)
+	}
+}
+
+// gwPost sends one relay-spec POST through the real gateway server and
+// returns the fully read body (the classification it drives completes before
+// the response does).
+func gwPost(t *testing.T, gwSrv *httptest.Server) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set(HeaderTarget, "https://target.example")
+	req.Header.Set(HeaderPath, "/v1")
+	resp, err := gwSrv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(raw)
+}
+
+// waitForStats polls a pool stats row until pred holds — the completion-time
+// success record lands microseconds after the body EOFs, so the test waits
+// for it instead of racing it.
+func waitForStats(t *testing.T, row func() pool.StatsRow, pred func(pool.StatsRow) bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pred(row()) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s; last row = %+v", what, row())
+}
+
+// TestClientCancellationIsNotAPassiveFailure pins the client_aborted half of
+// the classification: a client that goes away — before the relay answers or
+// mid-body — is never evidence against the relay. Its teardown takes the
+// upstream leg with it, so recording a passive failure would cool a relay
+// down for the caller's own hangup.
+func TestClientCancellationIsNotAPassiveFailure(t *testing.T) {
+	t.Run("before the relay answers", func(t *testing.T) {
+		gate := make(chan struct{})
+		release := make(chan struct{})
+		hits := &atomic.Int64{}
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			close(gate) // the attempt is parked inside the relay
+			<-release
+			if r.Context().Err() != nil {
+				return // the leg is already gone; never write on it
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(up.Close)
+
+		g, lc := newCapturingGateway(t, &State{
+			Pool: buildPool(t, []relaySpec{
+				{name: "solo", provider: "vercel", rawURL: up.URL, maxBody: bufferBytes()},
+			}),
+			MaxRetries:     3, // available and never used: the client is gone
+			MaxBufferBytes: bufferBytes(),
+		})
+		gwSrv := httptest.NewServer(g)
+		t.Cleanup(gwSrv.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set(HeaderProvider, "vercel")
+		done := make(chan error, 1)
+		go func() {
+			resp, doErr := gwSrv.Client().Do(req)
+			if doErr == nil {
+				_ = resp.Body.Close()
+			}
+			done <- doErr
+		}()
+		select {
+		case <-gate:
+		case <-time.After(2 * time.Second):
+			t.Fatal("request never reached the relay")
+		}
+
+		cancel() // the client goes away before any response byte
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("the canceled request must fail on the client")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("canceled request never returned")
+		}
+		close(release) // unwind the parked upstream handler
+
+		waitForLog(t, lc, "client_aborted")
+		row := relayStatsBy(g.st.Load().Pool)["solo"]
+		if row.Requests != 0 || row.Failures != 0 || row.MidstreamFailures != 0 || !row.Healthy {
+			t.Fatalf("row = %+v, want zero counters, healthy — a client abort is not a relay failure", row)
+		}
+		if n := hits.Load(); n != 1 {
+			t.Fatalf("upstream hits = %d, want exactly one attempt with no retry", n)
+		}
+	})
+
+	t.Run("mid-body", func(t *testing.T) {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fl := w.(http.Flusher)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("chunk-0\n"))
+			fl.Flush()
+			<-r.Context().Done() // the body stays open until the client leaves
+		}))
+		t.Cleanup(up.Close)
+
+		g, lc := newCapturingGateway(t, &State{
+			Pool: buildPool(t, []relaySpec{
+				{name: "solo", provider: "vercel", rawURL: up.URL, maxBody: bufferBytes()},
+			}),
+			MaxRetries:     3,
+			MaxBufferBytes: bufferBytes(),
+		})
+		gwSrv := httptest.NewServer(g)
+		t.Cleanup(gwSrv.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, gwSrv.URL+"/", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set(HeaderProvider, "vercel")
+		resp, err := gwSrv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("streaming request: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		prefix := make([]byte, len("chunk-0\n"))
+		if _, err := io.ReadFull(resp.Body, prefix); err != nil {
+			t.Fatalf("read first chunk: %v", err)
+		}
+
+		cancel() // the client goes away mid-body
+		_, _ = io.Copy(io.Discard, resp.Body)
+		waitForLog(t, lc, "client_aborted")
+		if strings.Contains(lc.String(), `"outcome":"upstream_midstream"`) {
+			t.Fatal("a client abort mid-body was classified against the relay")
+		}
+		row := relayStatsBy(g.st.Load().Pool)["solo"]
+		if row.Requests != 1 || row.Failures != 0 || row.MidstreamFailures != 0 || !row.Healthy {
+			t.Fatalf("row = %+v, want the counted request with zero failures — the answer itself was transport-level success", row)
+		}
+	})
 }
 
 // --- streaming ---
@@ -1222,4 +1731,141 @@ func TestPostSwapPickServesFromTheCurrentGeneration(t *testing.T) {
 	if hitsB.Load() == 0 {
 		t.Fatal("current-generation relay never received the request")
 	}
+}
+
+// TestHealthUpdatesReachThePickedGeneration is the issue #60 regression pin:
+// an attempt that begins before a Swap and runs after it must record its
+// passive health on the generation it picked FROM, not on the entry
+// snapshot's. The two generations here are standalone pool.New builds —
+// fresh RelayState objects even for the same relay identity — so a
+// mis-bound record is directly observable: the picked generation's relay
+// carries the outcome, the entry generation's stays at zero.
+func TestHealthUpdatesReachThePickedGeneration(t *testing.T) {
+	// gen builds one standalone generation whose only relay is named the
+	// same in both generations, pointing at the given origin.
+	gen := func(t *testing.T, rawURL string) *State {
+		return &State{
+			Pool: buildPool(t, []relaySpec{
+				{name: "solo", provider: "vercel", rawURL: rawURL, maxBody: bufferBytes()},
+			}),
+			Client:         NewClient(NewTransport(time.Second, time.Second)),
+			MaxRetries:     0,
+			MaxBufferBytes: bufferBytes(),
+		}
+	}
+
+	// parkRequest enters one request and holds it in body buffering, so the
+	// pick happens only when the body is released — after the Swap below.
+	// It returns the release closure and the channel the response arrives on.
+	parkRequest := func(t *testing.T, gwSrv *httptest.Server) (release func(), respCh <-chan *http.Response) {
+		t.Helper()
+		pr, pw := io.Pipe()
+		t.Cleanup(func() { _ = pw.Close() })
+		req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", pr)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.ContentLength = 8
+		req.Header.Set(HeaderTarget, "https://target.example")
+		req.Header.Set(HeaderPath, "/v1")
+
+		ch := make(chan *http.Response, 1)
+		go func() {
+			r, doErr := gwSrv.Client().Do(req)
+			if doErr != nil {
+				t.Errorf("client do: %v", doErr)
+				ch <- nil
+				return
+			}
+			ch <- r
+		}()
+		// Give the handler time to park in the body read; the Swap lands
+		// while the request has picked nothing yet.
+		time.Sleep(50 * time.Millisecond)
+		return func() {
+			if _, err := pw.Write([]byte("12345678")); err != nil {
+				t.Errorf("write body: %v", err)
+			}
+			if err := pw.Close(); err != nil {
+				t.Errorf("close body: %v", err)
+			}
+		}, ch
+	}
+
+	t.Run("success is recorded on the picked generation", func(t *testing.T) {
+		upOK, hitsOK, _ := newUpstream(t, http.StatusOK, "served", nil)
+		entry := gen(t, deadRelayURL(t)) // would have failed: a success here exposes the mis-binding
+		picked := gen(t, upOK.URL)
+		g, lc := newCapturingGateway(t, entry)
+		gwSrv := httptest.NewServer(g)
+		t.Cleanup(gwSrv.Close)
+
+		release, respCh := parkRequest(t, gwSrv)
+		g.Swap(picked)
+		release()
+
+		select {
+		case resp := <-respCh:
+			if resp == nil {
+				t.Fatal("no response")
+			}
+			defer func() { _ = resp.Body.Close() }()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if string(got) != "served" {
+				t.Fatalf("response = %q, want the picked generation's answer", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("request never completed")
+		}
+		waitForLog(t, lc, "relayed")
+
+		byName := relayStatsBy(picked.Pool)
+		if byName["solo"].Requests != 1 || byName["solo"].Failures != 0 {
+			t.Fatalf("picked generation row = %+v, want the success recorded here", byName["solo"])
+		}
+		if entryRow := relayStatsBy(entry.Pool)["solo"]; entryRow.Requests != 0 || entryRow.Failures != 0 {
+			t.Fatalf("entry generation row = %+v, want untouched — the health update must follow the pick", entryRow)
+		}
+		if n := hitsOK.Load(); n != 1 {
+			t.Fatalf("upstream hits = %d, want 1", n)
+		}
+	})
+
+	t.Run("failure is recorded on the picked generation", func(t *testing.T) {
+		upOK, _, _ := newUpstream(t, http.StatusOK, "served", nil)
+		entry := gen(t, upOK.URL) // would have succeeded: a failure here exposes the mis-binding
+		picked := gen(t, deadRelayURL(t))
+		g, lc := newCapturingGateway(t, entry)
+		gwSrv := httptest.NewServer(g)
+		t.Cleanup(gwSrv.Close)
+
+		release, respCh := parkRequest(t, gwSrv)
+		g.Swap(picked)
+		release()
+
+		select {
+		case resp := <-respCh:
+			if resp == nil {
+				t.Fatal("request errored on the client")
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502 from the failed attempt", resp.StatusCode)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("request never completed")
+		}
+		waitForLog(t, lc, "upstream_pre_response")
+
+		byName := relayStatsBy(picked.Pool)
+		if byName["solo"].Failures != 1 || byName["solo"].Requests != 0 {
+			t.Fatalf("picked generation row = %+v, want exactly one recorded failure", byName["solo"])
+		}
+		if entryRow := relayStatsBy(entry.Pool)["solo"]; entryRow.Requests != 0 || entryRow.Failures != 0 {
+			t.Fatalf("entry generation row = %+v, want untouched — the health update must follow the pick", entryRow)
+		}
+	})
 }
