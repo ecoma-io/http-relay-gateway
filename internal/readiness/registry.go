@@ -35,11 +35,17 @@
 // deploy until a stale delete in flight has finished deleting the OLD
 // project.
 //
-// Generations are monotonic within one process and start at 1 per entry;
-// they are not persisted, so a restart restarts every relay at 1. That is
-// deliberate: the registry holds no truth across restarts, so a generation
-// number never needs to mean anything beyond this process's own stale-
-// completion guard.
+// Generations are monotonic within one entry's lifetime and start at 1 per
+// entry; they are not persisted, so a restart restarts every relay at 1.
+// That is deliberate: the registry holds no truth across restarts, so a
+// generation number never needs to mean anything beyond this process's own
+// stale-completion guard. The counter is per entry, not global: a purge
+// (DeleteDone) followed by a recreate restarts at 1 — numerically identical
+// to a long-gone incarnation, which the stale-completion guard cannot tell
+// apart (ABA). That is safe only under one caller discipline, held by every
+// caller today: each completion is delivered before the Begin or BeginDelete
+// release closure that captured its generation returns, so no completion can
+// outlive the incarnation it belongs to and land on a recreated entry.
 package readiness
 
 import (
@@ -122,8 +128,13 @@ type Record struct {
 	// incarnation's next rollout must re-run the settle+drain barrier before
 	// deploying. It is deliberately not carried by the (state, reason) pair
 	// — Failing refreshes the reason and Pause replaces the phase between
-	// passes — and it clears only when the barrier completes, the relay is
-	// re-admitted, or the incarnation changes.
+	// passes — and it clears when the barrier completes (DrainCompleted), the
+	// relay is re-admitted (Ready), or the identity is re-added after a
+	// removal. One deliberate exception: a scope flip also changes the
+	// incarnation, and the flip branch in Sync still carries the marker — on
+	// vercel the derived production URL <project>.vercel.app is
+	// scope-independent, so an old-scope straggler can be streaming the very
+	// URL a new-scope deploy switches, and the drain stays necessary.
 	DrainPending bool
 }
 
@@ -523,7 +534,11 @@ func (r *Registry) GenerationOf(key Key) (uint64, bool) {
 // relay — that caller is the only one operating on it. This is what keeps
 // concurrent reconciliation paths from launching duplicate work for one
 // relay, and what guarantees a re-added identity cannot deploy until an
-// in-flight stale delete has finished deleting the old project.
+// in-flight stale delete has finished deleting the old project. Every
+// completion captured under the returned generation must be delivered before
+// the release closure runs: generations restart at 1 after a purge (see the
+// package generations note), so a completion held past release could land on
+// a recreated entry whose generation happens to match.
 func (r *Registry) Begin(key Key) (release func(), generation uint64, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -543,6 +558,9 @@ func (r *Registry) Begin(key Key) (release func(), generation uint64, ok bool) {
 // BeginDelete takes the single-flight hold for a remote delete: it succeeds
 // only while the relay is actually labeled removing. A re-added identity
 // (state configured again) can no longer be deleted by the stale operation.
+// The same completion-before-release discipline as Begin applies here — the
+// purge on success restarts the entry's generation counter, so a completion
+// held past the release closure could match a recreated incarnation.
 func (r *Registry) BeginDelete(key Key) (release func(), generation uint64, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -647,7 +665,13 @@ func (r *Registry) Ready(key Key, generation uint64, url, token string, duration
 	e.record.LastAttempt = now
 	e.record.LastResult = duration
 	e.record.FailStreak = 0
-	e.record.DrainPending = false // re-admission ends any deferred replacement
+	// Re-admission ends the incarnation's replacement story — both markers
+	// clear here. The scope-flip one matters when no rollout ever ran: a flip
+	// whose next pass reuses a verified deployment (verifyOK → Ready) would
+	// otherwise leave its marker armed for a much later unrelated rollout in
+	// the same incarnation to read true and run a needless settle+drain.
+	e.record.DrainPending = false
+	e.scopeChanged = false
 	e.nextTry = time.Time{}
 	if !e.serving {
 		e.serving = true
@@ -819,7 +843,12 @@ func (r *Registry) DrainCompleted(key Key, generation uint64) {
 
 // DeleteDone purges key after its remote delete completed under the given
 // incarnation. Stale completions are discarded: a re-added identity (new
-// incarnation) stays exactly as it is.
+// incarnation) stays exactly as it is. The purge is also where the per-entry
+// generation counter restarts — a later recreate begins again at 1, which is
+// indistinguishable from the long-gone incarnation this completion just
+// closed (ABA). That is safe only because every caller delivers its
+// completions before its BeginDelete release closure runs, so nothing
+// captured under the old incarnation can still be in flight here.
 func (r *Registry) DeleteDone(key Key, generation uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

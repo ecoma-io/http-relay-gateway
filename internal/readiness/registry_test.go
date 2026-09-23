@@ -397,6 +397,45 @@ func TestSyncReaddAdoptsScopeAsBaselineWithoutASecondBump(t *testing.T) {
 	}
 }
 
+// A scope flip raises the barrier marker for the rollout that follows. But a
+// flip whose next pass reuses a verified deployment never runs that rollout —
+// discovery finds the deployment, verification passes, Ready re-admits — and
+// the marker must clear with that re-admission, or a much later unrelated
+// rollout in the same incarnation reads it true and runs a needless
+// settle+drain. The rollout's own consumption path is unchanged: a fresh flip
+// raises a fresh marker, read-and-clear.
+func TestReadyClearsTheScopeChangedMarker(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+
+	// The flip sets the marker; a Ready at the flip's generation clears it.
+	r.Sync([]Member{pinned(keyA, "team-b")})
+	flipped := generationOf(t, r, keyA)
+	if flipped != gen+1 {
+		t.Fatalf("generation after the flip = %d, want %d", flipped, gen+1)
+	}
+	r.Ready(keyA, flipped, "https://alpha.example", "rk", time.Millisecond)
+	if r.TakeScopeChanged(keyA, flipped) {
+		t.Fatal("a Ready at the flip's generation must clear the scope-changed marker")
+	}
+
+	// A fresh flip raises a fresh marker for the rollout to consume.
+	r.Sync([]Member{pinned(keyA, "team-c")})
+	again := generationOf(t, r, keyA)
+	if again != flipped+1 {
+		t.Fatalf("generation after the second flip = %d, want %d", again, flipped+1)
+	}
+	if !r.TakeScopeChanged(keyA, again) {
+		t.Fatal("the rollout must still find a fresh flip's marker")
+	}
+	if r.TakeScopeChanged(keyA, again) {
+		t.Fatal("the marker is read-and-clear: the second read must be false")
+	}
+}
+
 func TestReadyPublishesURLAndTokenAtomically(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
