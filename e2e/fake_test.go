@@ -24,6 +24,15 @@ import (
 // worker sim on the same origin. The gateway derives each relay's stable
 // URL as <fake base>/<project slug>, so a relay's ingress, version probe
 // and self-forward all land here, muxed by the first path segment.
+//
+// Projects live inside a provider scope, exactly like on the real platforms:
+// vercel addresses them through the teamId query, cloudflare through the
+// account path segment, deno through the organization path segment and its
+// org-unique project UUIDs. A project created in one scope is invisible to
+// another scope's API calls — the platform property that makes a moved scope
+// pin orphan the old deployment instead of relocating it. The shared origin
+// stays scope-blind (one stable URL per slug), so live routing keeps a
+// per-slug pointer to whichever deployment last went live.
 type fakeEdge struct {
 	t    *testing.T
 	base string
@@ -34,12 +43,20 @@ type fakeEdge struct {
 
 	mu       sync.Mutex
 	require  map[string]string       // provider -> required bearer token ("" accepts any)
-	projects map[string]*fakeProject // slug -> state
+	projects map[string]*fakeProject // provider+scope+slug -> state
+	live     map[string]*fakeProject // slug -> the deployment now answering on the shared origin
 	calls    []fakeCall
 	// denoPolls counts GET /deployments/{id} polls per deployment id so the
 	// status walk can model the platform's pending→success transition.
 	denoPolls map[string]int
 	closed    bool
+}
+
+// pkey is a project's map key: its identity within one provider scope. Two
+// credentials pinned to different scopes address two different projects even
+// under one slug.
+func pkey(provider, scope, slug string) string {
+	return provider + "\x00" + scope + "\x00" + slug
 }
 
 type fakeCall struct {
@@ -62,6 +79,7 @@ type deployRecord struct {
 type fakeProject struct {
 	provider   string
 	slug       string
+	scope      string // the provider scope this project lives in; "" = unclaimed stub
 	exists     bool
 	rootRoutes bool                  // vercel only: a deployment shipped the root rewrite
 	envs       map[string]fakeEnvVar // vercel only: the project env the worker reads
@@ -96,6 +114,7 @@ func newFakeEdge(t *testing.T) *fakeEdge {
 		ln:        ln,
 		require:   map[string]string{},
 		projects:  map[string]*fakeProject{},
+		live:      map[string]*fakeProject{},
 		denoPolls: map[string]int{},
 		client:    &http.Client{Timeout: 30 * time.Second},
 	}
@@ -144,7 +163,7 @@ func (f *fakeEdge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		p := f.projects[slug]
+		p := f.live[slug]
 		f.mu.Unlock()
 		if p == nil || p.sim == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no route"})
@@ -205,7 +224,62 @@ func (f *fakeEdge) callsFor(provider, kind string) []fakeCall {
 func (f *fakeEdge) project(slug string) *fakeProject {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.projects[slug]
+	return f.live[slug]
+}
+
+// projectIn returns the project a (provider, scope) API view addresses. Scope
+// flips are invisible to the slug-only helpers: after a flip two projects
+// share a slug, one per scope, and only the new scope's is live.
+func (f *fakeEdge) projectIn(provider, scope, slug string) *fakeProject {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.projects[pkey(provider, scope, slug)]
+}
+
+// deployCountIn counts the deployments one scope's view of a project recorded.
+func (f *fakeEdge) deployCountIn(provider, scope, slug string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.projects[pkey(provider, scope, slug)]
+	if p == nil {
+		return 0
+	}
+	return len(p.deploys)
+}
+
+// deleteCountIn is deployCountIn for remote deletes, per scope: an orphaned
+// deployment's counter never moves, whatever happens to the new scope's.
+func (f *fakeEdge) deleteCountIn(provider, scope, slug string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.projects[pkey(provider, scope, slug)]
+	if p == nil {
+		return 0
+	}
+	return len(p.deletes)
+}
+
+// projectExistsIn reports whether the (provider, scope) project is live on
+// the platform — the orphan check a scope-flip test makes.
+func (f *fakeEdge) projectExistsIn(provider, scope, slug string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.projects[pkey(provider, scope, slug)]
+	return p != nil && p.exists
+}
+
+// removeProjectManually models the operator removing an orphaned deployment
+// by hand on the platform console — the documented remediation for a scope
+// the gateway no longer addresses. The gateway never sees this: no API call
+// is recorded and no delete counter moves.
+func (f *fakeEdge) removeProjectManually(provider, scope, slug string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.projects[pkey(provider, scope, slug)]
+	delete(f.projects, pkey(provider, scope, slug))
+	if p != nil && f.live[slug] == p {
+		delete(f.live, slug)
+	}
 }
 
 // servesPath models Vercel's request routing for one path on the shared
@@ -224,12 +298,14 @@ func (p *fakeProject) servesPath(path string) bool {
 // addProject pre-registers a project as existing on its platform, with a
 // fresh sim in the given initial mode (the caller then sets the deployed
 // version/token or the mode). A pre-registered vercel project models an
-// already-serving deployment, so its root routes.
+// already-serving deployment, so its root routes. The project starts
+// unscoped: it is claimed by the first scope whose API asks for its slug.
 func (f *fakeEdge) addProject(provider, slug, mode string) *fakeProject {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := &fakeProject{provider: provider, slug: slug, exists: true, rootRoutes: true, sim: newSim(slug, mode)}
-	f.projects[slug] = p
+	f.projects[pkey(provider, "", slug)] = p
+	f.live[slug] = p
 	return p
 }
 
@@ -242,7 +318,7 @@ func (f *fakeEdge) setToken(provider, token string) {
 func (f *fakeEdge) deploysOf(slug string) []deployRecord {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := f.projects[slug]
+	p := f.live[slug]
 	if p == nil {
 		return nil
 	}
@@ -254,7 +330,7 @@ func (f *fakeEdge) deployCount(slug string) int { return len(f.deploysOf(slug)) 
 func (f *fakeEdge) deleteCount(slug string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := f.projects[slug]
+	p := f.live[slug]
 	if p == nil {
 		return 0
 	}
@@ -267,7 +343,7 @@ func (f *fakeEdge) deleteCount(slug string) int {
 func (f *fakeEdge) deleteDoneAt(slug string) (time.Time, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := f.projects[slug]
+	p := f.live[slug]
 	if p == nil || p.deleteDone.IsZero() {
 		return time.Time{}, false
 	}
@@ -282,11 +358,27 @@ func (f *fakeEdge) deleteDoneAt(slug string) (time.Time, bool) {
 func (f *fakeEdge) armDeployGate(slug string) (release func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p, ok := f.projects[slug]
-	if !ok {
+	p := f.live[slug]
+	if p == nil {
 		p = &fakeProject{slug: slug, sim: newSim(slug, simOK)}
-		f.projects[slug] = p
+		f.projects[pkey("", "", slug)] = p
+		f.live[slug] = p
 	}
+	gate := make(chan struct{})
+	p.gate = gate
+	return func() { close(gate) }
+}
+
+// armFreshDeployGate arms the next deploy onto a brand-new unclaimed stub,
+// never touching the live project the slug already names. This is the form a
+// scope-flip test needs: the deploy that matters lands on a project the slug
+// does not name yet, and an unclaimed stub is claimed by the first scope
+// whose API asks for it.
+func (f *fakeEdge) armFreshDeployGate(slug string) (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := &fakeProject{slug: slug, sim: newSim(slug, simOK)}
+	f.projects[pkey("", "", slug)] = p
 	gate := make(chan struct{})
 	p.gate = gate
 	return func() { close(gate) }
@@ -296,10 +388,11 @@ func (f *fakeEdge) armDeployGate(slug string) (release func()) {
 func (f *fakeEdge) armDeleteGate(slug string) (release func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p, ok := f.projects[slug]
-	if !ok {
+	p := f.live[slug]
+	if p == nil {
 		p = &fakeProject{slug: slug, sim: newSim(slug, simOK)}
-		f.projects[slug] = p
+		f.projects[pkey("", "", slug)] = p
+		f.live[slug] = p
 	}
 	gate := make(chan struct{})
 	p.deleteOp = gate
@@ -415,6 +508,9 @@ func (p *vercelPayload) workerSource() string {
 
 func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	// Every vercel call carries its scope in the teamId query — absent when
+	// the credential addresses the token's own user scope.
+	scope := r.URL.Query().Get("teamId")
 	switch {
 	case r.Method == http.MethodPost && path == "/v11/projects":
 		if !f.authorized(w, r, "vercel") {
@@ -427,12 +523,13 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 		f.record("vercel", "create-project", body.Name, r)
 		f.mu.Lock()
-		p := f.projects[body.Name]
+		p := f.scoped("vercel", scope, body.Name)
 		if p == nil {
-			p = &fakeProject{provider: "vercel", slug: body.Name, sim: newSim(body.Name, simOK)}
-			f.projects[body.Name] = p
+			p = &fakeProject{provider: "vercel", slug: body.Name, scope: scope, sim: newSim(body.Name, simOK)}
+			f.projects[pkey("vercel", scope, body.Name)] = p
 		}
 		p.exists = true
+		f.live[body.Name] = p
 		f.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"id": "prj-" + body.Name, "name": body.Name})
 
@@ -442,7 +539,7 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 		if !f.authorized(w, r, "vercel") {
 			return
 		}
-		p := f.lookup("vercel", slug)
+		p := f.lookup("vercel", scope, slug)
 		if p == nil || !p.exists {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "NOT_FOUND"})
 			return
@@ -486,7 +583,7 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 		if !f.authorized(w, r, "vercel") {
 			return
 		}
-		p := f.lookup("vercel", slug)
+		p := f.lookup("vercel", scope, slug)
 		if p == nil || !p.exists {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "NOT_FOUND"})
 			return
@@ -513,7 +610,7 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.record("vercel", "discover", slug, r)
-		if p := f.lookup("vercel", slug); p != nil && p.exists {
+		if p := f.lookup("vercel", scope, slug); p != nil && p.exists {
 			writeJSON(w, http.StatusOK, map[string]any{"id": "prj-" + slug, "name": slug})
 			return
 		}
@@ -532,7 +629,7 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.record("vercel", "deploy", payload.Name, r)
-		p := f.waitGate("vercel", payload.Name)
+		p := f.waitGate("vercel", scope, payload.Name)
 		// The worker's environment is whatever the project env held when
 		// the deployment was created: the values arrive through the env
 		// endpoints, never through the deployment payload.
@@ -547,7 +644,7 @@ func (f *fakeEdge) serveVercel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.record("vercel", "delete", slug, r)
-		f.completeDelete("vercel", slug)
+		f.completeDelete("vercel", scope, slug)
 		writeJSON(w, http.StatusOK, map[string]any{})
 
 	default:
@@ -624,12 +721,21 @@ type cfBindings struct {
 
 func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/") // accounts/{a}/workers/scripts/{slug}[...]
+	// Every account-scoped call carries its scope in the path; the account
+	// itself is what a credential without a pin resolves from the token.
+	scope := ""
+	if len(parts) >= 2 && parts[0] == "accounts" {
+		scope = parts[1]
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/accounts":
 		if !f.authorized(w, r, "cloudflare") {
 			return
 		}
 		f.record("cloudflare", "accounts", "", r)
+		// This fake's credential sees exactly one account — the single-
+		// account token the resolve-from-token path models. Scope flips ride
+		// the account pin, which arrives in the paths below.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"success": true, "result": []map[string]string{{"id": "acct-e2e"}},
 		})
@@ -640,7 +746,7 @@ func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.record("cloudflare", "discover", slug, r)
-		p := f.lookup("cloudflare", slug)
+		p := f.lookup("cloudflare", scope, slug)
 		if p != nil && p.exists {
 			writeJSON(w, http.StatusOK, map[string]any{"success": true, "result": map[string]string{"id": slug}})
 			return
@@ -690,7 +796,7 @@ func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 			source = string(raw)
 		}
 		f.record("cloudflare", "deploy", slug, r)
-		p := f.waitGate("cloudflare", slug)
+		p := f.waitGate("cloudflare", scope, slug)
 		f.completeDeploy(p, version, token, source, true)
 		writeJSON(w, http.StatusOK, map[string]any{"success": true, "result": map[string]string{}})
 
@@ -707,7 +813,7 @@ func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.record("cloudflare", "delete", slug, r)
-		f.completeDelete("cloudflare", slug)
+		f.completeDelete("cloudflare", scope, slug)
 		writeJSON(w, http.StatusOK, map[string]any{"success": true})
 
 	default:
@@ -728,10 +834,12 @@ func (f *fakeEdge) serveCloudflare(w http.ResponseWriter, r *http.Request) {
 // serves this org only; any other id answers 404 like the real API.
 const e2eDenoOrgID = "e17a0e6b-7ba7-4a6e-9dbd-1f9a83d4db0a"
 
-// denoProjectID derives the deterministic project UUID for a slug — the
-// platform addresses projects by UUID, never by name.
-func denoProjectID(slug string) string {
-	sum := sha256.Sum256([]byte("deno-project:" + slug))
+// denoProjectID derives the deterministic project UUID for a slug inside one
+// organization — the platform addresses projects by UUID, never by name, and
+// organizations are disjoint namespaces: the same name under another org is a
+// different project with a different UUID.
+func denoProjectID(org, slug string) string {
+	sum := sha256.Sum256([]byte("deno-project:" + org + ":" + slug))
 	src := []byte(hex.EncodeToString(sum[:16]))
 	src[12] = '4' // UUID version nibble
 	src[16] = '8' // RFC 4122 variant nibble
@@ -752,9 +860,9 @@ type denoDeployPayload struct {
 }
 
 // denoProjectJSON renders the spec's Project (all its required fields).
-func denoProjectJSON(slug string) map[string]any {
+func denoProjectJSON(org, slug string) map[string]any {
 	return map[string]any{
-		"id":          denoProjectID(slug),
+		"id":          denoProjectID(org, slug),
 		"name":        slug,
 		"description": "",
 		"createdAt":   "2026-01-01T00:00:00Z",
@@ -771,6 +879,7 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "organization not found"})
 			return
 		}
+		org := parts[2]
 		switch r.Method {
 		case http.MethodGet:
 			if !f.authorized(w, r, "deno") {
@@ -779,9 +888,11 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 			f.record("deno", "discover", "", r)
 			f.mu.Lock()
 			var slugs []string
-			for slug, p := range f.projects {
-				if p.provider == "deno" && p.exists {
-					slugs = append(slugs, slug)
+			for _, p := range f.projects {
+				// The collection is organization-scoped: only this org's
+				// projects are listed, an org flip's orphan stays invisible.
+				if p.provider == "deno" && p.scope == org && p.exists {
+					slugs = append(slugs, p.slug)
 				}
 			}
 			f.mu.Unlock()
@@ -801,7 +912,7 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 					end = len(slugs)
 				}
 				for _, slug := range slugs[start:end] {
-					items = append(items, denoProjectJSON(slug))
+					items = append(items, denoProjectJSON(org, slug))
 				}
 			}
 			writeJSON(w, http.StatusOK, items)
@@ -820,15 +931,16 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 			}
 			f.record("deno", "create-project", body.Name, r)
 			f.mu.Lock()
-			p, ok := f.projects[body.Name]
-			if !ok {
-				p = &fakeProject{sim: newSim(body.Name, simOK)}
-				f.projects[body.Name] = p
+			p := f.scoped("deno", org, body.Name)
+			if p == nil {
+				p = &fakeProject{provider: "deno", slug: body.Name, scope: org, sim: newSim(body.Name, simOK)}
+				f.projects[pkey("deno", org, body.Name)] = p
 			}
 			p.provider = "deno"
 			p.exists = true // gates and sims on a pre-armed stub stay untouched
+			f.live[body.Name] = p
 			f.mu.Unlock()
-			writeJSON(w, http.StatusOK, denoProjectJSON(body.Name))
+			writeJSON(w, http.StatusOK, denoProjectJSON(org, body.Name))
 
 		default:
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no deno route"})
@@ -859,13 +971,13 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 				source = string(decoded)
 			}
 		}
-		slug, ok := f.denoSlugFor(parts[2])
+		org, slug, ok := f.denoSlugFor(parts[2])
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "project not found"})
 			return
 		}
 		f.record("deno", "deploy", slug, r)
-		p := f.waitGate("deno", slug)
+		p := f.waitGate("deno", org, slug)
 		f.completeDeploy(p, payload.EnvVars["RELAY_VERSION"], payload.EnvVars["RELAY_AUTH_TOKEN"], source, true)
 		// The build is asynchronous on the platform: create answers pending
 		// and the status poll below observes the pending→success walk.
@@ -904,13 +1016,13 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 		if !f.authorized(w, r, "deno") {
 			return
 		}
-		slug, ok := f.denoSlugFor(parts[2])
+		org, slug, ok := f.denoSlugFor(parts[2])
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "project not found"})
 			return
 		}
 		f.record("deno", "delete", slug, r)
-		f.completeDelete("deno", slug)
+		f.completeDelete("deno", org, slug)
 		w.WriteHeader(http.StatusOK) // the spec's delete answers 200 with no body
 
 	default:
@@ -921,36 +1033,83 @@ func (f *fakeEdge) serveDeno(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// denoSlugFor resolves a project UUID back to its slug among the fake's deno
-// (or not-yet-typed, gate-armed) projects.
-func (f *fakeEdge) denoSlugFor(projectID string) (string, bool) {
+// denoSlugFor resolves a project UUID back to its (organization, slug) among
+// the fake's deno (or not-yet-typed, gate-armed) projects. A UUID is only
+// ever minted from this fake's list/create answers, so an unclaimed stub
+// matching the slug under the token's organization is adopted by the deploy —
+// the same claim rule the other platforms' routes use.
+func (f *fakeEdge) denoSlugFor(projectID string) (org, slug string, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for slug, p := range f.projects {
-		if (p.provider == "deno" || p.provider == "") && denoProjectID(slug) == projectID {
-			return slug, true
+	for _, p := range f.projects {
+		if (p.provider == "deno" || p.provider == "") && denoProjectID(p.scope, p.slug) == projectID {
+			return p.scope, p.slug, true
 		}
 	}
-	return "", false
+	// Unclaimed stub: it belongs to the org this fake's credential can see.
+	for key, p := range f.projects {
+		if (p.provider == "deno" || p.provider == "") && p.scope == "" &&
+			len(p.deploys) == 0 && len(p.deletes) == 0 && denoProjectID(e2eDenoOrgID, p.slug) == projectID {
+			p.scope = e2eDenoOrgID
+			delete(f.projects, key) // drop the stub's unscoped key: one key per project
+			f.projects[pkey("deno", e2eDenoOrgID, p.slug)] = p
+			return e2eDenoOrgID, p.slug, true
+		}
+	}
+	return "", "", false
 }
 
 // --- shared deploy/delete plumbing ---
 
-func (f *fakeEdge) lookup(provider, slug string) *fakeProject {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.projects[slug]
+// scoped resolves the project one platform call addresses: (provider, scope,
+// slug). A project created in one scope is invisible to another scope's API
+// — the platform property that makes a moved pin orphan its old deployment
+// instead of relocating it. An unclaimed stub (pre-registered by a test, or
+// a create that no deployment ever followed) is claimed by the first scope
+// that asks for its slug, so the arming helpers keep working unchanged; a
+// project with deploy or delete history is never relocated.
+func (f *fakeEdge) scoped(provider, scope, slug string) *fakeProject {
+	if p, ok := f.projects[pkey(provider, scope, slug)]; ok {
+		return p
+	}
+	for key, p := range f.projects {
+		if p.slug != slug {
+			continue
+		}
+		if p.provider != provider && p.provider != "" {
+			continue
+		}
+		if p.scope != scope && p.scope != "" {
+			continue // another scope's project: invisible here
+		}
+		if len(p.deploys) > 0 || len(p.deletes) > 0 {
+			continue // has history: never relocated across scopes
+		}
+		delete(f.projects, key)
+		p.provider, p.scope = provider, scope
+		f.projects[pkey(provider, scope, slug)] = p
+		return p
+	}
+	return nil
 }
 
-// waitGate marks the project existing (a deploy creates it), blocks while a
-// test-armed gate is held, and returns the project.
-func (f *fakeEdge) waitGate(provider, slug string) *fakeProject {
+func (f *fakeEdge) lookup(provider, scope, slug string) *fakeProject {
 	f.mu.Lock()
-	p, ok := f.projects[slug]
-	if !ok {
-		p = &fakeProject{provider: provider, slug: slug, sim: newSim(slug, simOK)}
-		f.projects[slug] = p
+	defer f.mu.Unlock()
+	return f.scoped(provider, scope, slug)
+}
+
+// waitGate resolves or creates the project a deploy addresses (a deploy
+// creates it), blocks while a test-armed gate is held, and returns the
+// project.
+func (f *fakeEdge) waitGate(provider, scope, slug string) *fakeProject {
+	f.mu.Lock()
+	p := f.scoped(provider, scope, slug)
+	if p == nil {
+		p = &fakeProject{provider: provider, slug: slug, scope: scope, sim: newSim(slug, simOK)}
+		f.projects[pkey(provider, scope, slug)] = p
 	}
+	f.live[slug] = p
 	gate := p.gate
 	f.mu.Unlock()
 	if gate != nil {
@@ -974,14 +1133,15 @@ func (f *fakeEdge) completeDeploy(p *fakeProject, version, token, source string,
 	p.rootRoutes = rootRoutes
 	p.deploys = append(p.deploys, deployRecord{Version: version, Token: token, Source: source, At: time.Now()})
 	p.sim.setDeployed(version, token)
+	f.live[p.slug] = p
 }
 
-func (f *fakeEdge) completeDelete(provider, slug string) {
+func (f *fakeEdge) completeDelete(provider, scope, slug string) {
 	f.mu.Lock()
-	p := f.projects[slug]
+	p := f.scoped(provider, scope, slug)
 	if p == nil {
-		p = &fakeProject{provider: provider}
-		f.projects[slug] = p
+		p = &fakeProject{provider: provider, slug: slug, scope: scope}
+		f.projects[pkey(provider, scope, slug)] = p
 	}
 	gate := p.deleteOp
 	p.exists = false

@@ -1,8 +1,10 @@
 package e2e
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -542,6 +544,211 @@ func TestE2E_MultiRelayAdmissionAndOrder(t *testing.T) {
 		disc[0].Auth != "Bearer "+ct {
 		t.Fatalf("cloudflare discover = %+v, want an authenticated call", disc)
 	}
+}
+
+// TestE2E_ScopeFlipReincarnatesTheRelay: moving a relay's provider scope pin
+// (the vercel team) under an unchanged name is a new identity, not an update.
+// Each flip bumps the generation and revokes admission first, drains the
+// request the OLD scope's worker still carries before anything deploys, then
+// creates a fresh deployment in the new scope — and leaves the old scope's
+// deployment orphaned on the platform: never addressed again, never deleted.
+// Flipping back never resurrects the orphan; the relay serves a third, fresh
+// deployment built in the original scope.
+func TestE2E_ScopeFlipReincarnatesTheRelay(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, vt := freshIdentity("scope")
+	fake.setToken("vercel", vt)
+	tokenFile := filepath.Join(t.TempDir(), "vercel-token")
+	if err := os.WriteFile(tokenFile, []byte(vt+"\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	relayWithTeam := func(team string) string {
+		return configYAML(relayBlock("v-rel", "vercel",
+			tokenFileLine(tokenFile)+"    team: "+team+"\n"))
+	}
+
+	g := startGateway(t, fake, gwOptions{key: key, config: relayWithTeam("team-a")})
+	g.waitForReady(t, 20*time.Second)
+	if row, ok := lifecycleOf(g.stats(t), "vercel", "v-rel"); !ok || row.State != "ready" || row.Generation != 1 {
+		t.Fatalf("lifecycle after admission = %+v (ok=%v), want ready generation 1", row, ok)
+	}
+	if n := fake.deployCountIn("vercel", "team-a", "v-rel"); n != 1 {
+		t.Fatalf("deploys in team-a = %d, want exactly 1", n)
+	}
+
+	// holdOneRequest parks one request inside the serving worker's sim — the
+	// request a flip's settle+drain barrier must wait for. The returned func
+	// releases it and waits for the answer: a flip drains the old scope's
+	// worker, it never cuts the request mid-flight.
+	holdOneRequest := func(marker string) (release func()) {
+		releaseHold := fake.project("v-rel").sim.blockMarker(marker)
+		done := make(chan error, 1)
+		go func() {
+			req, err := http.NewRequest(http.MethodPost, g.base+"/", bytes.NewReader([]byte("inflight")))
+			if err != nil {
+				done <- err
+				return
+			}
+			req.Header.Set("X-Relay-Target", echo.base)
+			req.Header.Set("X-Relay-Path", "/"+marker)
+			req.Header.Set("X-Marker", marker)
+			resp, err := relayClient.Do(req)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					err = fmt.Errorf("status %d", resp.StatusCode)
+				}
+			}
+			done <- err
+		}()
+		waitFor(t, 10*time.Second, "the in-flight request to reach the serving worker", func() bool {
+			return fake.project("v-rel").sim.markerSeen(marker)
+		})
+		return func() {
+			releaseHold()
+			waitFor(t, 10*time.Second, "the drained request to answer", func() bool {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("in-flight request failed: %v", err)
+					}
+					return true
+				default:
+					return false
+				}
+			})
+		}
+	}
+
+	// flip moves the pin to the next team and returns once the relay has
+	// reincarnated: generation wantGen with admission revoked, while the
+	// still-held request keeps the barrier closed — no deploy may even be
+	// received in the new scope. (The discovery pass relabels the entry
+	// discovered/missing microseconds after the flip's configured/
+	// scope_changed, so the label is not observable; the generation and the
+	// orphan warning are.)
+	flip := func(next string, wantGen uint64) (releaseDeploy func()) {
+		releaseDeploy = fake.armFreshDeployGate("v-rel")
+		g.writeConfig(relayWithTeam(next))
+		g.waitForStats(t, 15*time.Second, "the "+next+" flip to reincarnate the relay", func(d *statsDoc) bool {
+			r, ok := lifecycleOf(d, "vercel", "v-rel")
+			return ok && r.Generation == wantGen && r.State != "ready"
+		})
+		// The flip warns about the orphan it leaves behind — scopes named by
+		// fingerprint, never by the pin value the credential resolved.
+		log := g.logDump()
+		if !strings.Contains(log, "relay scope changed") ||
+			!strings.Contains(log, "previous_scope") {
+			t.Fatalf("the %s flip logged no orphaned-deployment warning", next)
+		}
+		for _, pin := range []string{"team-a", "team-b"} {
+			if strings.Contains(log, pin) {
+				t.Fatalf("the %s flip logged the raw pin value, not its fingerprint", next)
+			}
+		}
+		// The identity changed before any new deployment exists: the pool
+		// serves nothing even though the old scope's worker still answers.
+		resp, _ := g.do(t, http.MethodGet, "/readyz", nil, nil)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("/readyz mid-flip = %d, want 503", resp.StatusCode)
+		}
+		if doc := g.stats(t); len(doc.Relays) != 0 {
+			t.Fatalf("pool mid-flip = %+v, want nothing serving", doc.Relays)
+		}
+		// The deploy is gated anyway; the fake records the call the moment it
+		// arrives, so a regression that deploys while the drain waits cannot
+		// pass on a technicality. Boot admission accounts for generation 1.
+		time.Sleep(700 * time.Millisecond)
+		if n := len(fake.callsFor("vercel", "deploy")); n != int(wantGen)-1 {
+			t.Fatalf("deploy calls received after the %s flip = %d, want %d (settle and drain precede any deploy)",
+				next, n, int(wantGen)-1)
+		}
+		if n := fake.deployCountIn("vercel", next, "v-rel"); n != 0 {
+			t.Fatalf("deploys completed in %s = %d, want 0 while the drain waits", next, n)
+		}
+		return releaseDeploy
+	}
+
+	// relay marker lands in exactly one scope's worker sim — after a flip,
+	// only in the new scope's.
+	markerServedBy := func(marker, scope string) {
+		t.Helper()
+		resp, body := g.do(t, http.MethodPost, "/", map[string]string{
+			"X-Relay-Target": echo.base, "X-Relay-Path": "/" + marker, "X-Marker": marker,
+		}, []byte("after"))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request after the flip = %d (%s)", resp.StatusCode, body)
+		}
+		if !fake.projectIn("vercel", scope, "v-rel").sim.markerSeen(marker) {
+			t.Fatalf("marker %s never reached the %s worker", marker, scope)
+		}
+		for _, other := range []string{"team-a", "team-b"} {
+			if other == scope {
+				continue
+			}
+			if fake.projectIn("vercel", other, "v-rel") != nil &&
+				fake.projectIn("vercel", other, "v-rel").sim.markerSeen(marker) {
+				t.Fatalf("marker %s reached the %s worker — the old scope is still being served", marker, other)
+			}
+		}
+	}
+
+	// --- flip one: team-a → team-b, under one in-flight request ---
+	releaseA := holdOneRequest("hold-a")
+	releaseDeployB := flip("team-b", 2)
+	releaseA()
+	if n := len(echo.requests()); n != 1 {
+		t.Fatalf("echo requests = %d, want 1: the drained request answered exactly once", n)
+	}
+	releaseDeployB()
+	g.waitForStats(t, 15*time.Second, "the team-b worker to admit", func(d *statsDoc) bool {
+		r, ok := lifecycleOf(d, "vercel", "v-rel")
+		return ok && r.State == "ready" && r.Generation == 2
+	})
+	if n := fake.deployCountIn("vercel", "team-b", "v-rel"); n != 1 {
+		t.Fatalf("deploys in team-b = %d, want exactly 1 fresh deploy for the flip", n)
+	}
+	// The old scope's deployment is orphaned, never deleted: the gateway
+	// addresses only the scope it pins now.
+	if !fake.projectExistsIn("vercel", "team-a", "v-rel") || fake.deleteCountIn("vercel", "team-a", "v-rel") != 0 {
+		t.Fatalf("team-a after the flip: exists=%v deletes=%d, want the orphan still present, never deleted",
+			fake.projectExistsIn("vercel", "team-a", "v-rel"), fake.deleteCountIn("vercel", "team-a", "v-rel"))
+	}
+	markerServedBy("post-b", "team-b")
+
+	// The documented remediation for an orphan: remove it by hand on the
+	// platform console. The fake drops it with no API call — nothing the
+	// gateway does may reach the old scope.
+	fake.removeProjectManually("vercel", "team-a", "v-rel")
+
+	// --- flip two: team-b → team-a, same discipline, no orphan reuse ---
+	releaseB := holdOneRequest("hold-b")
+	releaseDeployA := flip("team-a", 3)
+	releaseB()
+	releaseDeployA()
+	g.waitForStats(t, 15*time.Second, "the team-a replacement to admit", func(d *statsDoc) bool {
+		r, ok := lifecycleOf(d, "vercel", "v-rel")
+		return ok && r.State == "ready" && r.Generation == 3
+	})
+	if n := fake.deployCountIn("vercel", "team-a", "v-rel"); n != 1 {
+		t.Fatalf("deploys in team-a = %d, want exactly 1 fresh deploy for the flip back", n)
+	}
+	if n := fake.deployCountIn("vercel", "team-b", "v-rel") + fake.deployCountIn("vercel", "team-a", "v-rel"); n != 2 {
+		t.Fatalf("total flip deploys = %d, want 2 (one fresh deployment per flip)", n)
+	}
+	if !fake.projectExistsIn("vercel", "team-b", "v-rel") ||
+		fake.deleteCountIn("vercel", "team-b", "v-rel") != 0 {
+		t.Fatalf("team-b after the flip back: exists=%v deletes=%d, want the orphan still present, never deleted",
+			fake.projectExistsIn("vercel", "team-b", "v-rel"), fake.deleteCountIn("vercel", "team-b", "v-rel"))
+	}
+	markerServedBy("post-a", "team-a")
+
+	if strings.Contains(g.logDump(), "in-flight drain timed out") {
+		t.Fatal("a flip waited out the drain timeout; the barrier must see the held request answer")
+	}
+	g.scanLog(t, fake)
 }
 
 func equalStrings(got, want []string) bool {
