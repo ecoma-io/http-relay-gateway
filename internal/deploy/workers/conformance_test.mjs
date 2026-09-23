@@ -60,6 +60,89 @@ async function withUpstream(run, resHeaders) {
   }
 }
 
+// Streaming upstream for the SSE cases: it answers 200 with the given
+// headers and writes every string the frame generator yields, flushing per
+// write. An await inside the generator leaves the origin silent while the
+// relay is already serving — which is exactly the window the heartbeat
+// cases observe. (withUpstream above buffers its request and answers in one
+// write; this one stays open.)
+async function withStreamUpstream(resHeaders, frame, run) {
+  const upstream = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { ...resHeaders });
+    (async () => {
+      for await (const chunk of frame()) {
+        res.write(chunk);
+        if (typeof res.flush === "function") res.flush();
+      }
+      res.end();
+    })().catch(() => {});
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  try {
+    return await run(`http://127.0.0.1:${upstream.address().port}`);
+  } finally {
+    upstream.closeAllConnections?.();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+}
+
+// readUntil pulls from a relayed body until want(text) holds and returns
+// everything read up to that point. A bounded wait turns a relay that
+// buffered, swallowed or stalled a write into a reported observation instead
+// of a hung suite.
+async function readUntil(reader, want, what, timeoutMs = 3000) {
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  let text = "";
+  for (;;) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`timed out waiting for ${what}; saw ${JSON.stringify(text)}`);
+    let timer;
+    const expired = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`timed out waiting for ${what}; saw ${JSON.stringify(text)}`)),
+        left,
+      );
+      timer.unref?.();
+    });
+    let result;
+    try {
+      result = await Promise.race([reader.read(), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (result.done) return { text, done: true };
+    text += decoder.decode(result.value, { stream: true });
+    if (want(text)) return { text, done: false };
+  }
+}
+
+// The comment line the worker emits, and the fast interval its cases run on:
+// the timing cases hold the origin silent for a few intervals and read what
+// crossed the relay meanwhile, so the interval stays small enough to keep
+// the suite quick while leaving the default (15000ms) untouched.
+const SSE_PING = ": relay-ping\n\n";
+const SSE_PING_MS = 25;
+const sseEnv = { ...env, RELAY_SSE_PING_MS: String(SSE_PING_MS) };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// sseRequest targets the streaming upstream; marker selects one origin gate.
+function sseRequest(upstreamBase) {
+  return relayRequest("/x", {
+    headers: {
+      "x-relay-token": env.RELAY_AUTH_TOKEN,
+      "x-relay-target": upstreamBase,
+      "x-relay-path": "/sse",
+    },
+  });
+}
+
+// stripPings removes every heartbeat comment from a relayed SSE body, which
+// must leave exactly the bytes the upstream wrote.
+const stripPings = (text) => text.split(SSE_PING).join("");
+
 for (const platform of PLATFORMS) {
   const mod = await loadEntry(platform);
 
@@ -279,5 +362,166 @@ for (const platform of PLATFORMS) {
     );
     assert.equal(res.status, 502);
     assert.deepEqual(await res.json(), { error: "upstream fetch failed" });
+  });
+
+  test(`${platform}: a silent SSE upstream is kept alive by heartbeat comments`, async () => {
+    let release;
+    const parked = new Promise((resolve) => (release = resolve));
+    await withStreamUpstream(
+      { "content-type": "text/event-stream" },
+      async function* () {
+        yield "data: one\n\n";
+        // Silent for as long as the test likes: the origin is parked, so
+        // anything that arrives now was emitted by the relay.
+        await parked;
+        yield "data: two\n\n";
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseRequest(upstreamBase), sseEnv);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "text/event-stream");
+
+        const reader = res.body.getReader();
+        const first = await readUntil(reader, (text) => text.includes(SSE_PING), "a heartbeat");
+        assert.ok(first.text.includes(SSE_PING), `no heartbeat while the upstream was silent`);
+        // The upstream is still parked: the comment crossed the relay
+        // without the origin having written anything else.
+        assert.ok(
+          !first.text.includes("data: two"),
+          `the upstream's second chunk arrived before it was released: ${JSON.stringify(first.text)}`,
+        );
+
+        release();
+        const rest = await readUntil(reader, () => false, "the stream to end");
+        assert.ok(rest.done, "the relayed stream did not end with the upstream");
+        const body = first.text + rest.text;
+
+        // The upstream's own bytes are all present, unmodified and in order;
+        // nothing else but heartbeat comments joined them; and nothing was
+        // appended after the upstream's last byte.
+        assert.equal(stripPings(body), "data: one\n\ndata: two\n\n");
+        assert.ok(body.endsWith("data: two\n\n"), `bytes follow the upstream's last byte: ${body}`);
+      },
+    );
+  });
+
+  test(`${platform}: a non-SSE body is relayed byte-for-byte`, async () => {
+    // The body IS the heartbeat text: an injection on a non-SSE response
+    // would show up as added bytes, not as a needle in a haystack.
+    const body = SSE_PING + "plain body\n";
+    await withStreamUpstream(
+      { "content-type": "text/plain" },
+      async function* () {
+        yield body;
+        await sleep(4 * SSE_PING_MS);
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseRequest(upstreamBase), sseEnv);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "text/plain");
+        assert.equal(await res.text(), body);
+      },
+    );
+  });
+
+  test(`${platform}: an SSE body with a content-encoding is relayed byte-for-byte`, async () => {
+    // An encoded body must never be touched — the gateway deliberately never
+    // decodes relay traffic, so an injected byte would corrupt it. The guard
+    // is the header's presence, whatever its value; the body below carries
+    // the heartbeat text itself, so an injection would be visible as added
+    // bytes. (identity keeps the comparison byte-exact: Node's fetch decodes
+    // gzip/br/zstd before the worker's guard ever sees the body, so those
+    // codings would hide what the worker actually forwarded.)
+    const body = "data: one\n\n" + SSE_PING + "data: two\n\n";
+    await withStreamUpstream(
+      { "content-type": "text/event-stream", "content-encoding": "identity" },
+      async function* () {
+        yield body;
+        await sleep(4 * SSE_PING_MS);
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseRequest(upstreamBase), sseEnv);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-encoding"), "identity");
+        assert.equal(await res.text(), body);
+      },
+    );
+  });
+
+  test(`${platform}: a bodyless response is relayed, never wrapped`, async () => {
+    // The sharpest shape: a 204 that still carries the SSE content type has
+    // nothing to wrap, and wrapping it would throw (a Response with a body
+    // cannot hold a null-body status) — the wrap is gated on the body, so
+    // the 204 relays as itself.
+    const upstream = createServer((req, res) => {
+      req.resume();
+      res.writeHead(204, { "content-type": "text/event-stream" });
+      res.end();
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${upstream.address().port}`;
+      const res = await mod.handle(sseRequest(base), sseEnv);
+      assert.equal(res.status, 204);
+      assert.equal(res.headers.get("content-type"), "text/event-stream");
+      assert.equal(await res.text(), "");
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+
+  test(`${platform}: an upstream that breaks mid-stream errors the relayed body`, async () => {
+    const upstream = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: one\n\n");
+      if (typeof res.flush === "function") res.flush();
+      // Cut the connection mid-body: no terminating chunk ever follows, so
+      // the relayed stream must fail rather than close cleanly — that error
+      // is the mid-stream classification the gateway relies on.
+      setTimeout(() => res.socket?.destroy(), 50);
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${upstream.address().port}`;
+      const res = await mod.handle(sseRequest(base), sseEnv);
+      assert.equal(res.status, 200);
+      let failed = null;
+      try {
+        await res.text();
+      } catch (err) {
+        failed = err;
+      }
+      assert.ok(
+        failed !== null,
+        "the relayed body ended cleanly after the upstream broke mid-stream",
+      );
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+
+  test(`${platform}: no heartbeat is emitted after the upstream's final byte`, async () => {
+    await withStreamUpstream(
+      { "content-type": "text/event-stream" },
+      async function* () {
+        yield "data: start\n\n";
+        // Silent long enough for several heartbeats to have gone out, so the
+        // final assertion below is about the end of the stream, not about a
+        // heartbeat that never happened.
+        await sleep(4 * SSE_PING_MS);
+        yield "data: end\n\n";
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseRequest(upstreamBase), sseEnv);
+        assert.equal(res.status, 200);
+        const text = await res.text();
+        assert.ok(text.includes(SSE_PING), "the heartbeat never fired, so the case proves nothing");
+        assert.equal(stripPings(text), "data: start\n\ndata: end\n\n");
+        assert.ok(text.endsWith("data: end\n\n"), `bytes follow the upstream's last byte: ${text}`);
+      },
+    );
   });
 }

@@ -79,7 +79,17 @@ Authorization: Bearer $TARGET_TOKEN
   relays healthy the served sequence is exactly pool order — sorted by
   `(provider, name)` — so tests can pin exact sequences.
 - Responses stream straight through with a flush per write, so SSE chunks
-  reach the client immediately.
+  reach the client immediately. The one exception lives in the relay worker,
+  not here: a `text/event-stream` response that carries **no**
+  `content-encoding` gets an SSE comment line (`: relay-ping`) after 15 s of
+  upstream silence — the worker's `SSE_PING_MS`, overridable through the
+  worker env `RELAY_SSE_PING_MS` (a hook the conformance suite uses to time
+  the case; no deployer sets it). A stream whose origin is thinking, not
+  writing, is byte-silent, and an internal LB read timeout, a Cloudflare
+  zone proxy read timeout or a platform lifecycle rule would reap it. The
+  comment is SSE grammar, not data — no parser surfaces it as an event — it
+  stops with the stream, an encoded body is never touched (the gateway never
+  decodes relay traffic), and every other response is relayed byte for byte.
 - Failover happens only while the failure is still a transport error
   (before any response byte). Once the relay answered, the response is
   never retried. A body that dies mid-stream is recorded against the relay

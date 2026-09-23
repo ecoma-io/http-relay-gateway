@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -1491,6 +1492,30 @@ type echoServer struct {
 
 	mu   sync.Mutex
 	reqs []echoRecord
+	sse  map[string]*sseGate
+}
+
+// sseGate parks one /sse response on each step the test releases, so a test
+// can prove a write crossed the whole chain before the origin wrote anything
+// else. The buffer holds every step a case may send, so the test can never
+// deadlock on a gate the origin already abandoned.
+type sseGate struct{ steps chan struct{} }
+
+func newSSEGate(steps int) *sseGate { return &sseGate{steps: make(chan struct{}, steps)} }
+
+// step releases the origin's next write.
+func (g *sseGate) step() { g.steps <- struct{}{} }
+
+// next waits for the test's step, or for the request to end.
+func (g *sseGate) next(ctx context.Context) bool {
+	select {
+	case <-g.steps:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-time.After(20 * time.Second):
+		return false
+	}
 }
 
 func newEcho(t *testing.T) *echoServer {
@@ -1498,11 +1523,22 @@ func newEcho(t *testing.T) *echoServer {
 	if err != nil {
 		t.Fatalf("echo listen: %v", err)
 	}
-	e := &echoServer{base: "http://" + ln.Addr().String(), ln: ln}
+	e := &echoServer{base: "http://" + ln.Addr().String(), ln: ln, sse: map[string]*sseGate{}}
 	e.srv = &http.Server{Handler: http.HandlerFunc(e.handle), ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = e.srv.Serve(ln) }()
 	t.Cleanup(func() { _ = e.srv.Close() })
 	return e
+}
+
+// holdSSE arms the gate for one marker: the next /sse request carrying it
+// answers with the first comment, then waits for a step before writing the
+// second, and for another before ending. The returned gate carries the steps.
+func (e *echoServer) holdSSE(marker string) *sseGate {
+	g := newSSEGate(2)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sse[marker] = g
+	return g
 }
 
 func (e *echoServer) handle(w http.ResponseWriter, r *http.Request) {
@@ -1517,7 +1553,13 @@ func (e *echoServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	e.mu.Lock()
 	e.reqs = append(e.reqs, rec)
+	gate := e.sse[r.Header.Get("X-Marker")]
 	e.mu.Unlock()
+
+	if r.URL.Path == "/sse" {
+		e.serveSSE(w, r, gate)
+		return
+	}
 
 	w.Header().Set("X-Echo", "e2e")
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1555,6 +1597,44 @@ func (e *echoServer) lastRequest() (echoRecord, bool) {
 		return echoRecord{}, false
 	}
 	return e.reqs[len(e.reqs)-1], true
+}
+
+// The comment-only body the SSE origin serves. Comment lines are the SSE
+// grammar's own heartbeat: an origin emits them to keep a stream that is
+// thinking, not writing, alive across hops that measure bytes.
+const (
+	sseOpen = ": origin-open\n\n"
+	sseLate = ": origin-late\n\n"
+)
+
+// serveSSE answers one held SSE response: one comment per write with a flush,
+// parked on the gate's steps between the writes. A test reads the comment
+// that crossed the relay while the origin was still parked on the next step,
+// which is what "no hop buffered it" means on the wire.
+func (e *echoServer) serveSSE(w http.ResponseWriter, r *http.Request, gate *sseGate) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	fl, _ := w.(http.Flusher)
+	write := func(comment string) {
+		_, _ = io.WriteString(w, comment)
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+
+	write(sseOpen)
+	if gate == nil {
+		write(sseLate)
+		return
+	}
+	if !gate.next(r.Context()) {
+		return
+	}
+	write(sseLate)
+	if !gate.next(r.Context()) {
+		return
+	}
 }
 
 // parsedEcho decodes one echo answer body.
