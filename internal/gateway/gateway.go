@@ -153,13 +153,16 @@ func New(st *State, version, relayVersion string, log zerolog.Logger) *Gateway {
 // for the drain: when Swap returns, every request that will still use the
 // old pool is already counted in inflight, so an AwaitIdle call after Swap
 // cannot miss one. The outgoing client's idle connections are closed so a
-// timeout-settings change does not strand pooled keep-alive sockets;
-// in-flight requests on the old client finish untouched.
+// timeout-settings change does not strand pooled keep-alive sockets — but
+// only when the state actually changes the client: a cached client
+// (ClientCache) is shared across generations, and closing its idle conns on
+// every swap would erase the keep-alive pool the cache exists to preserve.
+// In-flight requests on the old client finish untouched.
 func (g *Gateway) Swap(st *State) {
 	g.mu.Lock()
 	old := g.st.Swap(st)
 	g.mu.Unlock()
-	if old != nil && old.Client != nil {
+	if old != nil && st != nil && old.Client != nil && old.Client != st.Client {
 		old.Client.CloseIdleConnections()
 	}
 }
