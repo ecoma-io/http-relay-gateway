@@ -265,7 +265,9 @@ func TestScopeFlipDiscardsInFlightCompletions(t *testing.T) {
 // A pass whose credential resolution failed claims no scope, and Sync must
 // not read that as a flip: an unrelated credential hiccup may not evict
 // every pinned relay. The first resolved scope after unknown ones is a
-// baseline too, never a change.
+// baseline too, never a change — and that baseline is live: a later real
+// move against it flips, bumping the generation and (when the relay was
+// serving at the move) revoking admission and raising the drain marker.
 func TestSyncUnknownScopeNeverFlips(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
@@ -310,9 +312,39 @@ func TestSyncUnknownScopeNeverFlips(t *testing.T) {
 	if r.IsReady(keyA) {
 		t.Fatal("the real flip must revoke admission")
 	}
-	// keyB never moved, so it stays on its first incarnation, still serving.
+	// keyB still has not moved, so it stays on its first incarnation.
 	if got := generationOf(t, r, keyB); got != 1 {
 		t.Fatalf("keyB generation = %d, want 1", got)
+	}
+
+	// The adopted baseline is live, not an armistice: keyB's first real move
+	// flips too. Without admission the flip only bumps the incarnation.
+	r.Sync(fleet(pinned(keyA, "team-b"), pinned(keyB, "org-b")))
+	if got := generationOf(t, r, keyB); got != 2 {
+		t.Fatalf("keyB generation = %d, want 2 (the adopted baseline still flips)", got)
+	}
+	if r.TakeScopeChanged(keyB, 2) {
+		t.Fatal("a flip without admission must not raise the drain marker")
+	}
+
+	// The serving variant: admitted at org-b, then moved to org-c — the flip
+	// revokes admission, labels the reason, and raises the barrier marker.
+	genB := admit(t, r, keyB, "https://beta.example", "rk")
+	if genB != 2 {
+		t.Fatalf("keyB admitted at generation %d, want 2", genB)
+	}
+	r.Sync(fleet(pinned(keyA, "team-b"), pinned(keyB, "org-c")))
+	if got := generationOf(t, r, keyB); got != genB+1 {
+		t.Fatalf("keyB generation = %d, want %d (a serving flip is a new incarnation)", got, genB+1)
+	}
+	if r.IsReady(keyB) || r.ReadyCount() != 0 {
+		t.Fatal("a serving flip must revoke admission")
+	}
+	if rec, _ := r.StateOf(keyB); rec.Reason != ReasonScopeChanged {
+		t.Fatalf("reason = %q, want %q", rec.Reason, ReasonScopeChanged)
+	}
+	if !r.TakeScopeChanged(keyB, genB+1) {
+		t.Fatal("a serving flip must raise the drain marker")
 	}
 }
 

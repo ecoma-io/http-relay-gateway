@@ -354,14 +354,21 @@ func (r *Registry) Sync(members []Member) {
 			r.notifyLocked()
 			continue
 		}
-		// Present and continuing. A scope that actually moved is a new
-		// incarnation under the same name — the deployment the pins used to
-		// address is a different project from the one they address now.
-		// Admission is revoked FIRST (the old scope's verification must not
-		// serve the new scope's identity for even one more request), then
-		// the generation bump discards everything this incarnation had in
-		// flight.
-		if m.ScopeKnown && e.scopeKnown && m.Scope != e.scope {
+		// Present and continuing. Two scope rules run here. Baseline
+		// adoption first: an entry whose scope has never resolved (an entry
+		// created from a credential-hiccup pass) records the first resolved
+		// scope as its baseline — no generation bump and no notification,
+		// because nothing operator-facing changes and no admission or
+		// in-flight work exists to protect. Only a LATER move against that
+		// known baseline is a new incarnation under the same name — the
+		// deployment the pins used to address is a different project from
+		// the one they address now. Such a flip revokes admission FIRST (the
+		// old scope's verification must not serve the new scope's identity
+		// for even one more request), then the generation bump discards
+		// everything this incarnation had in flight.
+		if m.ScopeKnown && !e.scopeKnown {
+			e.scope, e.scopeKnown, e.scopeFP = m.Scope, true, fp // first resolution is a baseline, not a change
+		} else if m.ScopeKnown && e.scopeKnown && m.Scope != e.scope {
 			wasServing := e.serving
 			if e.serving {
 				e.serving = false
