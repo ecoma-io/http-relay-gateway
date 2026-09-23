@@ -1180,6 +1180,7 @@ const (
 	simStale           = "staleVersion"    // worker answers an old version
 	simProbe500        = "probeFailed"     // worker forwards, upstream leg fails (its 502)
 	simResetLeg        = "resetLeg"        // relay leg accepted then reset without an answer
+	simSSEOpen         = "sseOpen"         // worker opens an SSE caller's response on the origin's behalf
 )
 
 // hopByHop mirrors the connection-scoped header set the worker strips.
@@ -1378,6 +1379,16 @@ func (s *simState) serveHTTP(w http.ResponseWriter, r *http.Request, f *fakeEdge
 		time.Sleep(45 * time.Second)
 		return
 	}
+	if mode == simSSEOpen && acceptsEventStream(r) {
+		// Mirrors core.js's early-open: an SSE caller who has not met the
+		// grace is answered by the worker's own opened stream (200 + the
+		// marker comment) the moment the grace runs out — the origin's body
+		// feeds through as it settles. The gate never catches the probes:
+		// ForwardProbe sends no Accept header, so a probing request skips this
+		// branch and the ordinary forward leg runs instead.
+		s.serveSSEOpen(w, r)
+		return
+	}
 
 	if release != nil {
 		select {
@@ -1389,9 +1400,21 @@ func (s *simState) serveHTTP(w http.ResponseWriter, r *http.Request, f *fakeEdge
 	s.forward(w, r)
 }
 
+// acceptsEventStream answers whether the caller asked for text/event-stream
+// — the same inbound Accept gate the worker's early-open keys on.
+func acceptsEventStream(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		mt := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if strings.EqualFold(mt, "text/event-stream") {
+			return true
+		}
+	}
+	return false
+}
+
 // forward mirrors the worker's relay leg: validate the target, pin the path
-// to the target origin, strip relay-spec and hop-by-hop headers, stream the
-// body up and the response back; an upstream transport failure is a 502.
+// to the target origin, then hand off to forwardUpstream. An upstream
+// transport failure is a 502.
 func (s *simState) forward(w http.ResponseWriter, r *http.Request) {
 	target := r.Header.Get("X-Relay-Target")
 	tu, err := url.Parse(target)
@@ -1413,7 +1436,15 @@ func (s *simState) forward(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "x-relay-path must stay on the target origin"})
 		return
 	}
+	s.forwardUpstream(w, r, up)
+}
 
+// forwardUpstream builds one forward request from a validated upstream:
+// strip the relay-spec and hop-by-hop headers, stream the body up and the
+// raw response back with per-read flushes, exactly like the worker's relay
+// leg. It writes the upstream's status and headers into w first, then
+// streams the body, flushing every read.
+func (s *simState) forwardUpstream(w http.ResponseWriter, r *http.Request, up *url.URL) {
 	var body io.Reader
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		body = r.Body
@@ -1473,6 +1504,178 @@ func (s *simState) forward(w http.ResponseWriter, r *http.Request) {
 // sharedSimClient carries the sims' inner forwarding fetches.
 var sharedSimClient = &http.Client{Timeout: 30 * time.Second}
 
+// The marker bytes the worker's early-open writes, and the grace it waits
+// before opening an SSE caller's response on the origin's behalf. Sized for
+// the e2e suite's fast clock, never for production.
+const (
+	sseOpenMarker = ": relay-open\n\n"
+	sseOpenGrace  = 150 * time.Millisecond
+)
+
+// serveSSEOpen mirrors core.js's early-open branch (the sim is the worker
+// for the e2e suite): for an SSE caller — the Accept gate is checked by the
+// caller — commit HTTP 200 with the marker comment at the grace mark, then
+// forward the origin's actual response when it settles (status, headers and
+// a flush-per-read body) so the real origin's bytes ride on the opened
+// response. An origin transport failure errors the opened stream instead of
+// answering a status. A settled origin with no body (a 204) just ends the
+// stream.
+func (s *simState) serveSSEOpen(w http.ResponseWriter, r *http.Request) {
+	target := r.Header.Get("X-Relay-Target")
+	tu, err := url.Parse(target)
+	if err != nil || tu.Host == "" || (tu.Scheme != "http" && tu.Scheme != "https") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "x-relay-target must be an absolute http(s) URL"})
+		return
+	}
+	relayPath := r.Header.Get("X-Relay-Path")
+	if relayPath == "" {
+		relayPath = "/"
+	}
+	pu, err := url.Parse(relayPath)
+	if err != nil || pu.Host != "" || strings.HasPrefix(pu.Path, "//") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "x-relay-path must stay on the target origin"})
+		return
+	}
+	up := tu.ResolveReference(pu)
+	if up.Host != tu.Host || up.Scheme != tu.Scheme {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "x-relay-path must stay on the target origin"})
+		return
+	}
+
+	// The fetch starts now, in the background — exactly like core.js's race.
+	type upstreamResult struct {
+		resp *http.Response
+		err  error
+	}
+	settled := make(chan upstreamResult, 1)
+	go func() {
+		resp, rerr := sharedSimClient.Do(forwardRequest(r, up))
+		settled <- upstreamResult{resp: resp, err: rerr}
+	}()
+
+	// The grace decides whether the origin is already silent enough to
+	// deserve an opened response: when it expires first, commit 200 + the
+	// marker NOW and let the origin's body feed through as it settles. When
+	// the origin answered first, hand off to the ordinary leg unchanged.
+	select {
+	case got := <-settled:
+		if got.err == nil && got.resp != nil {
+			defer func() { _ = got.resp.Body.Close() }()
+		}
+		// Like the real branch (Promise.race then pending.then): the origin
+		// won, so the legacy path relays the settled response verbatim.
+		relaySettled(w, got.resp, got.err)
+		return
+	case <-time.After(sseOpenGrace):
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	fl, _ := w.(http.Flusher)
+	if _, werr := w.Write([]byte(sseOpenMarker)); werr != nil {
+		return
+	}
+	if fl != nil {
+		fl.Flush()
+	}
+
+	got := <-settled
+	if got.err != nil || got.resp == nil {
+		// The opened stream holds a 200; an origin that refused (or never
+		// answered) ends it broken, never as a status and never cleanly. The
+		// connection ends — the gateway records a mid-stream failure, not a
+		// success.
+		return
+	}
+	defer func() { _ = got.resp.Body.Close() }()
+	if got.resp.Body == nil {
+		return // the origin genuinely answered with no body
+	}
+	// The origin's real body, live: this loop only stops when the origin ends
+	// the response, and any read error ends the stream without a clean close —
+	// the gateway still records a mid-stream failure, not a success.
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := got.resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
+// relaySettled relays the origin-settled outcome exactly like the ordinary
+// forward leg: the response's own status and headers, streamed with a
+// flush-per-read body, or a 502 on a transport failure.
+func relaySettled(w http.ResponseWriter, resp *http.Response, forwErr error) {
+	if forwErr != nil || resp == nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream fetch failed"})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	for k, vv := range resp.Header {
+		if hopByHop[http.CanonicalHeaderKey(k)] || http.CanonicalHeaderKey(k) == "Content-Length" {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	fl, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
+// forwardRequest builds the inner forward request for one relay-spec ingress
+// the way forwardUpstream does, so the early-open branch forwards the origin
+// with the same stripping and streaming as the ordinary leg. forwardUpstream
+// and forwardRequest share the strip; forwardRequest exists so the opening
+// branch can forward outside the response writer's goroutine.
+func forwardRequest(r *http.Request, up *url.URL) *http.Request {
+	var body io.Reader
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		body = r.Body
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, up.String(), body)
+	if err != nil {
+		return nil
+	}
+	for k, vv := range r.Header {
+		ck := http.CanonicalHeaderKey(k)
+		if hopByHop[ck] || ck == "Host" || ck == "Content-Length" ||
+			ck == "X-Relay-Target" || ck == "X-Relay-Path" ||
+			ck == "X-Relay-Provider" || ck == "X-Relay-Token" {
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	return req
+}
+
 // --- echo upstream ---
 
 type echoRecord struct {
@@ -1490,10 +1693,19 @@ type echoServer struct {
 	srv  *http.Server
 	ln   net.Listener
 
-	mu   sync.Mutex
-	reqs []echoRecord
-	sse  map[string]*sseGate
+	mu    sync.Mutex
+	reqs  []echoRecord
+	sse   map[string]*sseGate
+	quiet map[string]*quietGate
 }
+
+// quietGate parks one /sse response before it writes anything — not even the
+// response headers — so a test can prove the relay opened the response on the
+// origin's behalf: while the gate is parked no origin byte exists anywhere.
+// The buffer holds the single release, so it can never block.
+type quietGate struct{ ch chan struct{} }
+
+func (q *quietGate) release() { q.ch <- struct{}{} }
 
 // sseGate parks one /sse response on each step the test releases, so a test
 // can prove a write crossed the whole chain before the origin wrote anything
@@ -1523,7 +1735,7 @@ func newEcho(t *testing.T) *echoServer {
 	if err != nil {
 		t.Fatalf("echo listen: %v", err)
 	}
-	e := &echoServer{base: "http://" + ln.Addr().String(), ln: ln, sse: map[string]*sseGate{}}
+	e := &echoServer{base: "http://" + ln.Addr().String(), ln: ln, sse: map[string]*sseGate{}, quiet: map[string]*quietGate{}}
 	e.srv = &http.Server{Handler: http.HandlerFunc(e.handle), ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = e.srv.Serve(ln) }()
 	t.Cleanup(func() { _ = e.srv.Close() })
@@ -1541,6 +1753,18 @@ func (e *echoServer) holdSSE(marker string) *sseGate {
 	return g
 }
 
+// holdQuietSSE arms one /sse request carrying marker to answer nothing until
+// release(): no headers, no body — the origin refused to speak at all. The
+// test reads the marker the relay opened on its behalf before releasing the
+// origin, then releases it and reads the origin's own bytes.
+func (e *echoServer) holdQuietSSE(marker string) *quietGate {
+	q := &quietGate{ch: make(chan struct{}, 1)}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.quiet[marker] = q
+	return q
+}
+
 func (e *echoServer) handle(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20))
 	_ = r.Body.Close()
@@ -1551,12 +1775,31 @@ func (e *echoServer) handle(w http.ResponseWriter, r *http.Request) {
 	if len(raw) <= 64<<10 {
 		rec.Body = string(raw)
 	}
+	marker := r.Header.Get("X-Marker")
 	e.mu.Lock()
 	e.reqs = append(e.reqs, rec)
-	gate := e.sse[r.Header.Get("X-Marker")]
+	gate := e.sse[marker]
+	quiet := e.quiet[marker]
 	e.mu.Unlock()
 
 	if r.URL.Path == "/sse" {
+		if quiet != nil {
+			// The origin holds back its entire answer — no headers, no body —
+			// until the test releases it. Only bytes the RELAY invented can
+			// cross to the caller before that. When the caller leaves first
+			// the handler returns without ever answering. Once released the
+			// origin writes ONE comment and ends — a distinct tail, so the
+			// test can tell the origin's bytes from the relay's marker.
+			select {
+			case <-quiet.ch:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, sseLate)
+			return
+		}
 		e.serveSSE(w, r, gate)
 		return
 	}

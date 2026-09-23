@@ -221,6 +221,85 @@ func TestE2E_SSEStreamsThroughWithAFlushPerWrite(t *testing.T) {
 	}
 }
 
+// TestE2E_SSEOriginSilentPastGraceOpensEarly pins the early-open contract on
+// the wire: an SSE caller whose origin has not answered inside the grace
+// receives the worker's 200 and the ": relay-open" comment BEFORE any origin
+// byte exists — the gateway relays a byte the worker invented. The origin is
+// held quiet (no headers at all) past the grace, so the marker can only be
+// sitting at the head of a stream that no hop buffered. The gateway needs
+// nothing from the marker: it forwards it like any relayed byte, and the
+// caller's read proves the response was already open while the origin was
+// still silent.
+func TestE2E_SSEOriginSilentPastGraceOpensEarly(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, vt := freshIdentity("sse")
+	fake.setToken("vercel", vt)
+
+	g := startGateway(t, fake, gwOptions{
+		config:   configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
+	})
+	g.waitForReady(t, 20*time.Second)
+
+	// Hold the origin's /sse response entirely silent until released: not
+	// even response headers, so nothing the caller reads before that is the
+	// origin's. The sim's early-open grace is milliseconds, not the worker's
+	// default (20 s), because the sim drives the same contract for the e2e
+	// suite at suite speed.
+	gate := echo.holdQuietSSE("sse2")
+	fake.project("v-rel").sim.setMode(simSSEOpen)
+
+	req, err := http.NewRequest(http.MethodGet, g.base+"/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Relay-Target", echo.base)
+	req.Header.Set("X-Relay-Path", "/sse")
+	req.Header.Set("X-Marker", "sse2")
+	req.Header.Set("Accept", "text/event-stream") // the caller asks for SSE
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("SSE request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE request = %d, want 200 (the response opened early)", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("relayed content-type = %q, want the opened stream's text/event-stream", ct)
+	}
+
+	// The marker reaches the caller while the origin has still written
+	// nothing. Time-bound every read: a hop that buffered the stream fails
+	// the test with the read it could not complete, not a hang.
+	rdr := bufio.NewReader(resp.Body)
+	markerLine, err := rdr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the early-open marker: %v", err)
+	}
+	blank, err := rdr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the marker's blank line: %v", err)
+	}
+	if got := markerLine + blank; got != sseOpenMarker {
+		t.Fatalf("first relayed comment = %q, want the worker's %q", got, sseOpenMarker)
+	}
+
+	// The origin is now released: its own bytes ride the opened stream.
+	gate.release()
+	tail, err := io.ReadAll(rdr)
+	if err != nil {
+		t.Fatalf("reading the SSE tail: %v", err)
+	}
+	if got, want := string(tail), ": origin-late\n\n"; got != want {
+		t.Fatalf("relayed SSE tail after the marker = %q, want %q verbatim", got, want)
+	}
+}
+
 // rawRequest speaks one hand-built HTTP/1.1 request against addr and
 // returns the whole wire answer (the request sets Connection: close).
 func rawRequest(t *testing.T, addr, raw string) string {
