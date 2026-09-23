@@ -1061,6 +1061,28 @@ func TestConcurrencyKeepsCountersConsistent(t *testing.T) {
 			}
 		}(i)
 	}
+	// Two more workers alternate the desired member set between two pinned
+	// scopes, so Sync itself races the completion APIs above: a generation a
+	// worker just captured can be bumped — and its admission revoked — by a
+	// flip mid-flight, which is exactly what the stale-completion guards
+	// exist for and what the loop above alone never exercised.
+	for i := 8; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := range 120 {
+				team := "team-a"
+				if (i+j)%2 == 1 {
+					team = "team-b"
+				}
+				ms := make([]Member, 0, len(keys))
+				for _, k := range keys {
+					ms = append(ms, Member{Key: k, Scope: deploy.Scope{Team: team}, ScopeKnown: true})
+				}
+				r.Sync(ms)
+			}
+		}(i)
+	}
 	wg.Wait()
 
 	if r.ReadyCount() != len(r.Serving()) {
