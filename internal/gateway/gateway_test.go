@@ -1099,6 +1099,13 @@ func waitForStats(t *testing.T, row func() pool.StatsRow, pred func(pool.StatsRo
 	t.Fatalf("timed out waiting for %s; last row = %+v", what, row())
 }
 
+// roundTripperFunc adapts one function to http.RoundTripper for a focused
+// transport seam. It lets a test control the outbound leg's exact context
+// without relying on a second TCP server's remote-close scheduling.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 // TestClientCancellationIsNotAPassiveFailure pins the client_aborted half of
 // the classification: a client that goes away — before the relay answers or
 // mid-body — is never evidence against the relay. Its teardown takes the
@@ -1106,61 +1113,51 @@ func waitForStats(t *testing.T, row func() pool.StatsRow, pred func(pool.StatsRo
 // down for the caller's own hangup.
 func TestClientCancellationIsNotAPassiveFailure(t *testing.T) {
 	t.Run("before the relay answers", func(t *testing.T) {
-		gate := make(chan struct{})
-		release := make(chan struct{})
+		// Use the handler seam directly instead of asking two real TCP legs to
+		// observe cancellation in an unspecified order. The transport receives
+		// the exact context roundTrip gives its outbound leg; it parks until
+		// that context is canceled, then returns the cancellation error. This
+		// makes the pre-response client-abort state factual and pins its
+		// classification without racing net/http's remote-close detection.
+		entered := make(chan struct{})
 		hits := &atomic.Int64{}
-		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			hits.Add(1)
-			close(gate) // the attempt is parked inside the relay
-			<-release
-			if r.Context().Err() != nil {
-				return // the leg is already gone; never write on it
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		t.Cleanup(up.Close)
-
+			close(entered)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		})
 		g, lc := newCapturingGateway(t, &State{
 			Pool: buildPool(t, []relaySpec{
-				{name: "solo", provider: "vercel", rawURL: up.URL, maxBody: bufferBytes()},
+				{name: "solo", provider: "vercel", rawURL: "http://solo.internal", maxBody: bufferBytes()},
 			}),
+			Client:         &http.Client{Transport: transport},
 			MaxRetries:     3, // available and never used: the client is gone
 			MaxBufferBytes: bufferBytes(),
 		})
-		gwSrv := httptest.NewServer(g)
-		t.Cleanup(gwSrv.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
-		if err != nil {
-			t.Fatalf("build request: %v", err)
-		}
+		req := relayRequest(t, http.MethodPost, "/", "x", specHeaders()).WithContext(ctx)
 		req.Header.Set(HeaderProvider, "vercel")
-		done := make(chan error, 1)
+		done := make(chan struct{})
 		go func() {
-			resp, doErr := gwSrv.Client().Do(req)
-			if doErr == nil {
-				_ = resp.Body.Close()
-			}
-			done <- doErr
+			defer close(done)
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, req)
 		}()
 		select {
-		case <-gate:
+		case <-entered:
 		case <-time.After(2 * time.Second):
-			t.Fatal("request never reached the relay")
+			t.Fatal("request never reached the relay transport")
 		}
 
 		cancel() // the client goes away before any response byte
 		select {
-		case err := <-done:
-			if err == nil {
-				t.Fatal("the canceled request must fail on the client")
-			}
+		case <-done:
 		case <-time.After(2 * time.Second):
-			t.Fatal("canceled request never returned")
+			t.Fatal("canceled request never returned from the gateway")
 		}
-		close(release) // unwind the parked upstream handler
 
 		waitForLog(t, lc, "client_aborted")
 		row := relayStatsBy(g.st.Load().Pool)["solo"]
