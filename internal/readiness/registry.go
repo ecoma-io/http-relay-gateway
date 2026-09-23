@@ -25,14 +25,21 @@
 //     the pool without the exact URL+key pair that passed verification.
 //
 // Every entry carries a generation — the relay's incarnation. It is bumped
-// whenever the identity leaves the desired configuration (removal) and when
-// it is re-added, so every in-flight operation (verify, deploy, delete)
-// that captured an older generation completes into the void: Ready,
-// Failing, Demote and DeleteDone discard stale completions instead of
-// mutating the newer incarnation. An operation holds the single-flight lock
-// from Begin to release, which also guarantees a re-added identity cannot
-// start its own deploy until a stale delete in flight has finished deleting
-// the OLD project.
+// whenever the identity leaves the desired configuration (removal), when it
+// is re-added, and when the scope its credential pins moves under a stable
+// name, so every in-flight operation (verify, deploy, delete) that captured
+// an older generation completes into the void: Ready, Failing, Demote and
+// DeleteDone discard stale completions instead of mutating the newer
+// incarnation. An operation holds the single-flight lock from Begin to
+// release, which also guarantees a re-added identity cannot start its own
+// deploy until a stale delete in flight has finished deleting the OLD
+// project.
+//
+// Generations are monotonic within one process and start at 1 per entry;
+// they are not persisted, so a restart restarts every relay at 1. That is
+// deliberate: the registry holds no truth across restarts, so a generation
+// number never needs to mean anything beyond this process's own stale-
+// completion guard.
 package readiness
 
 import (
@@ -48,6 +55,25 @@ import (
 // RelayKey under a local name. All reconciliation, single-flight and
 // incarnation decisions are per key.
 type Key = deploy.RelayKey
+
+// Member is one desired relay as Sync consumes it: the identity plus the
+// scope its resolved credential's pins address. The scope is part of the
+// deployment's identity — (provider, name) addresses a project only within
+// one provider-side scope — so a pin that moves under a stable name starts
+// a new incarnation here, before anything deploys into the wrong namespace.
+type Member struct {
+	Key Key
+	// Scope is the member's deployment scope. Its pins are already resolved
+	// from the environment; they must never be logged raw, and the registry
+	// does not — records and errors carry deploy.Scope.FP() instead.
+	Scope deploy.Scope
+	// ScopeKnown reports whether Scope was actually resolved this pass. A
+	// pass whose credential resolution failed cannot claim a scope; claiming
+	// the zero scope there would evict every pinned relay on the next
+	// unrelated credential hiccup. While it is false the registry compares
+	// nothing — it keeps the last known scope as the baseline.
+	ScopeKnown bool
+}
 
 // State is the observable lifecycle phase of one relay.
 type State string
@@ -79,6 +105,7 @@ const (
 	ReasonMissing       = "missing"           // no deployment exists for this identity
 	ReasonDeleteFailed  = "delete_failed"     // the remote delete errored; retried under backoff
 	ReasonCredentials   = "credential_failed" // provider credential rejected, ambiguous scope, or unreadable
+	ReasonScopeChanged  = "scope_changed"     // the credential's pins moved: a new incarnation of the relay
 )
 
 // Record is the operator-facing view of one relay's readiness.
@@ -168,6 +195,21 @@ type entry struct {
 	scopeFP string
 	busy    bool      // single-flight: a verifier/deployer/deleter holds this relay
 	nextTry time.Time // backoff gate for the next attempt
+
+	// scope is the incarnation's deployment scope: the pins this entry's
+	// credential resolved to when Sync last saw it. Raw pin values never
+	// leave this struct — the operator view carries Scope.FP() at most.
+	scope deploy.Scope
+	// scopeKnown reports whether scope has ever been resolved for this
+	// entry. Until it is, no comparison runs: the first resolved scope
+	// becomes the baseline rather than counting as a change.
+	scopeKnown bool
+	// scopeChanged marks that this incarnation's scope moved while it held
+	// admission — the incarnation is over (Sync bumped the generation), but
+	// the rollout that follows must re-run the settle+drain barrier before
+	// deploying, because in-flight requests were addressed to the OLD
+	// scope's deployment. Read-and-cleared via TakeScopeChanged.
+	scopeChanged bool
 }
 
 // Registry is the in-memory readiness state. All methods are safe for
@@ -248,25 +290,32 @@ func (r *Registry) UpdateSettings(settings Settings) {
 	}
 }
 
-// Sync reconciles the registry with the desired relay set: keys that first
-// appear are announced as configured, keys that reappear while a removal
-// was in flight are resurrected as a NEW incarnation (generation bumped — a
-// re-added relay must re-verify from scratch, never from memory, and any
-// delete/verify/deploy still in flight for the old incarnation completes
-// into the void), and keys that disappeared are moved to removing with
+// Sync reconciles the registry with the desired relay set: members that
+// first appear are announced as configured, members that reappear while a
+// removal was in flight are resurrected as a NEW incarnation (generation
+// bumped — a re-added relay must re-verify from scratch, never from memory,
+// and any delete/verify/deploy still in flight for the old incarnation
+// completes into the void), members whose scope moved under a stable name
+// start a new incarnation too (admission revoked first — a pin that moved
+// addresses a different deployment, and nothing verified for it may keep
+// serving), and identities that disappeared are moved to removing with
 // their generation bumped, invalidating their in-flight operations. The
 // reconciler calls this on every pass, so the registry always mirrors the
 // desired configuration.
-func (r *Registry) Sync(present []Key) {
+func (r *Registry) Sync(members []Member) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.cfg.Now()
-	seen := make(map[Key]bool, len(present))
-	for _, k := range present {
-		seen[k] = true
-		e, ok := r.entries[k]
+	seen := make(map[Key]bool, len(members))
+	for _, m := range members {
+		seen[m.Key] = true
+		e, ok := r.entries[m.Key]
 		if !ok {
-			r.entries[k] = &entry{record: Record{Key: k, State: StateConfigured, Generation: 1, Since: now}}
+			r.entries[m.Key] = &entry{
+				record:     Record{Key: m.Key, State: StateConfigured, Generation: 1, Since: now},
+				scope:      m.Scope,
+				scopeKnown: m.ScopeKnown,
+			}
 			r.notifyLocked() // lifecycle changed; the operator-facing snapshot rebuilds
 			continue
 		}
@@ -275,7 +324,10 @@ func (r *Registry) Sync(present []Key) {
 			// incarnation. The stale delete finishes harmlessly — it holds
 			// the single-flight, so this incarnation's own deploy waits
 			// until the OLD project has actually been deleted — and its
-			// completion lands on a bumped generation and is discarded.
+			// completion lands on a bumped generation and is discarded. The
+			// member's scope is adopted as the fresh incarnation's baseline:
+			// the generation bump above is the incarnation change, and no
+			// admission or in-flight work survives to protect.
 			e.record.Generation++
 			e.record.State = StateConfigured
 			e.record.Reason = ""
@@ -283,6 +335,34 @@ func (r *Registry) Sync(present []Key) {
 			e.record.DrainPending = false
 			e.nextTry = time.Time{}
 			e.record.Since = now
+			e.scope, e.scopeKnown, e.scopeChanged = m.Scope, m.ScopeKnown, false
+			r.notifyLocked()
+			continue
+		}
+		// Present and continuing. A scope that actually moved is a new
+		// incarnation under the same name — the deployment the pins used to
+		// address is a different project from the one they address now.
+		// Admission is revoked FIRST (the old scope's verification must not
+		// serve the new scope's identity for even one more request), then
+		// the generation bump discards everything this incarnation had in
+		// flight.
+		if m.ScopeKnown && e.scopeKnown && m.Scope != e.scope {
+			wasServing := e.serving
+			if e.serving {
+				e.serving = false
+				r.readyCount--
+			}
+			e.record.Generation++
+			e.record.State = StateConfigured
+			e.record.Reason = ReasonScopeChanged
+			e.record.FailStreak = 0
+			e.nextTry = time.Time{} // a fresh incarnation does not inherit the old one's backoff
+			e.record.Since = now
+			e.scope, e.scopeKnown = m.Scope, true
+			// The barrier marker rides only a flip that held admission: an
+			// unserving relay has no in-flight request to protect, and the
+			// ordinary rollout path may deploy straight into the new scope.
+			e.scopeChanged = wasServing
 			r.notifyLocked()
 		}
 	}
@@ -306,6 +386,25 @@ func (r *Registry) Sync(present []Key) {
 			r.notifyLocked()
 		}
 	}
+}
+
+// TakeScopeChanged reports whether this incarnation's scope moved while the
+// relay held admission, and clears the marker. The reconciler calls it once
+// per rollout, after Sync, to learn that the settle+drain barrier must run
+// before the deploy even though the relay was already demoted by ordinary
+// replacement flow. Guarded by the generation: a marker left over from an
+// older incarnation reads as false, exactly like any other stale
+// completion.
+func (r *Registry) TakeScopeChanged(key Key, generation uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.current(key, generation)
+	if e == nil {
+		return false // stale: the incarnation moved on
+	}
+	changed := e.scopeChanged
+	e.scopeChanged = false
+	return changed
 }
 
 // IsReady reports whether key is admitted to the serving pool — the gate

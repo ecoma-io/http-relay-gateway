@@ -20,7 +20,10 @@
 // wait for the old incarnation's in-flight requests to drain, and only then
 // deploy. The order is forced by the platforms: a project has one production
 // URL, and deploy switches what answers on it — so an old admission left
-// standing would serve whatever lands on that URL next, verified or not.
+// standing would serve whatever lands on that URL next, verified or not. A
+// scope that moves under a stable relay name is a replacement too — the
+// registry starts a new incarnation for it — and its rollout runs the same
+// barrier before deploying into the new scope.
 //
 // Probes never trigger deploys on transport failures: an unreachable relay
 // may be a cold start or a network blip, and one missed answer is never
@@ -112,13 +115,15 @@ type Worker struct {
 	probeHTTP     *http.Client
 	platformLocks map[string]*sync.Mutex
 	credMu        sync.Mutex
-	// credentials remembers each desired relay's provider credential so a
-	// relay that later leaves the configuration can still have its remote
-	// deleted. In-memory by design: after a restart the registry starts
-	// empty and holds only config-listed relays, so a removing entry never
-	// lacks its memo unless the configuration vanished mid-run — and then
-	// the remote is left behind deliberately rather than guessed at.
-	credentials map[deploy.RelayKey]deploy.Credential
+	// credentials remembers each desired relay's provider credential — and
+	// the scope its pins address — so a relay that later leaves the
+	// configuration can still have its remote deleted, and a scope that
+	// moved under a stable name can be called out as the orphaning event it
+	// is. In-memory by design: after a restart the registry starts empty and
+	// holds only config-listed relays, so a removing entry never lacks its
+	// memo unless the configuration vanished mid-run — and then the remote
+	// is left behind deliberately rather than guessed at.
+	credentials map[deploy.RelayKey]credEntry
 
 	wake   chan struct{}
 	ctx    context.Context
@@ -134,6 +139,18 @@ type Worker struct {
 	budget      context.Context
 	drainCtx    context.Context
 	drainCancel context.CancelFunc
+}
+
+// credEntry is one memoized relay credential: the credential itself, the
+// scope its pins address (the value the registry's incarnation is keyed on),
+// and the entry it replaced when that scope moved. The prior chain is kept
+// so the orphaning event is attributable — which scope the deployment was
+// left in — and so a future cleanup pass can name the abandoned remote; it
+// is never used to reach the old scope's project.
+type credEntry struct {
+	cred  deploy.Credential
+	scope deploy.Scope
+	prior *credEntry
 }
 
 // Start launches the worker. It runs one pass immediately and returns.
@@ -159,7 +176,7 @@ func Start(cfg Config) *Worker {
 		log:           cfg.Log,
 		probeHTTP:     deploy.ProbeClient(probeTimeout),
 		platformLocks: locks,
-		credentials:   map[deploy.RelayKey]deploy.Credential{},
+		credentials:   map[deploy.RelayKey]credEntry{},
 		wake:          make(chan struct{}, 1),
 		ctx:           ctx,
 		cancel:        cancel,
@@ -261,8 +278,14 @@ func (w *Worker) pass() {
 		w.logError(err, "pass: resolve relay key; keeping the last verified fleet")
 		return
 	}
-	w.memoCredentials(cfg)
-	w.reg.Sync(cfg.Keys())
+	// Credentials resolve before the sync so the registry sees the scope the
+	// RESOLVED credential addresses — the pins interpolate out of the
+	// environment here, and only a resolved scope may count as the
+	// incarnation's identity. A relay whose credential failed to resolve
+	// still syncs as a member; it just claims no scope, so an unrelated
+	// credential hiccup can never read as a scope flip.
+	members := w.memoCredentials(cfg)
+	w.reg.Sync(members)
 	w.runDeletes()
 
 	keys := cfg.Keys()
@@ -275,28 +298,54 @@ func (w *Worker) pass() {
 	})
 }
 
-// memoCredentials records the current credentials for later deletes.
-func (w *Worker) memoCredentials(cfg *config.Config) {
+// memoCredentials records the current credentials — and the scope each
+// addresses — for later deletes and for the registry's incarnation sync, and
+// returns the desired relay set as registry members. Raw pin values never
+// reach the log: the scope change warning carries Scope.FP() forms, which
+// are non-reversible.
+func (w *Worker) memoCredentials(cfg *config.Config) []readiness.Member {
+	members := make([]readiness.Member, 0, len(cfg.Relays))
 	w.credMu.Lock()
 	defer w.credMu.Unlock()
-	for _, rel := range cfg.Relays {
+	for i := range cfg.Relays {
+		rel := cfg.Relays[i]
+		key := deploy.RelayKey{Provider: rel.Provider, Name: rel.Name}
 		token, err := rel.ResolveToken()
 		if err != nil {
-			continue // ensureRelay reports the credential problem for this relay
+			// The credential is unreadable this pass: the relay stays
+			// desired, but no scope can be claimed for it — Sync keeps the
+			// last known scope as the baseline instead of comparing. The
+			// credential problem itself is ensureRelay's report.
+			members = append(members, readiness.Member{Key: key})
+			continue
 		}
-		key := deploy.RelayKey{Provider: rel.Provider, Name: rel.Name}
 		cred := deploy.Credential{Token: token, Team: rel.Team, Account: rel.Account,
 			Organization: rel.Organization}
-		if prev, ok := w.credentials[key]; ok && !prev.SameScope(cred) {
-			// The scope pin moved under a stable identity: this pass
-			// discovers and deploys in the NEW scope, and the deployment the
-			// old scope hosted is orphaned there — no later pass can ever
-			// reach or delete it again. The operator removes it by hand.
-			w.log.Warn().Str("provider", rel.Provider).Str("relay", rel.Name).
-				Msg("relay scope changed; the deployment in the previous scope is orphaned and must be removed manually")
+		scope := cred.Scope()
+		if prev, ok := w.credentials[key]; ok {
+			if prev.scope == scope {
+				// Unchanged scope: refresh the credential in place (the token
+				// re-reads every pass) and keep whatever prior chain the
+				// entry already carries.
+				w.credentials[key] = credEntry{cred: cred, scope: scope, prior: prev.prior}
+			} else {
+				// The scope pin moved under a stable identity: this pass
+				// discovers and deploys in the NEW scope, and the deployment
+				// the old scope hosted is orphaned there — no later pass can
+				// ever reach or delete it again. The operator removes it by
+				// hand; the fingerprints say which scope it sits in.
+				w.log.Warn().Str("provider", rel.Provider).Str("relay", rel.Name).
+					Str("previous_scope", prev.scope.FP()).
+					Str("scope", scope.FP()).
+					Msg("relay scope changed; the deployment in the previous scope is orphaned and must be removed manually")
+				w.credentials[key] = credEntry{cred: cred, scope: scope, prior: &prev}
+			}
+		} else {
+			w.credentials[key] = credEntry{cred: cred, scope: scope}
 		}
-		w.credentials[key] = cred
+		members = append(members, readiness.Member{Key: key, Scope: scope, ScopeKnown: true})
 	}
+	return members
 }
 
 // ensureRelay drives one relay toward verified readiness: discover its
@@ -400,8 +449,18 @@ func (w *Worker) ensureRelay(rel config.Relay, relayKey string) {
 // whatever lands on that URL next. The settle+drain gate also covers a
 // replacement an earlier pass deferred at the drain timeout (the incarnation-
 // scoped drainPending marker): the retry pass re-runs both before deploying —
-// the same discipline the delete path applies on every retry.
+// the same discipline the delete path applies on every retry. And it covers
+// a scope flip: the incarnation Sync replaced had admission while its
+// in-flight requests were addressed to the OLD scope's deployment, so the
+// deploy into the new scope waits for the same quiet, even though the flip
+// itself already revoked admission and bumped the generation.
 func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, relayKey string, client deploy.Client, project string, wasReady, drainPending bool) {
+	// The scope-flip marker is consumed here — at the moment a rollout will
+	// actually run — and not earlier in the pass: a pass whose discovery
+	// fails must not spend it, or the retry pass would deploy into the new
+	// scope with no barrier at all. Guarded by the generation, so a marker
+	// left over from an older incarnation reads as false.
+	scopeChanged := w.reg.TakeScopeChanged(key, gen)
 	// Gating the drain on wasReady alone skips it on the retry pass — the
 	// first pass already demoted the relay, so IsReady is false from there
 	// on — and the deploy would fire under the very straggler the ordering
@@ -409,7 +468,7 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 	if wasReady {
 		w.reg.Demote(key, gen, readiness.ReasonReplacing)
 	}
-	if wasReady || drainPending {
+	if wasReady || drainPending || scopeChanged {
 		if !w.settle() {
 			// The process is shutting down and the applier will never
 			// satisfy the barrier. The demotion stands; the replacement is
@@ -557,8 +616,11 @@ func (w *Worker) runDeletes() {
 func (w *Worker) credentialFor(key deploy.RelayKey) (deploy.Credential, bool) {
 	w.credMu.Lock()
 	defer w.credMu.Unlock()
-	cred, ok := w.credentials[key]
-	return cred, ok
+	entry, ok := w.credentials[key]
+	if !ok {
+		return deploy.Credential{}, false
+	}
+	return entry.cred, true
 }
 
 // verdictKind classifies one readiness verification of a deployment URL.
