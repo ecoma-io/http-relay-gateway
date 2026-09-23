@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -133,6 +134,91 @@ func TestE2E_StatsNeverLeaksAndBodyLimits(t *testing.T) {
 		t.Fatalf("4.6MB pinned to cloudflare = %d, want 200", resp.StatusCode)
 	}
 	assertNoLeaks(t, "pinned 4.6MB body", g, fake, body)
+}
+
+// TestE2E_SSEStreamsThroughWithAFlushPerWrite pins the response path on the
+// stream the relay's heartbeat exists for: an SSE response of comment lines
+// relays verbatim, and a comment the origin writes after a pause reaches the
+// client while the origin is still parked — nothing buffered it, so a
+// heartbeat comment written mid-stream is delivered the moment it is
+// written, not with the end of the body.
+func TestE2E_SSEStreamsThroughWithAFlushPerWrite(t *testing.T) {
+	fake := newFakeEdge(t)
+	echo := newEcho(t)
+	key, vt := freshIdentity("sse")
+	fake.setToken("vercel", vt)
+
+	g := startGateway(t, fake, gwOptions{
+		config:   configYAML(relayBlock("v-rel", "vercel", tokenEnvLine("E2E_VT"))),
+		key:      key,
+		extraEnv: map[string]string{"E2E_VT": vt},
+	})
+	g.waitForReady(t, 20*time.Second)
+
+	gate := echo.holdSSE("sse1")
+	req, err := http.NewRequest(http.MethodGet, g.base+"/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Relay-Target", echo.base)
+	req.Header.Set("X-Relay-Path", "/sse")
+	req.Header.Set("X-Marker", "sse1")
+
+	// The timeout bounds every read below: a hop that buffered the stream
+	// fails the test with the read it could not complete, not a hang.
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("SSE request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE request = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("relayed content-type = %q, want the upstream's text/event-stream", ct)
+	}
+
+	// readComment takes one complete comment: its line plus the blank line
+	// that terminates it.
+	br := bufio.NewReader(resp.Body)
+	readComment := func(what string) string {
+		t.Helper()
+		var out strings.Builder
+		for range 2 {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				t.Fatalf("reading %s: %v (the stream was buffered, truncated or never relayed)", what, err)
+			}
+			out.WriteString(line)
+		}
+		return out.String()
+	}
+
+	// The origin wrote, flushed and parked: the comment can only be here if
+	// the relay leg and the gateway both forwarded it on the spot.
+	first := readComment("the origin's first comment")
+	if first != sseOpen {
+		t.Fatalf("first relayed comment = %q, want %q", first, sseOpen)
+	}
+
+	// Written after the pause, still before the origin's last byte.
+	gate.step()
+	late := readComment("the comment written after the pause")
+	if late != sseLate {
+		t.Fatalf("relayed comment after the pause = %q, want %q", late, sseLate)
+	}
+
+	// The origin ends: the body is exactly the comments it wrote, nothing
+	// appended, nothing dropped.
+	gate.step()
+	tail, err := io.ReadAll(br)
+	if err != nil {
+		t.Fatalf("reading the SSE tail: %v", err)
+	}
+	if body, want := first+late+string(tail), sseOpen+sseLate; body != want {
+		t.Fatalf("relayed SSE body = %q, want %q verbatim", body, want)
+	}
 }
 
 // rawRequest speaks one hand-built HTTP/1.1 request against addr and
