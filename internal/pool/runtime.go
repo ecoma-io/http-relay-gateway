@@ -97,6 +97,10 @@ func (rs *RelayState) health(now time.Time) (up bool, lastErr string) {
 }
 
 // RecordSuccess clears the failure streak and brings the relay back up.
+// The caller records it only for a COMPLETED response — a body that fully
+// copied — never for a header receipt: a success that resets the streak must
+// be evidence the relay can still carry a whole answer, so consecutive
+// post-header failures accumulate to the threshold like any transport streak.
 func (rs *RelayState) RecordSuccess() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()

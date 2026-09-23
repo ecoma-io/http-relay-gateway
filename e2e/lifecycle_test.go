@@ -615,9 +615,10 @@ func midstreamRowOf(t *testing.T, g *gatewayProc, name string) (midstreamRow, bo
 
 // TestE2E_MidstreamFailureCountsOnceAndNeverRetries: a relay leg that dies
 // after the response headers have gone through is one counted attempt and
-// one passive failure — never a replay (the client already holds part of
-// the body), and the truncated 200 simply ends on the client instead of
-// turning into an error status.
+// one passive failure whose streak accumulates toward the cooldown threshold
+// (no completed response intervenes to reset it) — never a replay (the
+// client already holds part of the body), and the truncated 200 simply ends
+// on the client instead of turning into an error status.
 func TestE2E_MidstreamFailureCountsOnceAndNeverRetries(t *testing.T) {
 	fake := newFakeEdge(t)
 	key, vt := freshIdentity("midcut")
@@ -706,8 +707,11 @@ func TestE2E_MidstreamFailureCountsOnceAndNeverRetries(t *testing.T) {
 	}
 
 	// The accounting: one counted attempt, one passive failure, the
-	// mid-stream counter up once — and the relay stays healthy, because one
-	// failure sits below the harness threshold of 2.
+	// mid-stream counter up once — and the relay stays healthy, because the
+	// failure streak ACCUMULATES across completed-response-free attempts and
+	// a single one sits below the harness threshold of 2 (two in a row would
+	// trip the cooldown; nothing resets it in between, since no response
+	// completed).
 	waitFor(t, 10*time.Second, "/stats to count the mid-stream failure", func() bool {
 		row, ok := midstreamRowOf(t, g, "v-rel")
 		return ok && row.Requests == 1 && row.Failures == 1 && row.MidstreamFailures == 1

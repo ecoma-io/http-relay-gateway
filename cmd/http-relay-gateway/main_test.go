@@ -146,7 +146,7 @@ func TestBuildStateServesOnlyVerified(t *testing.T) {
 func TestBuildStateCarriesTheAdmissionIncarnation(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	k := readiness.Key{Provider: deploy.PlatformVercel, Name: "inc"}
-	reg.Sync([]readiness.Key{k})
+	syncKeys(reg, k)
 	admit(t, reg, k)
 
 	first := freshState(reg, config.DefaultSettings(), zerolog.Nop()).Pool.Pick(pool.KeyAll)
@@ -157,7 +157,7 @@ func TestBuildStateCarriesTheAdmissionIncarnation(t *testing.T) {
 	// Remove and re-add the identity: the registry bumps the incarnation,
 	// a fresh admission verifies it, and the rebuilt pool quotes it.
 	reg.Sync(nil)
-	reg.Sync([]readiness.Key{k})
+	syncKeys(reg, k)
 	admit(t, reg, k)
 
 	serving := reg.Serving()

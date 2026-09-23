@@ -473,14 +473,15 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 			}
 			continue
 		}
-		// An HTTP answer is transport-level success at header time — the
-		// counters book it here whatever the body does next. The never-retry
-		// rule from here on is structural, not a health verdict: the loop
-		// only ever continues on a client.Do error.
+		// An HTTP answer is a counted attempt at header time — and nothing
+		// more: the passive-health success record waits until the body has
+		// fully copied (below), because a header receipt the same attempt
+		// invalidates mid-body is not success evidence. Recording it here
+		// would reset the failure streak on every attempt of a relay whose
+		// body breaks every time, and the cooldown could never trip. The
+		// never-retry rule from here on stays structural, not a health
+		// verdict: the loop only ever continues on a client.Do error.
 		relay.Requests.Add(1)
-		// A success clears the failure streak: a flaky relay must not slide
-		// into cooldown across interleaved successes.
-		cur.Pool.RecordSuccess(relay)
 		log.Info().Str("method", r.Method).Str("provider", providerLabel(provider)).
 			Str("relay", relay.Name).Str("outcome", "relayed").
 			Uint64("incarnation", relay.Incarnation).
@@ -490,27 +491,36 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 			Msg("relayed")
 		copyErr := g.copyResponse(w, resp)
 		g.inflight.end(relay.Provider, relay.Name)
-		if copyErr != nil {
-			// The relay answered, but the body did not survive the copy.
-			// Same evidence rule as above: a dead request context means the
-			// client left, which also tears down the upstream leg — that is
-			// not evidence against the relay, and the response simply ends.
-			if r.Context().Err() != nil {
-				log.Info().Str("relay", relay.Name).Str("provider", relay.Provider).
-					Str("outcome", "client_aborted").
-					Uint64("incarnation", relay.Incarnation).
-					Int("status", resp.StatusCode).
-					Str("err", sanitize.ErrorString(copyErr)).
-					Str("duration", time.Since(start).Round(time.Millisecond).String()).
-					Msg("response aborted by the client")
-				return
-			}
+		switch {
+		case copyErr == nil:
+			// The body survived the copy — a COMPLETED response, the only
+			// success evidence the passive layer accepts. It clears the
+			// failure streak and lifts a cooldown, so a cooled relay picked
+			// best-effort recovers exactly when its body actually completes
+			// (evidence-based half-open recovery).
+			cur.Pool.RecordSuccess(relay)
+		case r.Context().Err() != nil:
+			// The relay answered, but the body did not survive the copy, and
+			// the request context is dead: the client left, which also tears
+			// down the upstream leg. Not evidence for or against the relay —
+			// recorded as neither success nor failure — and the truncated
+			// response simply ends.
+			log.Info().Str("relay", relay.Name).Str("provider", relay.Provider).
+				Str("outcome", "client_aborted").
+				Uint64("incarnation", relay.Incarnation).
+				Int("status", resp.StatusCode).
+				Str("err", sanitize.ErrorString(copyErr)).
+				Str("duration", time.Since(start).Round(time.Millisecond).String()).
+				Msg("response aborted by the client")
+		default:
 			// A live context with a broken body is the relay's failure after
-			// it had already answered: counted (above), recorded as a
-			// passive failure plus the mid-stream signal, and never retried
-			// — the client already holds part of the body, so the honest
-			// ending is the truncated response, not an invented status that
-			// cannot replace the headers already sent.
+			// it had already answered: recorded as a passive failure plus
+			// the mid-stream signal — it ACCUMULATES across consecutive
+			// attempts, because no completed response intervenes to reset
+			// the streak, so the cooldown trips like any transport streak —
+			// and never retried: the client already holds part of the body,
+			// so the honest ending is the truncated response, not an
+			// invented status that cannot replace the headers already sent.
 			cur.Pool.RecordFailure(relay, copyErr)
 			relay.MidstreamFailures.Add(1)
 			log.Warn().Str("relay", relay.Name).Str("provider", relay.Provider).

@@ -83,9 +83,10 @@ Authorization: Bearer $TARGET_TOKEN
 - Failover happens only while the failure is still a transport error
   (before any response byte). Once the relay answered, the response is
   never retried. A body that dies mid-stream is recorded against the relay
-  (a passive failure and a `midstreamFailures` counter) — but the truncated
-  answer simply ends on the client; a client that hangs up is never
-  evidence against the relay and is counted nowhere.
+  (a passive failure and a `midstreamFailures` counter, accumulating toward
+  the cooldown) — but the truncated answer simply ends on the client; a
+  client that hangs up is never evidence about the relay at all, neither
+  success nor failure.
 
 ### The relay key
 
@@ -221,7 +222,9 @@ The readiness gate above is the **verified** layer: slow, control-plane
 work that decides membership. Beneath it, the pool keeps a **passive**
 layer: `failure_threshold` consecutive transport failures put a relay on
 `cooldown` and it is skipped until the cooldown expires (half-open
-recovery); interleaved successes reset the streak. Passive failures skip a
+recovery); interleaved completed responses reset the streak, and one also
+lifts a cooldown — a cooled relay picked best-effort recovers only when a
+body actually completes. Passive failures skip a
 relay — they never change membership; the verified layer owns that. When
 every candidate is down, the pool still returns one (best effort beats a
 `503` when the whole fleet is having a bad minute).
@@ -244,13 +247,18 @@ is what the counters and the logs record:
 
 - **`upstream_pre_response`** — the relay leg failed before any response
   byte: a passive failure, and a buffered body replays on the next relay.
-- **`relayed`** — the relay answered; a counted attempt and a success at
-  header time (never-retry is structural: the client already holds part of
-  the answer).
+- **`relayed`** — the relay answered: a counted attempt at header time
+  (never-retry is structural: the client already holds part of the answer).
+  The passive-health success waits for the body to complete — a success
+  that resets the streak is a completed response, never the header receipt
+  the same attempt may go on to invalidate.
 - **`upstream_midstream`** — the body died after the headers went through:
   a passive failure and `midstreamFailures` on the relay, never a replay —
   the truncated answer simply ends on the client, because an error status
-  can no longer replace a response already in flight.
+  can no longer replace a response already in flight. The failure
+  accumulates: with no completed response in between, consecutive
+  mid-stream failures stack toward the threshold and trip the cooldown like
+  any transport streak.
 - **`client_aborted`** — the caller went away (the request context died:
   `http.Server.Shutdown` never cancels request contexts, so shutdown does
   not masquerade as this). The relay's leg is torn down _by_ the client's
