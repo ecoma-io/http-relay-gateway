@@ -18,6 +18,8 @@ package deploy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +64,43 @@ type RelayKey struct {
 
 func (k RelayKey) String() string { return k.Provider + "/" + k.Name }
 
+// Scope is the provider-side namespace a deployment lives in: the pins a
+// credential carries, resolved. It is the third component of a deployment's
+// identity — (provider, name) addresses a project only within one scope, so
+// a pin that moves under a stable relay name addresses a different
+// deployment, never the same one relocated.
+//
+// Only explicit pins take part in the identity. A credential without its
+// provider's pin addresses whatever single scope the platform resolves it
+// to (and fails with ErrAmbiguousScope when it cannot); the gateway never
+// learns that resolved value, so an absent pin cannot silently change —
+// only a configured pin can.
+type Scope struct {
+	// Team is the vercel team pin; empty means the token's own user scope.
+	Team string
+	// Account is the cloudflare account pin; empty means the token's own
+	// single account.
+	Account string
+	// Organization is the deno Deploy organization id (UUID); deno has no
+	// resolve-from-token route, so it is always pinned in practice.
+	Organization string
+}
+
+// FP returns a short, non-reversible fingerprint of the scope's pins, ""
+// when nothing is pinned. It is the log-safe form of a scope: pin values
+// arrive from the environment (${VAR} references resolve secrets), so they
+// must never reach a log line, a record or an error — the fingerprint
+// identifies a scope without carrying it. Equal pins always produce equal
+// fingerprints, and the pins are NUL-separated before hashing so one pin's
+// tail can never masquerade as the next pin's head.
+func (s Scope) FP() string {
+	if s == (Scope{}) {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(s.Team + "\x00" + s.Account + "\x00" + s.Organization))
+	return hex.EncodeToString(sum[:4])
+}
+
 // Credential is the provider management credential plus the optional scope
 // pins a provider needs to resolve (provider, name) to exactly one project.
 type Credential struct {
@@ -81,14 +120,12 @@ type Credential struct {
 	Organization string
 }
 
-// SameScope reports whether two credentials address the same platform
-// scope — same pin (or same absence of one). A scope change under a stable
-// relay identity moves the identity to a different part of the platform
-// account; the deployment the old scope hosted is unreachable from the
-// desired state from then on.
-func (c Credential) SameScope(other Credential) bool {
-	return c.Team == other.Team && c.Account == other.Account &&
-		c.Organization == other.Organization
+// Scope returns the deployment scope the credential's pins address. The
+// token is deliberately left out: it decides whether the calls succeed,
+// never which project (provider, name) resolves to — a rotated credential
+// keeps the same deployment, a moved pin does not.
+func (c Credential) Scope() Scope {
+	return Scope{Team: c.Team, Account: c.Account, Organization: c.Organization}
 }
 
 // Discovery reports what provider discovery found for one project name.

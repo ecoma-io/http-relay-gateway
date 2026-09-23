@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"http-relay-gateway/internal/deploy"
 )
 
 // clock is the injected test clock: tests advance it explicitly instead of
@@ -40,6 +42,18 @@ var (
 	keyC = key("deno", "gamma")
 )
 
+// members wraps keys as scope-resolved Sync members with no pins — the shape
+// every relay without provider pins presents, and the one these tests need
+// unless they exercise scope flips explicitly (ScopeKnown true, empty scope:
+// the credential resolved fine, it just pins nothing).
+func members(keys ...Key) []Member {
+	out := make([]Member, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, Member{Key: k, ScopeKnown: true})
+	}
+	return out
+}
+
 // admit brings a relay to ready through the normal Begin/Ready flow.
 func admit(t *testing.T, r *Registry, k Key, url, token string) uint64 {
 	t.Helper()
@@ -70,7 +84,7 @@ func TestSyncAnnouncesNewKeysAndRemovesMissing(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
 
-	r.Sync([]Key{keyA, keyB})
+	r.Sync(members(keyA, keyB))
 	rec, ok := r.StateOf(keyA)
 	if !ok || rec.State != StateConfigured || rec.Generation != 1 {
 		t.Fatalf("new key = %+v ok=%t, want configured generation 1", rec, ok)
@@ -106,10 +120,10 @@ func TestSyncReaddStartsNewIncarnation(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
 
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := admit(t, r, keyA, "https://alpha.example", "rk")
 	r.Sync(nil) // removed: generation bumps, admission revoked
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 
 	rec, ok := r.StateOf(keyA)
 	if !ok || rec.State != StateConfigured {
@@ -129,10 +143,232 @@ func TestSyncReaddStartsNewIncarnation(t *testing.T) {
 	}
 }
 
+// pinned wraps a key as a Sync member whose credential resolves to one
+// explicit team pin — the smallest concrete scope a flip can move.
+func pinned(k Key, team string) Member {
+	return Member{Key: k, Scope: deploy.Scope{Team: team}, ScopeKnown: true}
+}
+
+// A scope that moves under a stable name is a new incarnation: the old
+// scope's admission is revoked FIRST (a verification earned in one scope must
+// never serve an identity addressed in another), the generation bumps, and
+// the entry restarts as configured with a clean slate — but a deferred-drain
+// marker survives, because the incarnation's replacement story is still open.
+func TestSyncBumpsGenerationWhenScopeChanges(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	if r.ReadyCount() != 1 {
+		t.Fatalf("readyCount = %d, want 1", r.ReadyCount())
+	}
+	// Arm a deferred-drain marker and a backoff gate so the flip must show
+	// which incarnation state it carries over and which it leaves behind.
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	r.DeferDrain(keyA, gen)
+	if r.Allow(keyA) {
+		t.Fatal("precondition: the failing streak armed the backoff gate")
+	}
+
+	r.Sync([]Member{pinned(keyA, "team-b")})
+	rec, ok := r.StateOf(keyA)
+	if !ok {
+		t.Fatal("entry vanished on a scope flip")
+	}
+	if rec.Generation != gen+1 {
+		t.Fatalf("generation = %d, want %d (the flip is a new incarnation)", rec.Generation, gen+1)
+	}
+	if rec.State != StateConfigured || rec.Reason != ReasonScopeChanged {
+		t.Fatalf("state/reason = %s/%q, want configured/%q", rec.State, rec.Reason, ReasonScopeChanged)
+	}
+	if rec.FailStreak != 0 {
+		t.Fatalf("fail streak = %d, want 0 on the fresh incarnation", rec.FailStreak)
+	}
+	if !r.Allow(keyA) {
+		t.Fatal("a fresh incarnation must not inherit the old one's backoff")
+	}
+	if r.IsReady(keyA) || r.ReadyCount() != 0 || len(r.Serving()) != 0 {
+		t.Fatal("the old scope's admission must be revoked by the flip")
+	}
+	if !rec.DrainPending {
+		t.Fatal("a deferred-drain marker must survive the scope flip: the replacement is still open")
+	}
+	if r.NotifySeq() == 0 {
+		t.Fatal("a scope flip that revokes admission must notify the applier")
+	}
+}
+
+// Flipping back re-bumps: generation is a strict incarnation counter, so a
+// relay that returns to a previously used scope is still a NEW incarnation —
+// nothing about the old one, its admission included, may be remembered.
+func TestScopeFlipBackBumpsAgainWithoutReuse(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	genA := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Sync([]Member{pinned(keyA, "team-b")})
+	genB := generationOf(t, r, keyA)
+	if genB != genA+1 {
+		t.Fatalf("generation after the first flip = %d, want %d", genB, genA+1)
+	}
+
+	// Back to team-a: the fresh incarnation must not resurrect the team-a
+	// admission the previous incarnation held.
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	genBack := generationOf(t, r, keyA)
+	if genBack != genB+1 {
+		t.Fatalf("generation after the flip back = %d, want %d", genBack, genB+1)
+	}
+	if r.IsReady(keyA) || r.ReadyCount() != 0 {
+		t.Fatal("returning to a former scope must not resurrect its admission")
+	}
+	rec, _ := r.StateOf(keyA)
+	if rec.State != StateConfigured || rec.Reason != ReasonScopeChanged {
+		t.Fatalf("state/reason = %s/%q, want configured/%q", rec.State, rec.Reason, ReasonScopeChanged)
+	}
+}
+
+// Every completion captured under the flipped-out incarnation is stale: the
+// generation moved on, so a verification that finishes after the flip must
+// land in the void — most of all a Ready, which would otherwise re-admit a
+// relay whose URL now answers for a different scope.
+func TestScopeFlipDiscardsInFlightCompletions(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Sync([]Member{pinned(keyA, "team-b")})
+
+	r.Ready(keyA, gen, "https://alpha.example", "rk", time.Millisecond)
+	if r.IsReady(keyA) || r.ReadyCount() != 0 || len(r.Serving()) != 0 {
+		t.Fatal("a pre-flip Ready must complete into the void")
+	}
+	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
+	if rec, _ := r.StateOf(keyA); rec.FailStreak != 0 || rec.State != StateConfigured {
+		t.Fatalf("record = %+v, want the fresh incarnation untouched by a stale Failing", rec)
+	}
+	if r.TakeScopeChanged(keyA, gen) {
+		t.Fatal("a stale generation must read no scope marker")
+	}
+	if !r.TakeScopeChanged(keyA, gen+1) {
+		t.Fatal("the flip's marker must read under the new incarnation")
+	}
+	if r.TakeScopeChanged(keyA, gen+1) {
+		t.Fatal("the marker is read-and-clear: the second read must be false")
+	}
+}
+
+// A pass whose credential resolution failed claims no scope, and Sync must
+// not read that as a flip: an unrelated credential hiccup may not evict
+// every pinned relay. The first resolved scope after unknown ones is a
+// baseline too, never a change.
+func TestSyncUnknownScopeNeverFlips(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+	// Each Sync below mirrors the whole desired set, the way the reconciler
+	// feeds it — every member every pass, only the scope claim varying.
+	fleet := func(ms ...Member) []Member { return ms }
+
+	r.Sync(fleet(pinned(keyA, "team-a")))
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+
+	// Credential unresolvable this pass: no scope claimed, nothing compared.
+	r.Sync(fleet(Member{Key: keyA}))
+	if got := generationOf(t, r, keyA); got != gen {
+		t.Fatalf("generation = %d, want %d (an unknown scope is never a flip)", got, gen)
+	}
+	if !r.IsReady(keyA) {
+		t.Fatal("an unknown-scope pass must not revoke admission")
+	}
+
+	// Still unknown, then resolved again at the same scope: no flip either.
+	r.Sync(fleet(Member{Key: keyA}))
+	r.Sync(fleet(pinned(keyA, "team-a")))
+	if got := generationOf(t, r, keyA); got != gen {
+		t.Fatalf("generation = %d, want %d (re-resolving the same scope is not a flip)", got, gen)
+	}
+
+	// The baseline rule runs the other way too: a relay whose scope was
+	// never known before its first resolution must not flip on that first
+	// resolution.
+	r.Sync(fleet(pinned(keyA, "team-a"), Member{Key: keyB}))
+	r.Sync(fleet(pinned(keyA, "team-a"), pinned(keyB, "org-a")))
+	if got := generationOf(t, r, keyB); got != 1 {
+		t.Fatalf("generation = %d, want 1 (the first known scope is a baseline)", got)
+	}
+
+	// And the unknown passes must not have disarmed flip detection: a real
+	// move against the remembered baseline still flips.
+	r.Sync(fleet(pinned(keyA, "team-b"), pinned(keyB, "org-a")))
+	if got := generationOf(t, r, keyA); got != gen+1 {
+		t.Fatalf("generation = %d, want %d (the remembered baseline still flips)", got, gen+1)
+	}
+	if r.IsReady(keyA) {
+		t.Fatal("the real flip must revoke admission")
+	}
+	// keyB never moved, so it stays on its first incarnation, still serving.
+	if got := generationOf(t, r, keyB); got != 1 {
+		t.Fatalf("keyB generation = %d, want 1", got)
+	}
+}
+
+// A flip on a relay that never held admission revokes nothing and raises no
+// barrier marker: with no admission there is no in-flight request to
+// protect, so the ordinary rollout path may deploy straight into the new
+// scope.
+func TestScopeFlipWithoutAdmissionRaisesNoBarrierMarker(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	r.Sync([]Member{pinned(keyA, "team-b")})
+
+	rec, _ := r.StateOf(keyA)
+	if rec.Generation != 2 || rec.Reason != ReasonScopeChanged {
+		t.Fatalf("record = %+v, want generation 2 with %q", rec, ReasonScopeChanged)
+	}
+	if r.TakeScopeChanged(keyA, rec.Generation) {
+		t.Fatal("a flip without admission must not raise the drain marker")
+	}
+}
+
+// A re-added identity adopts the member's scope as its fresh baseline: the
+// generation bump of the re-add IS the incarnation change, and double-bumping
+// it for a scope the old incarnation never used would be a phantom flip.
+func TestSyncReaddAdoptsScopeAsBaselineWithoutASecondBump(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+	r.Sync(nil) // removal: generation bumps once
+	r.Sync([]Member{pinned(keyA, "team-b")})
+
+	if got := generationOf(t, r, keyA); got != gen+2 {
+		t.Fatalf("generation = %d, want %d (removal + re-add, no phantom flip)", got, gen+2)
+	}
+	rec, _ := r.StateOf(keyA)
+	if rec.Reason != "" {
+		t.Fatalf("reason = %q, want a clean re-add without a flip marker", rec.Reason)
+	}
+	if r.TakeScopeChanged(keyA, gen+2) {
+		t.Fatal("a re-add must not raise the drain marker")
+	}
+	// And the adopted baseline is live: the next real move flips.
+	r.Sync([]Member{pinned(keyA, "team-c")})
+	if got := generationOf(t, r, keyA); got != gen+3 {
+		t.Fatalf("generation = %d, want %d after the next real flip", got, gen+3)
+	}
+}
+
 func TestReadyPublishesURLAndTokenAtomically(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 
 	release, gen, ok := r.Begin(keyA)
 	if !ok {
@@ -163,7 +399,7 @@ func TestReadyPublishesURLAndTokenAtomically(t *testing.T) {
 func TestStaleCompletionsAreDiscarded(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	release, gen, ok := r.Begin(keyA)
 	if !ok {
 		t.Fatal("Begin failed")
@@ -196,7 +432,7 @@ func TestStaleCompletionsAreDiscarded(t *testing.T) {
 
 	// The current incarnation is configured again: even a CURRENT-generation
 	// DeleteDone is discarded because the relay is not removing.
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	rec, _ = r.StateOf(keyA)
 	r.DeleteDone(keyA, rec.Generation)
 	if _, ok := r.StateOf(keyA); !ok {
@@ -207,7 +443,7 @@ func TestStaleCompletionsAreDiscarded(t *testing.T) {
 func TestFailingBlipsKeepServingUntilDemoteAfter(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 	seq := r.NotifySeq()
 
@@ -241,7 +477,7 @@ func TestFailingBlipsKeepServingUntilDemoteAfter(t *testing.T) {
 func TestDemoteRevokesImmediatelyAndIdempotently(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 
 	gen := generationOf(t, r, keyA)
@@ -270,7 +506,7 @@ func TestDemoteRevokesImmediatelyAndIdempotently(t *testing.T) {
 func TestDemoteNeverServingLabelsFailed(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	seq := r.NotifySeq()
 
 	r.Demote(keyA, generationOf(t, r, keyA), ReasonVersionFailed)
@@ -289,7 +525,7 @@ func TestDemoteNeverServingLabelsFailed(t *testing.T) {
 func TestBackoffDoublesAndCapsWhileSomethingServes(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA, keyB})
+	r.Sync(members(keyA, keyB))
 	admit(t, r, keyB, "https://beta.example", "rk") // readyCount > 0: no RecoverMax cap
 
 	gen := generationOf(t, r, keyA)
@@ -313,7 +549,7 @@ func TestBackoffDoublesAndCapsWhileSomethingServes(t *testing.T) {
 func TestRecoverMaxCapsBackoffWhenNothingServes(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA}) // nothing serving at all
+	r.Sync(members(keyA)) // nothing serving at all
 
 	gen := generationOf(t, r, keyA)
 	for range 4 {
@@ -336,7 +572,7 @@ func TestRecoverMaxCapsBackoffWhenNothingServes(t *testing.T) {
 func TestUpdateSettingsAppliesExistingRetryGates(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA, keyB})
+	r.Sync(members(keyA, keyB))
 	genA := generationOf(t, r, keyA)
 	admit(t, r, keyB, "https://beta.example", "rk") // avoids the recover cap initially
 
@@ -400,7 +636,7 @@ func TestUpdateSettingsAppliesExistingRetryGates(t *testing.T) {
 func TestReadyAndDeployingResetTheGate(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := generationOf(t, r, keyA)
 	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
 	r.Failing(keyA, gen, ReasonUnreachable, time.Millisecond)
@@ -440,7 +676,7 @@ func TestReadyAndDeployingResetTheGate(t *testing.T) {
 func TestPauseUsesTheRevivalCadence(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA, keyB})
+	r.Sync(members(keyA, keyB))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 	admit(t, r, keyB, "https://beta.example", "rk")
 
@@ -468,7 +704,7 @@ func TestPauseUsesTheRevivalCadence(t *testing.T) {
 func TestFailingKeepsPausedRelaysPaused(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := generationOf(t, r, keyA)
 	r.Pause(keyA, gen, ReasonPaused)
 
@@ -494,7 +730,7 @@ func TestFailingKeepsPausedRelaysPaused(t *testing.T) {
 func TestEnterKeepsPausedRelaysPausedThroughRoutineProgress(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := generationOf(t, r, keyA)
 	r.Pause(keyA, gen, ReasonPaused)
 
@@ -531,7 +767,7 @@ func TestDeleteLifecycleGuardsAndPurge(t *testing.T) {
 	r := testRegistry(c)
 
 	// BeginDelete refuses anything that is not labeled removing.
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	if _, _, ok := r.BeginDelete(keyA); ok {
 		t.Fatal("BeginDelete succeeded on a configured relay")
 	}
@@ -576,7 +812,7 @@ func TestDeleteLifecycleGuardsAndPurge(t *testing.T) {
 func TestSingleFlightSpansTheWholeOperation(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 
 	release, gen, ok := r.Begin(keyA)
 	if !ok {
@@ -599,7 +835,7 @@ func TestSingleFlightSpansTheWholeOperation(t *testing.T) {
 func TestNotificationSemantics(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := generationOf(t, r, keyA)
 	base := r.NotifySeq() // two announcements so far: keyA + keyB absent
 
@@ -635,7 +871,7 @@ func TestNotificationSemantics(t *testing.T) {
 func TestChangesChannelCoalescesBursts(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA, keyB, keyC})
+	r.Sync(members(keyA, keyB, keyC))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 	admit(t, r, keyB, "https://beta.example", "rk")
 	r.Demote(keyA, generationOf(t, r, keyA), ReasonReplacing)
@@ -655,7 +891,7 @@ func TestChangesChannelCoalescesBursts(t *testing.T) {
 func TestServingAndSnapshotAreSorted(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyC, keyA, keyB})
+	r.Sync(members(keyC, keyA, keyB))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 	admit(t, r, keyC, "https://gamma.example", "rk")
 	admit(t, r, keyB, "https://beta.example", "rk")
@@ -683,7 +919,7 @@ func TestServingAndSnapshotAreSorted(t *testing.T) {
 func TestDefaultsTakeTheDocumentedValues(t *testing.T) {
 	c := newClock()
 	r := New(Config{Now: c.Now})
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := generationOf(t, r, keyA)
 	admit(t, r, keyA, "https://alpha.example", "rk")
 
@@ -717,7 +953,7 @@ func TestConcurrencyKeepsCountersConsistent(t *testing.T) {
 	r := testRegistry(c)
 	keys := []Key{keyA, keyB, keyC,
 		key("cloudflare", "delta"), key("vercel", "epsilon"), key("deno", "zeta")}
-	r.Sync(keys)
+	r.Sync(members(keys...))
 
 	var wg sync.WaitGroup
 	for i := range 8 {
@@ -788,7 +1024,7 @@ func TestDemoteIntoTotalOutageCapsTheFirstGateAtRecoverMax(t *testing.T) {
 		DemoteAfter: 3,
 		Now:         c.Now,
 	})
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := admit(t, r, keyA, "https://alpha.example", "rk")
 	r.Demote(keyA, gen, ReasonReplacing)
 	c.Advance(14 * time.Second)
@@ -804,7 +1040,7 @@ func TestDemoteIntoTotalOutageCapsTheFirstGateAtRecoverMax(t *testing.T) {
 func TestPausedRelayKeepsItsRevivalGateThroughOrdinaryFailures(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := admit(t, r, keyA, "https://alpha.example", "rk")
 	r.Pause(keyA, gen, ReasonPaused)
 
@@ -831,7 +1067,7 @@ func TestPausedRelayKeepsItsRevivalGateThroughOrdinaryFailures(t *testing.T) {
 func TestDrainPendingMarkerSurvivesChurnAndClearsAtTheBarrier(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	gen := generationOf(t, r, keyA)
 
 	r.DeferDrain(keyA, gen)
@@ -871,7 +1107,7 @@ func TestDrainPendingMarkerSurvivesChurnAndClearsAtTheBarrier(t *testing.T) {
 	// removal or a re-add.
 	r.DeferDrain(keyA, gen)
 	r.Sync(nil)
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	rec, ok := r.StateOf(keyA)
 	if !ok || rec.DrainPending {
 		t.Fatal("the marker leaked across an incarnation change")
@@ -890,7 +1126,7 @@ func TestDrainPendingMarkerSurvivesChurnAndClearsAtTheBarrier(t *testing.T) {
 func TestServingCarriesTheRecordedScopeFingerprint(t *testing.T) {
 	r := New(Config{})
 	keyA := Key{Provider: "vercel", Name: "alpha"}
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 
 	if got := r.Serving()[0].ScopeFP; got != "" {
@@ -902,5 +1138,38 @@ func TestServingCarriesTheRecordedScopeFingerprint(t *testing.T) {
 	r.mu.Unlock()
 	if got := r.Serving()[0].ScopeFP; got != "scope-fp-1" {
 		t.Fatalf("Serving ScopeFP = %q, want the recorded fingerprint", got)
+	}
+}
+
+// TestServingPublishesTheSyncedScopeFingerprint wires the recording the
+// runtime-key change anticipated: a member synced with a resolved pin
+// publishes that pin's fingerprint with its admission — the value the pool's
+// runtime keying folds into the endpoint key, so a relay's passive health
+// never crosses a scope move under an unchanged name. A flip republishes the
+// new scope's fingerprint with the new incarnation's admission, and a pass
+// whose credential does not resolve leaves the last recorded value alone —
+// an unknown scope is "no new information", not a scope change (the same
+// rule TestSyncUnknownScopeNeverFlips pins for the incarnation).
+func TestServingPublishesTheSyncedScopeFingerprint(t *testing.T) {
+	r := New(Config{})
+	keyA := Key{Provider: "vercel", Name: "alpha"}
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	if got := r.Serving()[0].ScopeFP; got != (deploy.Scope{Team: "team-a"}).FP() {
+		t.Fatalf("ScopeFP after a pinned sync = %q, want the pin's fingerprint", got)
+	}
+
+	r.Sync([]Member{pinned(keyA, "team-b")})
+	if gen := admit(t, r, keyA, "https://alpha.example", "rk"); gen != 2 {
+		t.Fatalf("generation after the flip = %d, want 2", gen)
+	}
+	if got := r.Serving()[0].ScopeFP; got != (deploy.Scope{Team: "team-b"}).FP() {
+		t.Fatalf("ScopeFP after the flip = %q, want the new pin's fingerprint", got)
+	}
+
+	r.Sync([]Member{{Key: keyA}})
+	if got := r.Serving()[0].ScopeFP; got != (deploy.Scope{Team: "team-b"}).FP() {
+		t.Fatalf("ScopeFP with an unresolved scope = %q, want the last recorded fingerprint", got)
 	}
 }

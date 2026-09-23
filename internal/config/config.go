@@ -428,6 +428,16 @@ func validUUID(s string) bool {
 	return true
 }
 
+// Scope returns the deployment scope this relay's pins address, in the form
+// the readiness registry compares across passes. The pins are already
+// interpolated and provider-validated by resolve — validation guarantees a
+// pin is set only on its own provider — so the mapping is verbatim and the
+// token (which may be re-read per pass) stays out: a rotated credential
+// keeps the same deployment, a moved pin starts a new incarnation.
+func (r Relay) Scope() deploy.Scope {
+	return deploy.Scope{Team: r.Team, Account: r.Account, Organization: r.Organization}
+}
+
 // ResolveToken returns the relay's provider credential, reading the secret
 // file fresh when the relay points at one.
 func (r Relay) ResolveToken() (string, error) {

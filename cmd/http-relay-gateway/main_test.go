@@ -63,12 +63,22 @@ func admit(t *testing.T, reg *readiness.Registry, keys ...readiness.Key) {
 	}
 }
 
+// syncKeys registers keys as scope-resolved Sync members with no pins — the
+// shape a relay without provider scope pins presents.
+func syncKeys(reg *readiness.Registry, keys ...readiness.Key) {
+	members := make([]readiness.Member, len(keys))
+	for i, k := range keys {
+		members[i] = readiness.Member{Key: k, ScopeKnown: true}
+	}
+	reg.Sync(members)
+}
+
 func TestBuildStateServesOnlyVerified(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	a := readiness.Key{Provider: deploy.PlatformVercel, Name: "bravo"}
 	b := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "alpha"}
 	c := readiness.Key{Provider: deploy.PlatformDeno, Name: "charlie"} // stays unverified
-	reg.Sync([]readiness.Key{a, b, c})
+	syncKeys(reg, a, b, c)
 	admit(t, reg, a, b)
 
 	st := freshState(reg, config.DefaultSettings(), zerolog.Nop())
@@ -132,7 +142,7 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	v := readiness.Key{Provider: deploy.PlatformVercel, Name: "v"}
 	c := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "c"}
-	reg.Sync([]readiness.Key{v, c})
+	syncKeys(reg, v, c)
 	admit(t, reg, v, c)
 
 	settings := config.DefaultSettings()
@@ -155,7 +165,7 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 	t.Run("single small provider keeps its own cap", func(t *testing.T) {
 		solo := readiness.New(readiness.Config{})
 		k := readiness.Key{Provider: deploy.PlatformVercel, Name: "solo"}
-		solo.Sync([]readiness.Key{k})
+		syncKeys(solo, k)
 		gen, _ := solo.GenerationOf(k)
 		u, err := fixtureURL(k.Provider, k.Name)
 		if err != nil {
@@ -184,7 +194,7 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 	t.Run("invalid verified urls are skipped not served", func(t *testing.T) {
 		bad := readiness.New(readiness.Config{})
 		k := readiness.Key{Provider: deploy.PlatformVercel, Name: "bad"}
-		bad.Sync([]readiness.Key{k})
+		syncKeys(bad, k)
 		gen, _ := bad.GenerationOf(k)
 		bad.Ready(k, gen, "://not a url", "key", time.Millisecond)
 		var logs bytes.Buffer
@@ -644,7 +654,7 @@ func TestBuildStateReusesRuntimeHealthAcrossSwaps(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	a := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "alpha"}
 	b := readiness.Key{Provider: deploy.PlatformVercel, Name: "bravo"}
-	reg.Sync([]readiness.Key{a, b})
+	syncKeys(reg, a, b)
 	admit(t, reg, a, b)
 
 	settings := shortFuseSettings()
@@ -669,7 +679,7 @@ func TestBuildStateReusesRuntimeHealthAcrossSwaps(t *testing.T) {
 	// alpha or bravo changed — the rebuild must not touch their runtime
 	// state.
 	c := readiness.Key{Provider: deploy.PlatformDeno, Name: "charlie"}
-	reg.Sync([]readiness.Key{a, b, c})
+	syncKeys(reg, a, b, c)
 	admit(t, reg, c)
 
 	second := buildState(reg, settings, zerolog.Nop(), rt, cc)
@@ -713,7 +723,7 @@ func TestBuildStatePrunesRemovedRelays(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	a := readiness.Key{Provider: deploy.PlatformVercel, Name: "alpha"}
 	b := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "bravo"}
-	reg.Sync([]readiness.Key{a, b})
+	syncKeys(reg, a, b)
 	admit(t, reg, a, b)
 
 	settings := shortFuseSettings()
@@ -732,7 +742,7 @@ func TestBuildStatePrunesRemovedRelays(t *testing.T) {
 	// bravo leaves the desired state: the registry revokes its admission,
 	// the applier prunes the identities the last-known-good file no longer
 	// names, and the rebuild serves only alpha.
-	reg.Sync([]readiness.Key{a})
+	syncKeys(reg, a)
 	rt.Prune(desiredIdentities(&config.Config{Relays: []config.Relay{
 		{Name: "alpha", Provider: deploy.PlatformVercel},
 	}}))
@@ -749,7 +759,7 @@ func TestBuildStatePrunesRemovedRelays(t *testing.T) {
 
 	// bravo comes back as a new incarnation: its pruned state must not
 	// resurface — the re-added relay starts clean while alpha stays cooled.
-	reg.Sync([]readiness.Key{a, b})
+	syncKeys(reg, a, b)
 	admit(t, reg, b)
 	third := buildState(reg, settings, zerolog.Nop(), rt, cc)
 	row, ok = relayStatsRow(third.Pool, "bravo")

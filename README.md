@@ -362,11 +362,16 @@ a cloudflare token that sees exactly one account resolves it automatically,
 anything more ambiguous requires the explicit pin; `organization` (deno only)
 pins the Deploy organization id, required because that API addresses projects
 by organization and offers no route to resolve one from the token. Changing a
-scope pin under an unchanged relay name moves the
-identity to a different platform scope: the gateway deploys fresh there,
-and the deployment the old scope hosted is **orphaned** — no later pass can
-reach or delete it, so the log warns and the old project must be removed
-manually.
+scope pin under an unchanged relay name is a new identity, not an update:
+the relay's readiness generation bumps, admission is revoked first, and the
+replacement runs the same settle → drain barrier as any rollout, so nothing
+deploys into the new scope while the old scope's worker still carries a
+request. The new scope then gets a fresh deployment; the deployment the old
+scope hosted is **orphaned** — no later pass can reach or delete it, so the
+log warns (scopes named by fingerprint, never by pin value) and the old
+project must be removed manually. Generations are monotonic within one
+process and start at 1 per relay; they are not persisted, so a restart
+restarts every relay at 1.
 
 The poller re-reads the file every second and compares content hashes — a
 design, not a gap: no inotify, and unlike a watcher it cannot miss events

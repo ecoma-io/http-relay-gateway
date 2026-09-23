@@ -15,7 +15,7 @@ func benchRegistry(b *testing.B) (*Registry, []Key) {
 		keys[i] = key("cloudflare", fmt.Sprintf("relay-%02d", i))
 	}
 	r := New(Config{Now: newClock().Now})
-	r.Sync(keys)
+	r.Sync(members(keys...))
 	for i, k := range keys {
 		if i%2 == 0 {
 			admitBench(b, r, k)

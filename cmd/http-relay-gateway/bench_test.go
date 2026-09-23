@@ -29,7 +29,11 @@ func BenchmarkBuildState(b *testing.B) {
 		})
 	}
 	reg := readiness.New(readiness.Config{})
-	reg.Sync(keys)
+	members := make([]readiness.Member, len(keys))
+	for i, k := range keys {
+		members[i] = readiness.Member{Key: k, ScopeKnown: true}
+	}
+	reg.Sync(members)
 	for _, k := range keys {
 		gen, ok := reg.GenerationOf(k)
 		if !ok {

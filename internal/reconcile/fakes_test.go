@@ -394,7 +394,7 @@ func (r *testRig) newWorker() *Worker {
 		log:           zerolog.Nop(),
 		probeHTTP:     deploy.ProbeClient(2 * time.Second),
 		platformLocks: locks,
-		credentials:   map[deploy.RelayKey]deploy.Credential{},
+		credentials:   map[deploy.RelayKey]credEntry{},
 		wake:          make(chan struct{}, 1),
 		ctx:           context.Background(),
 		cancel:        func() {},

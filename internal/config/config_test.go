@@ -940,6 +940,48 @@ relays:
 	}
 }
 
+// A relay's scope is its pins verbatim — validation already guarantees a pin
+// rides only its own provider — and never its token: the token rotates per
+// pass, the scope is part of the deployment's identity.
+func TestRelayScopeCarriesPinsOnly(t *testing.T) {
+	path := writeConfig(t, `
+relays:
+  - name: web-relay
+    provider: vercel
+    token: t
+    team: team-alpha
+  - name: edge-relay
+    provider: cloudflare
+    token: t
+    account: 023e105f4ecef8ad9ca31a8372d0c353
+  - name: fn-relay
+    provider: deno
+    token: t
+    organization: e17a0e6b-7ba7-4a6e-9dbd-1f9a83d4db0a
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	web, _ := cfg.Relay("vercel", "web-relay")
+	if got := web.Scope(); got != (deploy.Scope{Team: "team-alpha"}) {
+		t.Errorf("vercel relay scope = %+v, want the team pin", got)
+	}
+	edge, _ := cfg.Relay("cloudflare", "edge-relay")
+	if got := edge.Scope(); got != (deploy.Scope{Account: "023e105f4ecef8ad9ca31a8372d0c353"}) {
+		t.Errorf("cloudflare relay scope = %+v, want the account pin", got)
+	}
+	fn, _ := cfg.Relay("deno", "fn-relay")
+	if got := fn.Scope(); got != (deploy.Scope{Organization: "e17a0e6b-7ba7-4a6e-9dbd-1f9a83d4db0a"}) {
+		t.Errorf("deno relay scope = %+v, want the organization pin", got)
+	}
+	unpinned := Relay{Name: "bare", Provider: "vercel", Token: "t"}
+	if got := unpinned.Scope(); got != (deploy.Scope{}) {
+		t.Errorf("unpinned relay scope = %+v, want the zero scope", got)
+	}
+}
+
 func TestDefaultSettings(t *testing.T) {
 	want := Settings{
 		LogLevel:              "info",

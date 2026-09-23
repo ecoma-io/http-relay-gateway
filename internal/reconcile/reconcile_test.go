@@ -20,6 +20,16 @@ import (
 
 // --- first bring-up, reuse and drift ---
 
+// members wraps keys as scope-resolved Sync members with no pins — the shape
+// a relay without provider scope pins presents.
+func members(keys ...deploy.RelayKey) []readiness.Member {
+	out := make([]readiness.Member, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, readiness.Member{Key: k, ScopeKnown: true})
+	}
+	return out
+}
+
 func TestPassFirstBringUpDeploysAndAdmits(t *testing.T) {
 	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
 	rig.sim.setVersion(deploy.RelayVersion)
@@ -829,7 +839,7 @@ func TestRemoveWithoutMemoizedCredentialPurgesAnyway(t *testing.T) {
 	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
 	// No prior pass: no credential on record. Sync the identity, then take
 	// it away before any ensure ran.
-	rig.reg.Sync(rig.desired.Keys())
+	rig.reg.Sync(members(rig.desired.Keys()...))
 	rig.desired.Relays = nil
 	rig.worker.pass()
 
@@ -914,7 +924,7 @@ func TestStaleDeleteBlocksReaddedIdentityUntilOldProjectGone(t *testing.T) {
 
 	// While the delete holds the single-flight, the identity cannot begin
 	// any deploy — even after being re-added.
-	rig.reg.Sync([]deploy.RelayKey{key})
+	rig.reg.Sync(members(key))
 	rec, ok := rig.reg.StateOf(key)
 	if !ok || rec.State != readiness.StateConfigured {
 		t.Fatalf("re-added state = %+v ok=%t, want configured", rec, ok)
@@ -1239,28 +1249,98 @@ func TestShutdownSettleBarrierAbandonsTheDelete(t *testing.T) {
 // identity to a different platform scope: the pass deploys fresh there and
 // the old scope's deployment is unreachable from the desired state forever.
 // The operator gets a warning — once per actual change, not per pass.
-func TestScopePinChangeWarnsAboutTheOrphanedDeployment(t *testing.T) {
-	rig := newTestRig(t, relay("edge-a", deploy.PlatformVercel, testToken))
+// A scope pin that moves under a stable relay name is a new incarnation: the
+// registry revokes the old scope's admission and bumps the generation, the
+// rollout re-runs the settle+drain barrier before touching the platform (the
+// in-flight requests were addressed to the OLD scope's deployment), and the
+// fresh deploy lands in the new scope. The old scope's project is orphaned —
+// the warning says so in fingerprint form, never in raw pin values.
+func TestScopeChangeRunsTheBarrierThenDeploysInTheNewScope(t *testing.T) {
+	first := relay("edge-a", deploy.PlatformVercel, testToken)
+	first.Team = "team-a"
+	rig := newTestRig(t, first)
 	rig.sim.setVersion(deploy.RelayVersion)
-	rig.newPrimaryClient(true)
+	client := rig.newPrimaryClient(true)
 	var buf bytes.Buffer
 	rig.worker.log = zerolog.New(&buf)
 	rig.worker.pass()
-
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	gen1 := generationOfRig(t, rig, key)
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before the scope change")
+	}
 	if strings.Contains(buf.String(), "orphaned") {
 		t.Fatalf("first memo must not warn: %s", buf.String())
 	}
-	changed := relay("edge-a", deploy.PlatformVercel, testToken)
+
+	// Move the team pin: same name, same provider, a different scope — and a
+	// platform whose new scope has no project for this identity yet.
+	changed := first
 	changed.Team = "team-b"
 	*rig.desired = config.Config{Relays: []config.Relay{changed}, Settings: config.DefaultSettings()}
+	rig.factory.mu.Lock()
+	client.exists = false
+	rig.factory.mu.Unlock()
 	rig.worker.pass()
+
 	if !strings.Contains(buf.String(), "orphaned") {
 		t.Fatalf("scope change without an orphan warning: %s", buf.String())
 	}
+	// The warning names the scopes by fingerprint only.
+	if !strings.Contains(buf.String(), deploy.Scope{Team: "team-a"}.FP()) ||
+		!strings.Contains(buf.String(), deploy.Scope{Team: "team-b"}.FP()) {
+		t.Fatalf("orphan warning without both scope fingerprints: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), "team-b") {
+		t.Fatalf("orphan warning leaked the raw pin value: %s", buf.String())
+	}
+	if gen := generationOfRig(t, rig, key); gen != gen1+1 {
+		t.Fatalf("generation = %d, want %d (the flip is a new incarnation)", gen, gen1+1)
+	}
+	// The barrier ran ahead of the deploy even though the flip had already
+	// revoked admission: serving=false at drain time proves the barrier is
+	// the flip's, not an ordinary replacement's.
+	want := []string{"settle", "drain:vercel/edge-a:serving=false:idle=true", "deploy"}
+	if got := rig.log.all(); len(got) != len(want) {
+		t.Fatalf("events = %v, want exactly %v", got, want)
+	}
+	for i, ev := range want {
+		if got := rig.log.all()[i]; got != ev {
+			t.Fatalf("event[%d] = %q, want %q (the barrier precedes the deploy)", i, got, ev)
+		}
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 (the new scope's own fresh deploy)", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not re-admitted after the fresh deploy in the new scope")
+	}
+	for _, s := range rig.reg.Serving() {
+		if s.Version != gen1+1 {
+			t.Fatalf("serving generation = %d, want the new incarnation %d", s.Version, gen1+1)
+		}
+	}
 
+	// An unchanged scope stays silent and deploys nothing: the flip's marker
+	// was consumed by the rollout that ran it.
 	buf.Reset()
 	rig.worker.pass()
 	if buf.Len() != 0 {
 		t.Fatalf("an unchanged scope must stay silent, got: %s", buf.String())
 	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 (the next pass reuses, never redeploys)", got)
+	}
+	if settles := rig.settles; settles != 1 {
+		t.Fatalf("settles = %d, want 1 (the flip's barrier ran exactly once)", settles)
+	}
+}
+
+func generationOfRig(t *testing.T, rig *testRig, key deploy.RelayKey) uint64 {
+	t.Helper()
+	gen, ok := rig.reg.GenerationOf(key)
+	if !ok {
+		t.Fatalf("no registry entry for %v", key)
+	}
+	return gen
 }
