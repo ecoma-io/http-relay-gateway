@@ -750,6 +750,95 @@ func TestBuildStateReusesRuntimeHealthAcrossSwaps(t *testing.T) {
 	}
 }
 
+// TestBuildStateKeysRuntimeHealthByTheEndpoint pins every component in the
+// RuntimeKey literal buildState composes. Passive health belongs to the
+// verified endpoint, not merely provider/name: scope moves, URL moves and
+// relay-key rotations each start clean, while an unchanged rebuild carries
+// the cooldown. Re-admitting the original endpoint after each move must also
+// start clean: Attach purges the prior key for that identity rather than
+// retaining old endpoint state behind it. Deleting ScopeFP, URL or TokenFP
+// from the literal respectively makes the matching subtest carry the old
+// cooldown and fail.
+func TestBuildStateKeysRuntimeHealthByTheEndpoint(t *testing.T) {
+	key := readiness.Key{Provider: deploy.PlatformVercel, Name: "alpha"}
+	baseScope := deploy.Scope{Team: "team-a"}
+	const (
+		baseURL   = "http://alpha.vercel.internal"
+		baseToken = "relay-key-alpha"
+	)
+
+	type endpoint struct {
+		scope deploy.Scope
+		url   string
+		token string
+	}
+	base := endpoint{scope: baseScope, url: baseURL, token: baseToken}
+	cases := []struct {
+		name string
+		next endpoint
+	}{
+		{"scope fingerprint", endpoint{scope: deploy.Scope{Team: "team-b"}, url: baseURL, token: baseToken}},
+		{"serving URL", endpoint{scope: baseScope, url: "http://alpha-moved.vercel.internal", token: baseToken}},
+		{"relay token", endpoint{scope: baseScope, url: baseURL, token: "relay-key-rotated"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := readiness.New(readiness.Config{})
+			// admitEndpoint is the exact registry->buildState serving path:
+			// Sync records a scope fingerprint, Ready carries its URL/key pair.
+			admitEndpoint := func(ep endpoint) {
+				reg.Sync([]readiness.Member{{Key: key, Scope: ep.scope, ScopeKnown: true}})
+				gen, ok := reg.GenerationOf(key)
+				if !ok {
+					t.Fatal("endpoint key vanished from the registry")
+				}
+				reg.Ready(key, gen, ep.url, ep.token, time.Millisecond)
+				for {
+					select {
+					case <-reg.Changes():
+					default:
+						return
+					}
+				}
+			}
+
+			settings := shortFuseSettings() // threshold 1, day-long cooldown
+			rt := pool.NewRuntimeState()
+			cc := gateway.NewClientCache()
+			admitEndpoint(base)
+			first := buildState(reg, settings, zerolog.Nop(), rt, cc)
+			alpha := first.Pool.Pick(pool.KeyAll)
+			first.Pool.RecordFailure(alpha, errors.New("dial relay: connection refused"))
+			if row, ok := relayStatsRow(first.Pool, "alpha"); !ok || row.Healthy || row.Failures != 1 {
+				t.Fatalf("seeded endpoint failure = %+v (ok=%v), want a cooldown", row, ok)
+			}
+
+			// An unchanged endpoint re-attaches the state it earned.
+			unchanged := buildState(reg, settings, zerolog.Nop(), rt, cc)
+			if row, ok := relayStatsRow(unchanged.Pool, "alpha"); !ok || row.Healthy || row.Failures != 1 {
+				t.Fatalf("unchanged endpoint lost its health: %+v (ok=%v)", row, ok)
+			}
+
+			// Exactly one endpoint component moves; the serving snapshot is
+			// re-admitted under it and therefore builds with a new RuntimeKey.
+			admitEndpoint(tc.next)
+			moved := buildState(reg, settings, zerolog.Nop(), rt, cc)
+			if row, ok := relayStatsRow(moved.Pool, "alpha"); !ok || !row.Healthy || row.Failures != 0 || row.Requests != 0 {
+				t.Fatalf("changed %s inherited the old endpoint's health: %+v (ok=%v)", tc.name, row, ok)
+			}
+
+			// The old key was purged, not just displaced: returning to it
+			// gets a clean RelayState rather than the first build's cooldown.
+			admitEndpoint(base)
+			returned := buildState(reg, settings, zerolog.Nop(), rt, cc)
+			if row, ok := relayStatsRow(returned.Pool, "alpha"); !ok || !row.Healthy || row.Failures != 0 || row.Requests != 0 {
+				t.Fatalf("old endpoint state survived a %s move: %+v (ok=%v)", tc.name, row, ok)
+			}
+		})
+	}
+}
+
 // TestBuildStatePrunesRemovedRelays: a relay that left the desired
 // configuration loses its runtime state — a re-added identity starts clean
 // — while a relay that stayed desired keeps its cooldown through the same

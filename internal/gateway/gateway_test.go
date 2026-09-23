@@ -95,6 +95,9 @@ type relaySpec struct {
 	rawURL   string
 	token    string
 	maxBody  int64
+	// incarnation is the admission generation the relay was verified under;
+	// the hot path's attempt lines quote it. Zero is legal and unlabeled.
+	incarnation uint64
 }
 
 func buildPool(t *testing.T, specs []relaySpec) *pool.Pool {
@@ -106,11 +109,12 @@ func buildPool(t *testing.T, specs []relaySpec) *pool.Pool {
 			token = "token-" + s.name
 		}
 		in.Relays = append(in.Relays, pool.RelayInput{
-			Name:     s.name,
-			Provider: s.provider,
-			URL:      relayURL(t, s.rawURL),
-			Token:    token,
-			MaxBody:  s.maxBody,
+			Name:        s.name,
+			Provider:    s.provider,
+			URL:         relayURL(t, s.rawURL),
+			Token:       token,
+			MaxBody:     s.maxBody,
+			Incarnation: s.incarnation,
 		})
 	}
 	p, err := pool.New(in)
@@ -600,12 +604,16 @@ func TestControlEndpoints(t *testing.T) {
 }
 
 func TestStatsExposesNoSecrets(t *testing.T) {
-	up, _, got := newUpstream(t, http.StatusOK, "ok", nil)
-	g := newGateway(t, &State{
+	// The scenario is a mid-stream failure, not a clean answer: it is the
+	// one that populates every counter the contract renders — including
+	// midstreamFailures, whose allowlist entry the leak-scan would otherwise
+	// never exercise (omitempty hides it while zero).
+	up, _ := newTruncatingUpstream(t)
+	g, lc := newCapturingGateway(t, &State{
 		Pool: buildPool(t, []relaySpec{
 			{name: "alpha", provider: "vercel", rawURL: up.URL, token: "very-secret-token", maxBody: pool.VercelMaxBody},
 		}),
-		MaxRetries:     1,
+		MaxRetries:     0, // one attempt: a started response is never retried
 		MaxBufferBytes: bufferBytes(),
 		Lifecycle: []LifecycleRow{
 			{Name: "alpha", Provider: "vercel", State: "ready", Generation: 7},
@@ -614,11 +622,11 @@ func TestStatsExposesNoSecrets(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	g.ServeHTTP(rec, relayRequest(t, http.MethodGet, "/", "", specHeaders()))
+	g.ServeHTTP(rec, relayRequest(t, http.MethodPost, "/", "buffered", specHeaders()))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("relay status = %d, want 200 before /stats", rec.Code)
+		t.Fatalf("relay status = %d, want the relay's original 200 before /stats", rec.Code)
 	}
-	readCapture(t, got)
+	waitForLog(t, lc, "upstream_midstream")
 
 	rec = httptest.NewRecorder()
 	g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
@@ -651,14 +659,20 @@ func TestStatsExposesNoSecrets(t *testing.T) {
 	allowed := map[string]bool{
 		"name": true, "provider": true, "healthy": true, "maxBody": true,
 		"requests": true, "failures": true, "lastError": true,
+		"midstreamFailures": true,
 	}
 	for k := range doc.Relays[0] {
 		if !allowed[k] {
 			t.Fatalf("relay stats key %q would leak a URL or token", k)
 		}
 	}
-	if doc.Relays[0]["requests"] != float64(1) {
-		t.Fatalf("requests counter = %v, want 1", doc.Relays[0]["requests"])
+	if doc.Relays[0]["requests"] != float64(1) || doc.Relays[0]["failures"] != float64(1) {
+		t.Fatalf("counters = %v / %v, want 1 request, 1 failure", doc.Relays[0]["requests"], doc.Relays[0]["failures"])
+	}
+	// The contract field itself: rendered, non-zero, and equal to the count
+	// the mid-stream classification recorded.
+	if doc.Relays[0]["midstreamFailures"] != float64(1) {
+		t.Fatalf("midstreamFailures = %v, want 1 — the leak-scan must cover it while rendered", doc.Relays[0]["midstreamFailures"])
 	}
 	if len(doc.Lifecycle) != 2 {
 		t.Fatalf("lifecycle rows = %d, want one per configured relay", len(doc.Lifecycle))
@@ -768,20 +782,16 @@ func TestResponseStartedIsNeverRetried(t *testing.T) {
 	}
 }
 
-// TestMidstreamUpstreamErrorIsPassiveAndNeverRetried pins the issue #59
-// accounting and the issue #62 fix: a relay that answers and then breaks its
-// body mid-stream is a counted attempt AND a passive transport failure whose
-// streak ACCUMULATES across consecutive attempts (no header-time success
-// resets it), so threshold 2 trips on the second one — and the truncated
-// answer is never retried (the client already holds part of the body).
-func TestMidstreamUpstreamErrorIsPassiveAndNeverRetried(t *testing.T) {
+// newTruncatingUpstream answers 200 with a declared 128-byte body, ships a
+// short prefix and hard-closes the connection — the relay leg that breaks
+// after the headers. A handler that merely returns early is re-framed into a
+// complete chunked response by the server, so the hijack is what makes the
+// leg actually break mid-body. Every request it serves does this.
+func newTruncatingUpstream(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
 	hits := &atomic.Int64{}
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
-		// Answer, ship a prefix of the declared body, hard-close. A handler
-		// that merely returns early is re-framed into a complete chunked
-		// response by the server, so the hijack is what makes the leg
-		// actually break mid-body.
 		hj, ok := w.(http.Hijacker)
 		if !ok {
 			t.Error("upstream server does not support hijacking")
@@ -794,7 +804,7 @@ func TestMidstreamUpstreamErrorIsPassiveAndNeverRetried(t *testing.T) {
 		}
 		// The Fprintf error is discarded explicitly (errcheck): the write
 		// target is the hijacked conn's own buffered writer, and the test's
-		// assertions below observe the client-visible effect either way.
+		// assertions observe the client-visible effect either way.
 		_, _ = fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Length: 128\r\n"+
 			"Content-Type: text/plain\r\n\r\ntruncated-body")
 		if err := buf.Flush(); err != nil {
@@ -803,12 +813,27 @@ func TestMidstreamUpstreamErrorIsPassiveAndNeverRetried(t *testing.T) {
 		_ = conn.Close()
 	}))
 	t.Cleanup(up.Close)
+	return up, hits
+}
+
+// TestMidstreamUpstreamErrorIsPassiveAndNeverRetried pins the issue #59
+// accounting and the issue #62 fix: a relay that answers and then breaks its
+// body mid-stream is a counted attempt AND a passive transport failure whose
+// streak ACCUMULATES across consecutive attempts (no header-time success
+// resets it), so threshold 2 trips on the second one — and the truncated
+// answer is never retried (the client already holds part of the body).
+func TestMidstreamUpstreamErrorIsPassiveAndNeverRetried(t *testing.T) {
+	up, hits := newTruncatingUpstream(t)
 
 	// threshold 2: the second consecutive mid-stream failure must trip the
 	// cooldown. Under the pre-#62 ordering each attempt also recorded a
 	// header-time success that reset the streak first, so it never could —
-	// that is exactly the regression this pin guards.
-	in := pool.Input{FailureThreshold: 2, Cooldown: time.Second}
+	// that is exactly the regression this pin guards. The cooldown is a day:
+	// the trip is asserted immediately after the second failure against
+	// RecordFailure's wall-clock now, and this test never waits for expiry —
+	// a short cooldown here would make healthy=false race the clock on a
+	// loaded CI runner for no gain.
+	in := pool.Input{FailureThreshold: 2, Cooldown: 24 * time.Hour}
 	in.Relays = append(in.Relays, pool.RelayInput{
 		Name: "mid", Provider: "vercel", URL: relayURL(t, up.URL),
 		Token: "token-mid", MaxBody: bufferBytes(),
@@ -862,6 +887,11 @@ func TestMidstreamUpstreamErrorIsPassiveAndNeverRetried(t *testing.T) {
 // not clear the previous failure's evidence.
 func TestCompletedSuccessResetsTheMidstreamStreak(t *testing.T) {
 	hits := &atomic.Int64{}
+	// releaseBody is closed by the test once it has read the complete
+	// answer's bytes mid-flight; the upstream then lets the body EOF. The
+	// fallback timer only fires on a failed test, so a regression can never
+	// hang the suite.
+	releaseBody := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch hits.Add(1) {
 		case 1, 3:
@@ -888,14 +918,16 @@ func TestCompletedSuccessResetsTheMidstreamStreak(t *testing.T) {
 			// A complete answer whose body deliberately finishes late: the
 			// client already holds every byte while the relay body is still
 			// open — exactly the window where a header-time success would
-			// have recorded too early.
+			// have recorded too early. The body stays open until the test
+			// releases it, so the mid-flight row assert below races nothing.
 			fl := w.(http.Flusher)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("whole"))
 			fl.Flush()
 			select {
 			case <-r.Context().Done():
-			case <-time.After(80 * time.Millisecond):
+			case <-releaseBody:
+			case <-time.After(2 * time.Second):
 			}
 		case 4:
 			// The client leaves mid-body: one flushed chunk, then wait.
@@ -960,11 +992,14 @@ func TestCompletedSuccessResetsTheMidstreamStreak(t *testing.T) {
 	if string(prefix) != "whole" {
 		t.Fatalf("body prefix = %q, want the complete answer's bytes", prefix)
 	}
-	// The relay body is still open here (the upstream holds it ~60ms more).
-	time.Sleep(20 * time.Millisecond)
+	// The relay body is still open here — the upstream holds it until
+	// releaseBody below — so the copy cannot have reached EOF and the
+	// success record cannot have landed yet. No sleep: the hold makes the
+	// mid-flight window a fact, not a timing bet.
 	if r := row(); r.LastError == "" || r.Failures != 1 {
 		t.Fatalf("mid-flight of the completed body: row = %+v, want lastError still set and still 1 failure — headers are not success evidence", r)
 	}
+	close(releaseBody) // the upstream lets the body EOF: the copy completes
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		t.Fatalf("drain body: %v", err)
 	}
@@ -1868,4 +1903,518 @@ func TestHealthUpdatesReachThePickedGeneration(t *testing.T) {
 			t.Fatalf("entry generation row = %+v, want untouched — the health update must follow the pick", entryRow)
 		}
 	})
+}
+
+// --- outcome classification pins ---
+
+// stubRoundTripper answers every request with one canned response — the seam
+// that reaches the classification switch with a copy the transport itself
+// reported as clean.
+type stubRoundTripper struct{ resp *http.Response }
+
+func (s *stubRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return s.resp, nil }
+
+// abortBody serves its payload, then cancels the request's context as it
+// reports EOF — the EOF-flush abort shape: the copy itself succeeds
+// (copyErr == nil) while the client is already gone. In the real stack this
+// is a client dying while http.response flushes the final chunk: Flush
+// reports no error, so the copy looks complete and only the dead context
+// tells the two outcomes apart.
+type abortBody struct {
+	payload []byte
+	cancel  context.CancelFunc
+	eof     bool
+}
+
+func (b *abortBody) Read(p []byte) (int, error) {
+	if b.eof {
+		b.cancel()
+		return 0, io.EOF
+	}
+	b.eof = true
+	return copy(p, b.payload), nil
+}
+
+func (b *abortBody) Close() error { return nil }
+
+// TestEOFFlushAbortIsClientAbortedNotSuccess pins the flush window: a copy
+// that ends cleanly (copyErr == nil) with a DEAD request context is a client
+// abort — recorded as neither success nor failure, outcome client_aborted —
+// never a success. flushWriter drops the Flush error (http.response.Flush
+// has no return), so without the live-context check this shape recorded
+// RecordSuccess and silently cleared the relay's failure evidence. The
+// second subtest is the control: the same harness with a live context must
+// still record the success, so the first cannot pass vacuously.
+func TestEOFFlushAbortIsClientAbortedNotSuccess(t *testing.T) {
+	// run builds a seeded relay (one prior failure whose evidence a success
+	// would clear) whose relay leg is the stub transport, and drives one
+	// request through the real relay pipeline.
+	run := func(t *testing.T, abort bool) (*captureLog, *httptest.ResponseRecorder, *pool.Pool) {
+		t.Helper()
+		p := buildPool(t, []relaySpec{
+			{name: "solo", provider: "vercel", rawURL: "http://solo.internal", maxBody: bufferBytes()},
+		})
+		p.RecordFailure(p.Pick(pool.KeyAll), errors.New("dial solo: connection refused"))
+
+		body := &abortBody{payload: []byte("done"), cancel: func() {}}
+		req := relayRequest(t, http.MethodGet, "/", "", specHeaders())
+		if abort {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			body.cancel = cancel
+			req = req.WithContext(ctx)
+		}
+		g, lc := newCapturingGateway(t, &State{
+			Pool: p,
+			Client: &http.Client{Transport: &stubRoundTripper{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       body,
+			}}},
+			MaxRetries:     1,
+			MaxBufferBytes: bufferBytes(),
+		})
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, req)
+		return lc, rec, p
+	}
+
+	t.Run("dead context at a clean copy is an abort", func(t *testing.T) {
+		lc, rec, p := run(t, true)
+		if got := rec.Body.String(); got != "done" {
+			t.Fatalf("client body = %q, want the full relay body — the copy itself must have succeeded", got)
+		}
+		waitForLog(t, lc, "client_aborted")
+		row := relayStatsBy(p)["solo"]
+		if row.Requests != 1 || row.Failures != 1 || row.MidstreamFailures != 0 {
+			t.Fatalf("row = %+v, want the seeded failure standing with nothing added — an abort records neither success nor failure", row)
+		}
+		if row.LastError != "dial solo: connection refused" {
+			t.Fatalf("lastError = %q, want the seeded failure intact — a success here would have cleared it", row.LastError)
+		}
+		if !row.Healthy {
+			t.Fatalf("row = %+v, want the relay still healthy — an abort is not a failure", row)
+		}
+	})
+
+	t.Run("live context at a clean copy is a success", func(t *testing.T) {
+		lc, rec, p := run(t, false)
+		if got := rec.Body.String(); got != "done" {
+			t.Fatalf("client body = %q, want the full relay body", got)
+		}
+		if strings.Contains(lc.String(), `"outcome":"client_aborted"`) {
+			t.Fatal("a live context was classified as a client abort")
+		}
+		row := relayStatsBy(p)["solo"]
+		if row.LastError != "" {
+			t.Fatalf("lastError = %q, want it cleared — the control proves the harness records the success this test hangs on", row.LastError)
+		}
+		if row.Requests != 1 || !row.Healthy {
+			t.Fatalf("row = %+v, want the completed success recorded", row)
+		}
+	})
+}
+
+// outcomes extracts every logged outcome value in order.
+func outcomes(lc *captureLog) []string {
+	var out []string
+	for _, line := range strings.Split(lc.String(), "\n") {
+		i := strings.Index(line, `"outcome":"`)
+		if i < 0 {
+			continue
+		}
+		rest := line[i+len(`"outcome":"`):]
+		if j := strings.IndexByte(rest, '"'); j >= 0 {
+			out = append(out, rest[:j])
+		}
+	}
+	return out
+}
+
+// waitOutcome waits for the first attempt line and returns every outcome
+// logged so far. The log write sits after the classification decision in
+// every branch, so this is the happens-before edge the row comparisons
+// below rely on.
+func waitOutcome(t *testing.T, lc *captureLog) []string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if outs := outcomes(lc); len(outs) > 0 {
+			return outs
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("attempt log never recorded an outcome; captured:\n%s", lc.String())
+	return nil
+}
+
+// TestDrainDoesNotChangeClassification pins the BeginDrain contract: the
+// draining flag is a log-line label and nothing else. http.Server.Shutdown
+// never cancels request contexts, so a failure during the drain means
+// exactly what it means mid-flight — a drain-special-cased outcome (a
+// drain_aborted label, a skipped health record) would invent evidence the
+// mid-flight classification never produced and punish or excuse relays for
+// a process that is merely exiting.
+func TestDrainDoesNotChangeClassification(t *testing.T) {
+	// run issues one buffered request through a fresh gateway over rawURL
+	// and returns the relay's stats row, the logged outcomes and the raw
+	// log. Both runs of a scenario share one upstream, so the rows must be
+	// equal down to the error text.
+	run := func(t *testing.T, rawURL string, drained bool) (pool.StatsRow, []string, string) {
+		t.Helper()
+		p := buildPool(t, []relaySpec{
+			{name: "solo", provider: "vercel", rawURL: rawURL, maxBody: bufferBytes()},
+		})
+		g, lc := newCapturingGateway(t, &State{
+			Pool:           p,
+			MaxRetries:     0, // one attempt: the transport scenario must not retry
+			MaxBufferBytes: bufferBytes(),
+		})
+		if drained {
+			g.BeginDrain()
+		}
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, relayRequest(t, http.MethodPost, "/", "buffered", specHeaders()))
+		if rec.Code == 0 {
+			t.Fatal("the request never completed")
+		}
+		return relayStatsBy(p)["solo"], waitOutcome(t, lc), lc.String()
+	}
+
+	scenarios := []struct {
+		name   string
+		rawURL func(t *testing.T) string
+		want   string // the classification outcome the scenario must produce
+	}{
+		{"completed answer", func(t *testing.T) string {
+			up, _, _ := newUpstream(t, http.StatusOK, "served", nil)
+			return up.URL
+		}, "relayed"},
+		{"mid-stream failure", func(t *testing.T) string {
+			up, _ := newTruncatingUpstream(t)
+			return up.URL
+		}, "upstream_midstream"},
+		{"transport failure", func(t *testing.T) string { return deadRelayURL(t) }, "upstream_pre_response"},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			rawURL := tc.rawURL(t)
+			plainRow, plainOut, plainLog := run(t, rawURL, false)
+			drainedRow, drainedOut, drainedLog := run(t, rawURL, true)
+
+			if plainRow != drainedRow {
+				t.Fatalf("the drain changed the relay's row: plain %+v vs drained %+v", plainRow, drainedRow)
+			}
+			if strings.Join(plainOut, ",") != strings.Join(drainedOut, ",") {
+				t.Fatalf("the drain changed the logged outcomes: plain %v vs drained %v", plainOut, drainedOut)
+			}
+			if got := plainOut[len(plainOut)-1]; got != tc.want {
+				t.Fatalf("outcome = %q, want %q — the scenario must classify before the drain can be compared", got, tc.want)
+			}
+			if !strings.Contains(drainedLog, `"draining":true`) {
+				t.Fatal("the drained run's lines carry no draining label — the flag stopped being operator context")
+			}
+			if strings.Contains(plainLog, `"draining"`) {
+				t.Fatal("the undrained run's lines carry a draining label")
+			}
+		})
+	}
+}
+
+// outcomeEvents decodes every captured log line carrying the outcome into a
+// JSON object, so a test can pin the fields the hot path logged alongside
+// it.
+func outcomeEvents(t *testing.T, lc *captureLog, outcome string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(lc.String(), "\n") {
+		if !strings.Contains(line, `"outcome":"`+outcome+`"`) {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// TestAttemptLogCarriesThePickedIncarnation pins the incarnation label: a
+// relay-naming attempt line quotes the admission generation of the relay
+// that served it, and the value comes from the PICKED generation — the line
+// after a Swap names the new incarnation, never the entry snapshot's — and
+// equals the generation the lifecycle row renders for the same relay.
+func TestAttemptLogCarriesThePickedIncarnation(t *testing.T) {
+	upA, _, _ := newUpstream(t, http.StatusOK, "old", nil)
+	upB, _, _ := newUpstream(t, http.StatusOK, "new", nil)
+	stA := &State{
+		Pool: buildPool(t, []relaySpec{
+			{name: "alpha", provider: "vercel", rawURL: upA.URL, maxBody: bufferBytes(), incarnation: 7},
+		}),
+		MaxRetries:     0,
+		MaxBufferBytes: bufferBytes(),
+		Lifecycle:      []LifecycleRow{{Name: "alpha", Provider: "vercel", State: "ready", Generation: 7}},
+	}
+	stB := &State{
+		Pool: buildPool(t, []relaySpec{
+			{name: "bravo", provider: "deno", rawURL: upB.URL, maxBody: bufferBytes(), incarnation: 9},
+		}),
+		Client:         NewClient(NewTransport(time.Second, time.Second)),
+		MaxRetries:     0,
+		MaxBufferBytes: bufferBytes(),
+		Lifecycle:      []LifecycleRow{{Name: "bravo", Provider: "deno", State: "ready", Generation: 9}},
+	}
+	g, lc := newCapturingGateway(t, stA)
+
+	// lifecycleGeneration reads the ready relay's generation off /stats —
+	// the operator-facing view the log line must agree with.
+	lifecycleGeneration := func(t *testing.T, name string) uint64 {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+		var doc struct {
+			Lifecycle []struct {
+				Name       string `json:"name"`
+				State      string `json:"state"`
+				Generation uint64 `json:"generation"`
+			} `json:"lifecycle"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("decode /stats: %v\n%s", err, rec.Body.String())
+		}
+		for _, row := range doc.Lifecycle {
+			if row.Name == name && row.State == "ready" {
+				return row.Generation
+			}
+		}
+		t.Fatalf("no ready lifecycle row for %s in %s", name, rec.Body.String())
+		return 0
+	}
+	post := func(t *testing.T) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, relayRequest(t, http.MethodGet, "/", "", specHeaders()))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("relay status = %d, want 200", rec.Code)
+		}
+	}
+
+	post(t)
+	waitForLog(t, lc, "relayed")
+	events := outcomeEvents(t, lc, "relayed")
+	if len(events) != 1 {
+		t.Fatalf("relayed lines = %d, want 1", len(events))
+	}
+	if want := float64(lifecycleGeneration(t, "alpha")); events[0]["incarnation"] != want {
+		t.Fatalf("incarnation = %v, want the serving relay's lifecycle generation %v", events[0]["incarnation"], want)
+	}
+
+	g.Swap(stB)
+	post(t)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(outcomeEvents(t, lc, "relayed")) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the post-swap attempt never logged")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	events = outcomeEvents(t, lc, "relayed")
+	if events[1]["relay"] != "bravo" {
+		t.Fatalf("post-swap relay = %v, want the current generation's bravo", events[1]["relay"])
+	}
+	if want := float64(lifecycleGeneration(t, "bravo")); events[1]["incarnation"] != want {
+		t.Fatalf("incarnation after the swap = %v, want the picked generation's %v — the line must quote the generation that served, not the entry snapshot", events[1]["incarnation"], want)
+	}
+}
+
+// TestSwapAndAwaitIdleAreAtomicWithPick pins the drain guarantee at its
+// enforcement point: relay() takes Pick and inflight.begin under the same
+// mutex section Swap holds, so once Swap returns every request that will
+// still touch the old pool is already counted and AwaitIdle cannot miss it.
+// The mutation this hunts moves Pick+begin after the unlock: a request that
+// loaded the old generation just before the Swap then picks and begins after
+// AwaitIdle already saw the identity idle, and the drained relay serves one
+// more request — exactly the deploy-beneath-traffic the ordering exists to
+// prevent. The unlock->pick gap is unreachable from outside, so this is a
+// bounded stress: many short requests across many Swap rounds, failing the
+// moment one drained relay takes a late hit.
+func TestSwapAndAwaitIdleAreAtomicWithPick(t *testing.T) {
+	const (
+		workers = 8
+		rounds  = 16
+	)
+
+	// pickGate blocks an attempt immediately after the atomic section. On
+	// correct code it has already picked and registered before arriving; if
+	// Pick+begin move below Unlock, it arrives before either action — the
+	// test can then let Swap + AwaitIdle expose that untracked old-pool pick
+	// deterministically instead of betting on scheduler timing.
+	type pickGate struct {
+		arrived  chan struct{}
+		release  chan struct{}
+		released sync.Once
+	}
+	releaseGate := func(g *pickGate) { g.released.Do(func() { close(g.release) }) }
+	var (
+		gateMu sync.Mutex
+		gate   *pickGate
+	)
+
+	// A and B are the alternating serving generations. Each handler is
+	// deliberately simple: the test's gate holds attempts at the precise
+	// pick/register seam, then a hit says that one made it to this upstream.
+	type side struct {
+		name string
+		hits atomic.Int64
+		st   *State
+	}
+	client := NewClient(NewTransport(time.Second, time.Second))
+	var sides [2]*side
+	for i, name := range [2]string{"alpha", "bravo"} {
+		s := &side{name: name}
+		hits := &s.hits
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("done"))
+		}))
+		t.Cleanup(up.Close)
+		s.st = &State{
+			Pool: buildPool(t, []relaySpec{
+				{name: name, provider: "vercel", rawURL: up.URL, maxBody: bufferBytes()},
+			}),
+			Client:         client,
+			MaxRetries:     0, // one attempt: no retry may muddy relay hits
+			MaxBufferBytes: bufferBytes(),
+		}
+		sides[i] = s
+	}
+
+	g := newGateway(t, sides[0].st)
+	g.afterPick = func() {
+		gateMu.Lock()
+		current := gate
+		gateMu.Unlock()
+		if current == nil {
+			return
+		}
+		current.arrived <- struct{}{}
+		<-current.release
+	}
+	gwSrv := httptest.NewServer(g)
+	t.Cleanup(gwSrv.Close)
+
+	// K request goroutines loop one request per round. The round barrier
+	// makes every attempt participate in the active pick gate, avoiding a
+	// probabilistic timing window while preserving concurrent hot-path load.
+	starts := make(chan struct{})
+	finished := make(chan struct{}, workers*rounds)
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopWorkers := func() { stopOnce.Do(func() { close(stop) }) }
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				select {
+				case <-stop:
+					return
+				case <-starts:
+				}
+				req, err := http.NewRequest(http.MethodPost, gwSrv.URL+"/", strings.NewReader("x"))
+				if err != nil {
+					t.Errorf("build worker request: %v", err)
+					return
+				}
+				req.Header.Set(HeaderTarget, "https://target.example")
+				req.Header.Set(HeaderPath, "/v1")
+				resp, err := gwSrv.Client().Do(req)
+				if err != nil {
+					t.Errorf("worker request: %v", err)
+					return
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("worker request status = %d, want 200", resp.StatusCode)
+					return
+				}
+				finished <- struct{}{}
+			}
+		}()
+	}
+	t.Cleanup(func() {
+		gateMu.Lock()
+		current := gate
+		gateMu.Unlock()
+		if current != nil {
+			releaseGate(current)
+		}
+		stopWorkers()
+		wg.Wait()
+	})
+
+	cur := 0
+	for round := range rounds {
+		old, next := sides[cur], sides[1-cur]
+		currentGate := &pickGate{arrived: make(chan struct{}, workers), release: make(chan struct{})}
+		gateMu.Lock()
+		gate = currentGate
+		gateMu.Unlock()
+		for range workers {
+			starts <- struct{}{}
+		}
+		for range workers {
+			select {
+			case <-currentGate.arrived:
+			case <-time.After(2 * time.Second):
+				t.Fatal("worker never reached the pick gate")
+			}
+		}
+
+		// Correct code has already begun all K old-pool attempts before the
+		// swap, so AwaitIdle cannot return while their gates remain closed.
+		// The Pick+begin-after-Unlock mutation reaches this gate before it
+		// counts anything, so Swap wins and AwaitIdle returns true here — the
+		// exact violation, caught before a late old hit can hide in traffic.
+		g.Swap(next.st)
+		idle := make(chan bool, 1)
+		go func() { idle <- g.AwaitIdle(context.Background(), "vercel", old.name, time.Second) }()
+		select {
+		case v := <-idle:
+			releaseGate(currentGate)
+			stopWorkers()
+			wg.Wait()
+			t.Fatalf("round %d: AwaitIdle returned %v before the old-pool pick gates released — Pick+begin escaped Swap's mutex", round, v)
+		case <-time.After(20 * time.Millisecond):
+		}
+
+		releaseGate(currentGate)
+		select {
+		case v := <-idle:
+			if !v {
+				t.Fatalf("round %d: AwaitIdle timed out after the old attempts released", round)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("round %d: AwaitIdle remained blocked after old attempts released", round)
+		}
+		h0 := old.hits.Load()
+		for range workers {
+			select {
+			case <-finished:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("round %d: worker did not finish its released request", round)
+			}
+		}
+		if got := old.hits.Load(); got != h0 {
+			t.Fatalf("round %d: old relay %s served %d more request(s) after AwaitIdle reported idle (%d -> %d)", round, old.name, got-h0, h0, got)
+		}
+		gateMu.Lock()
+		gate = nil
+		gateMu.Unlock()
+		cur = 1 - cur
+	}
 }

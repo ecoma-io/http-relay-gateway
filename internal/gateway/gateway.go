@@ -107,6 +107,13 @@ type Gateway struct {
 	// special shutdown classification would invent evidence that does not
 	// exist (and punish relays for a process that is merely exiting).
 	draining atomic.Bool
+	// afterPick is an in-package test seam for the Swap/AwaitIdle invariant.
+	// Production leaves it nil. Its position after the mutex section is
+	// deliberate: a test can park an attempt after it picked and registered,
+	// then prove Swap cannot make AwaitIdle miss that registration. If Pick
+	// or begin move past the unlock, the same test parks before them and
+	// exposes the escaped old-generation pick.
+	afterPick func()
 
 	version string
 	// relayVersion is the worker generation this binary deploys; /stats
@@ -396,10 +403,14 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		// single load; Swap serializes with it, so AwaitIdle stays exact.
 		g.mu.Lock()
 		cur := g.st.Load()
-		// The budget is the bound generation's, and it is what terminates
-		// the loop: settings churn mid-request may reshape the tail, but
-		// every pass below costs one counted attempt, so the loop always
-		// ends. Streaming bodies keep exactly one attempt — the entry
+		// The budget is the bound generation's, and it re-reads on every
+		// pass — so settings churn mid-request can raise the ceiling and
+		// reshape the tail. What actually terminates the loop is the config
+		// validator's clamp: max_retries is rejected outside [0, 16]
+		// (internal/config), an accepted reload therefore carries at most 17
+		// attempts, and every pass below costs one counted attempt. A
+		// rejected reload never swaps at all — the bound generation keeps
+		// serving. Streaming bodies keep exactly one attempt — the entry
 		// decision above already consumed the body, and it cannot be
 		// replayed on a second relay.
 		budget := cur.MaxRetries + 1
@@ -415,6 +426,9 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 			g.inflight.begin(relay.Provider, relay.Name)
 		}
 		g.mu.Unlock()
+		if g.afterPick != nil {
+			g.afterPick()
+		}
 		if relay == nil {
 			jsonError(w, http.StatusServiceUnavailable, "no relay configured for "+key)
 			return
@@ -492,19 +506,25 @@ func (g *Gateway) relay(w http.ResponseWriter, r *http.Request, log zerolog.Logg
 		copyErr := g.copyResponse(w, resp)
 		g.inflight.end(relay.Provider, relay.Name)
 		switch {
-		case copyErr == nil:
-			// The body survived the copy — a COMPLETED response, the only
-			// success evidence the passive layer accepts. It clears the
-			// failure streak and lifts a cooldown, so a cooled relay picked
-			// best-effort recovers exactly when its body actually completes
-			// (evidence-based half-open recovery).
+		case copyErr == nil && r.Context().Err() == nil:
+			// The body survived the copy AND the client is still there — a
+			// COMPLETED response, the only success evidence the passive layer
+			// accepts. It clears the failure streak and lifts a cooldown, so
+			// a cooled relay picked best-effort recovers exactly when its
+			// body actually completes (evidence-based half-open recovery).
+			// The live-context half matters: flushWriter drops the Flush
+			// error (http.response.Flush has no return), so a client that
+			// dies while the final chunk flushes still yields copyErr == nil
+			// — without the check that abort would record as success.
 			cur.Pool.RecordSuccess(relay)
 		case r.Context().Err() != nil:
-			// The relay answered, but the body did not survive the copy, and
-			// the request context is dead: the client left, which also tears
-			// down the upstream leg. Not evidence for or against the relay —
-			// recorded as neither success nor failure — and the truncated
-			// response simply ends.
+			// The request context is dead: the client left, which also tears
+			// down the upstream leg. Both abort shapes land here — a copy
+			// that broke mid-body (copyErr != nil) and a copy that reached
+			// EOF but failed the final flush (copyErr == nil, err field empty
+			// below). Not evidence for or against the relay — recorded as
+			// neither success nor failure — and the truncated response simply
+			// ends.
 			log.Info().Str("relay", relay.Name).Str("provider", relay.Provider).
 				Str("outcome", "client_aborted").
 				Uint64("incarnation", relay.Incarnation).
