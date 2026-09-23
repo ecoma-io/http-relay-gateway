@@ -141,16 +141,20 @@ type Worker struct {
 	drainCancel context.CancelFunc
 }
 
-// credEntry is one memoized relay credential: the credential itself, the
-// scope its pins address (the value the registry's incarnation is keyed on),
-// and the entry it replaced when that scope moved. The prior chain is kept
-// so the orphaning event is attributable — which scope the deployment was
-// left in — and so a future cleanup pass can name the abandoned remote; it
-// is never used to reach the old scope's project.
+// credEntry is one memoized relay credential: the credential itself and the
+// scope its pins address (the value the registry's incarnation is keyed on).
+// The memo exists so a relay that later leaves the configuration can still
+// have its remote deleted, and so a scope that moved under a stable name can
+// be called out as the orphaning event it is — the warning names the
+// abandoned remote's scope by fingerprint. There is deliberately no chain of
+// priors: the previous entry is dropped when the scope moves, because the
+// old scope's project is unreachable from the desired state forever and
+// nothing ever reads the old entry back — a retained prior would pin the
+// previous provider credential, its token included, in memory for the
+// process lifetime.
 type credEntry struct {
 	cred  deploy.Credential
 	scope deploy.Scope
-	prior *credEntry
 }
 
 // Start launches the worker. It runs one pass immediately and returns.
@@ -325,20 +329,21 @@ func (w *Worker) memoCredentials(cfg *config.Config) []readiness.Member {
 		if prev, ok := w.credentials[key]; ok {
 			if prev.scope == scope {
 				// Unchanged scope: refresh the credential in place (the token
-				// re-reads every pass) and keep whatever prior chain the
-				// entry already carries.
-				w.credentials[key] = credEntry{cred: cred, scope: scope, prior: prev.prior}
+				// re-reads every pass).
+				w.credentials[key] = credEntry{cred: cred, scope: scope}
 			} else {
 				// The scope pin moved under a stable identity: this pass
 				// discovers and deploys in the NEW scope, and the deployment
 				// the old scope hosted is orphaned there — no later pass can
 				// ever reach or delete it again. The operator removes it by
-				// hand; the fingerprints say which scope it sits in.
+				// hand; the fingerprints say which scope it sits in. The old
+				// memo is dropped with the move — no prior chain (see
+				// credEntry).
 				w.log.Warn().Str("provider", rel.Provider).Str("relay", rel.Name).
 					Str("previous_scope", prev.scope.FP()).
 					Str("scope", scope.FP()).
 					Msg("relay scope changed; the deployment in the previous scope is orphaned and must be removed manually")
-				w.credentials[key] = credEntry{cred: cred, scope: scope, prior: &prev}
+				w.credentials[key] = credEntry{cred: cred, scope: scope}
 			}
 		} else {
 			w.credentials[key] = credEntry{cred: cred, scope: scope}
@@ -473,6 +478,13 @@ func (w *Worker) rollout(rel config.Relay, key deploy.RelayKey, gen uint64, rela
 			// The process is shutting down and the applier will never
 			// satisfy the barrier. The demotion stands; the replacement is
 			// the next process's first pass. Return so Stop() can finish.
+			// DeferDrain first: the scope-flip marker was already spent at
+			// the top of this rollout, so the barrier must be re-armed on
+			// the drain marker or this return would leave the deploy with
+			// no barrier at all. settle() fails only at shutdown today, but
+			// the marker costs nothing and a future non-shutdown settle
+			// failure must not silently drop the barrier.
+			w.reg.DeferDrain(key, gen)
 			w.logWarn("rollout: shutting down at the settle barrier; replacement deferred", key)
 			return
 		}
