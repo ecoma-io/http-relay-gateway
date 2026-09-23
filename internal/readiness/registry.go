@@ -290,6 +290,18 @@ func (r *Registry) UpdateSettings(settings Settings) {
 	}
 }
 
+// memberScopeFP resolves the log-safe fingerprint a member's scope publishes
+// with its admission: empty while the scope is not resolved yet. Empty must
+// stay empty — the pool's runtime keying reads an empty fingerprint as "no
+// scope constraint", never as a scope move that would reset passive health
+// on every rebuild of a relay whose credential has not resolved yet.
+func memberScopeFP(m Member) string {
+	if !m.ScopeKnown {
+		return ""
+	}
+	return m.Scope.FP()
+}
+
 // Sync reconciles the registry with the desired relay set: members that
 // first appear are announced as configured, members that reappear while a
 // removal was in flight are resurrected as a NEW incarnation (generation
@@ -309,12 +321,14 @@ func (r *Registry) Sync(members []Member) {
 	seen := make(map[Key]bool, len(members))
 	for _, m := range members {
 		seen[m.Key] = true
+		fp := memberScopeFP(m)
 		e, ok := r.entries[m.Key]
 		if !ok {
 			r.entries[m.Key] = &entry{
 				record:     Record{Key: m.Key, State: StateConfigured, Generation: 1, Since: now},
 				scope:      m.Scope,
 				scopeKnown: m.ScopeKnown,
+				scopeFP:    fp,
 			}
 			r.notifyLocked() // lifecycle changed; the operator-facing snapshot rebuilds
 			continue
@@ -336,6 +350,7 @@ func (r *Registry) Sync(members []Member) {
 			e.nextTry = time.Time{}
 			e.record.Since = now
 			e.scope, e.scopeKnown, e.scopeChanged = m.Scope, m.ScopeKnown, false
+			e.scopeFP = fp
 			r.notifyLocked()
 			continue
 		}
@@ -358,7 +373,7 @@ func (r *Registry) Sync(members []Member) {
 			e.record.FailStreak = 0
 			e.nextTry = time.Time{} // a fresh incarnation does not inherit the old one's backoff
 			e.record.Since = now
-			e.scope, e.scopeKnown = m.Scope, true
+			e.scope, e.scopeKnown, e.scopeFP = m.Scope, true, fp
 			// The barrier marker rides only a flip that held admission: an
 			// unserving relay has no in-flight request to protect, and the
 			// ordinary rollout path may deploy straight into the new scope.

@@ -1126,7 +1126,7 @@ func TestDrainPendingMarkerSurvivesChurnAndClearsAtTheBarrier(t *testing.T) {
 func TestServingCarriesTheRecordedScopeFingerprint(t *testing.T) {
 	r := New(Config{})
 	keyA := Key{Provider: "vercel", Name: "alpha"}
-	r.Sync([]Key{keyA})
+	r.Sync(members(keyA))
 	admit(t, r, keyA, "https://alpha.example", "rk")
 
 	if got := r.Serving()[0].ScopeFP; got != "" {
@@ -1138,5 +1138,38 @@ func TestServingCarriesTheRecordedScopeFingerprint(t *testing.T) {
 	r.mu.Unlock()
 	if got := r.Serving()[0].ScopeFP; got != "scope-fp-1" {
 		t.Fatalf("Serving ScopeFP = %q, want the recorded fingerprint", got)
+	}
+}
+
+// TestServingPublishesTheSyncedScopeFingerprint wires the recording the
+// runtime-key change anticipated: a member synced with a resolved pin
+// publishes that pin's fingerprint with its admission — the value the pool's
+// runtime keying folds into the endpoint key, so a relay's passive health
+// never crosses a scope move under an unchanged name. A flip republishes the
+// new scope's fingerprint with the new incarnation's admission, and a pass
+// whose credential does not resolve leaves the last recorded value alone —
+// an unknown scope is "no new information", not a scope change (the same
+// rule TestSyncUnknownScopeNeverFlips pins for the incarnation).
+func TestServingPublishesTheSyncedScopeFingerprint(t *testing.T) {
+	r := New(Config{})
+	keyA := Key{Provider: "vercel", Name: "alpha"}
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	admit(t, r, keyA, "https://alpha.example", "rk")
+	if got := r.Serving()[0].ScopeFP; got != (deploy.Scope{Team: "team-a"}).FP() {
+		t.Fatalf("ScopeFP after a pinned sync = %q, want the pin's fingerprint", got)
+	}
+
+	r.Sync([]Member{pinned(keyA, "team-b")})
+	if gen := admit(t, r, keyA, "https://alpha.example", "rk"); gen != 2 {
+		t.Fatalf("generation after the flip = %d, want 2", gen)
+	}
+	if got := r.Serving()[0].ScopeFP; got != (deploy.Scope{Team: "team-b"}).FP() {
+		t.Fatalf("ScopeFP after the flip = %q, want the new pin's fingerprint", got)
+	}
+
+	r.Sync([]Member{{Key: keyA}})
+	if got := r.Serving()[0].ScopeFP; got != (deploy.Scope{Team: "team-b"}).FP() {
+		t.Fatalf("ScopeFP with an unresolved scope = %q, want the last recorded fingerprint", got)
 	}
 }

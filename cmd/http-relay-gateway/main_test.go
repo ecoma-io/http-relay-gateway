@@ -654,7 +654,7 @@ func TestBuildStateReusesRuntimeHealthAcrossSwaps(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	a := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "alpha"}
 	b := readiness.Key{Provider: deploy.PlatformVercel, Name: "bravo"}
-	reg.Sync([]readiness.Key{a, b})
+	syncKeys(reg, a, b)
 	admit(t, reg, a, b)
 
 	settings := shortFuseSettings()
@@ -679,7 +679,7 @@ func TestBuildStateReusesRuntimeHealthAcrossSwaps(t *testing.T) {
 	// alpha or bravo changed — the rebuild must not touch their runtime
 	// state.
 	c := readiness.Key{Provider: deploy.PlatformDeno, Name: "charlie"}
-	reg.Sync([]readiness.Key{a, b, c})
+	syncKeys(reg, a, b, c)
 	admit(t, reg, c)
 
 	second := buildState(reg, settings, zerolog.Nop(), rt, cc)
@@ -723,7 +723,7 @@ func TestBuildStatePrunesRemovedRelays(t *testing.T) {
 	reg := readiness.New(readiness.Config{})
 	a := readiness.Key{Provider: deploy.PlatformVercel, Name: "alpha"}
 	b := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "bravo"}
-	reg.Sync([]readiness.Key{a, b})
+	syncKeys(reg, a, b)
 	admit(t, reg, a, b)
 
 	settings := shortFuseSettings()
@@ -742,7 +742,7 @@ func TestBuildStatePrunesRemovedRelays(t *testing.T) {
 	// bravo leaves the desired state: the registry revokes its admission,
 	// the applier prunes the identities the last-known-good file no longer
 	// names, and the rebuild serves only alpha.
-	reg.Sync([]readiness.Key{a})
+	syncKeys(reg, a)
 	rt.Prune(desiredIdentities(&config.Config{Relays: []config.Relay{
 		{Name: "alpha", Provider: deploy.PlatformVercel},
 	}}))
@@ -759,7 +759,7 @@ func TestBuildStatePrunesRemovedRelays(t *testing.T) {
 
 	// bravo comes back as a new incarnation: its pruned state must not
 	// resurface — the re-added relay starts clean while alpha stays cooled.
-	reg.Sync([]readiness.Key{a, b})
+	syncKeys(reg, a, b)
 	admit(t, reg, b)
 	third := buildState(reg, settings, zerolog.Nop(), rt, cc)
 	row, ok = relayStatsRow(third.Pool, "bravo")
