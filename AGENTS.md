@@ -132,6 +132,18 @@ Read [`README.md`](README.md) before changing the wire contract.
   bodyless response is never wrapped, the heartbeat stops with the stream,
   an upstream read error errors the relayed body (still classified
   `upstream_midstream`), and every other response relays byte for byte.
+- The same worker — not the gateway — opens an SSE caller's response early
+  when the origin will not answer: a caller whose `Accept` asks for
+  `text/event-stream` and whose origin stays silent for the grace gets a
+  deliberate `200` with `content-type: text/event-stream` and the comment
+  line `: relay-open` first, then the origin's body streamed through the
+  heartbeat as it settles. The grace is the worker's
+  `SSE_OPEN_BEFORE_UPSTREAM_MS` (default 20s; `RELAY_SSE_OPEN_BEFORE_UPSTREAM_MS`
+  overrides it, which the conformance suite uses — no deployer sets it).
+  Inside the grace nothing changes — the origin's real status, `204`
+  included, `502` on a refused connection, relays as today — and a non-SSE
+  caller is never opened early. Past the grace an origin failure ends the
+  opened stream (an `upstream_midstream`, never a status).
 - Body limits are per provider (vercel ~4.5MB, cloudflare ~100MB, deno
   ~100MB). The gateway buffers up to the largest limit and _skips_ to a
   provider that accepts the body; `413` only when no accepting provider

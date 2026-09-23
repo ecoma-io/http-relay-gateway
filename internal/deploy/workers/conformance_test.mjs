@@ -139,6 +139,33 @@ function sseRequest(upstreamBase) {
   });
 }
 
+// The single comment byte the early-open path emits, and the short grace it
+// runs on in the suite: the cases need to observe "origin silent past the
+// grace" in milliseconds, not in the default's 20 seconds.
+const SSE_OPEN = ": relay-open\n\n";
+const SSE_OPEN_MS = 25;
+
+// The same SSE call with an explicit accept for text/event-stream, so the
+// request itself qualifies for the early-open gate.
+function sseAcceptRequest(upstreamBase) {
+  return relayRequest("/x", {
+    headers: {
+      "x-relay-token": env.RELAY_AUTH_TOKEN,
+      "x-relay-target": upstreamBase,
+      "x-relay-path": "/sse",
+      accept: "text/event-stream",
+    },
+  });
+}
+
+// The early-open environment: heartbeat interval AND grace are both shortened
+// — the two are independent, and the cases exercise both.
+const earlyOpenEnv = {
+  ...env,
+  RELAY_SSE_PING_MS: String(SSE_PING_MS),
+  RELAY_SSE_OPEN_BEFORE_UPSTREAM_MS: String(SSE_OPEN_MS),
+};
+
 // stripPings removes every heartbeat comment from a relayed SSE body, which
 // must leave exactly the bytes the upstream wrote.
 const stripPings = (text) => text.split(SSE_PING).join("");
@@ -523,5 +550,254 @@ for (const platform of PLATFORMS) {
         assert.ok(text.endsWith("data: end\n\n"), `bytes follow the upstream's last byte: ${text}`);
       },
     );
+  });
+
+  test(`${platform}: a slow SSE origin gets the response opened early with the marker`, async () => {
+    let release;
+    const parked = new Promise((resolve) => (release = resolve));
+    await withStreamUpstream(
+      { "content-type": "text/event-stream" },
+      async function* () {
+        // Silent for 5× the grace: the relay must open the response while
+        // the origin has not written a byte.
+        await parked;
+        yield "data: late\n\n";
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseAcceptRequest(upstreamBase), earlyOpenEnv);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "text/event-stream");
+
+        const reader = res.body.getReader();
+        // The response opened at the grace mark — before the origin's first
+        // byte. Every byte crossing so far is the relay's own.
+        const first = await readUntil(
+          reader,
+          (text) => text.includes(SSE_OPEN),
+          "the early-open marker",
+        );
+        assert.ok(first.text.includes(SSE_OPEN), `no marker under the origin's silence`);
+        assert.ok(
+          !first.text.includes("data: late"),
+          `the origin's body arrived before it was released: ${JSON.stringify(first.text)}`,
+        );
+
+        release();
+        const rest = await readUntil(reader, () => false, "the stream to end");
+        assert.ok(rest.done, "the relayed stream did not end with the upstream");
+        const body = first.text + rest.text;
+
+        // The marker appears exactly once, at the head, and the origin's data
+        // is unmodified and in order — followed only by heartbeat comments
+        // the strip removes, never by a second marker.
+        assert.ok(
+          body.startsWith(SSE_OPEN),
+          `the marker is not at the head: ${JSON.stringify(body)}`,
+        );
+        assert.equal(
+          body.split(SSE_OPEN).length - 1,
+          1,
+          `marker repeated: ${JSON.stringify(body)}`,
+        );
+        assert.equal(stripPings(body), SSE_OPEN + "data: late\n\n");
+        assert.ok(body.endsWith("data: late\n\n"), `bytes follow the origin's last byte: ${body}`);
+      },
+    );
+  });
+
+  test(`${platform}: an origin that settles inside the grace is relayed unchanged, no marker`, async () => {
+    await withStreamUpstream(
+      { "content-type": "text/event-stream" },
+      async function* () {
+        yield "data: quick\n\n";
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseAcceptRequest(upstreamBase), earlyOpenEnv);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "text/event-stream");
+        const text = await res.text();
+        assert.equal(text, "data: quick\n\n");
+      },
+    );
+  });
+
+  test(`${platform}: a fast origin 204 inside the grace stays 204 and is never wrapped`, async () => {
+    const upstream = createServer((req, res) => {
+      req.resume();
+      res.writeHead(204, { "content-type": "text/event-stream" });
+      res.end();
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${upstream.address().port}`;
+      const res = await mod.handle(sseAcceptRequest(base), earlyOpenEnv);
+      assert.equal(res.status, 204);
+      assert.equal(res.headers.get("content-type"), "text/event-stream");
+      assert.equal(await res.text(), "");
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+
+  test(`${platform}: a non-SSE caller is never opened early`, async () => {
+    // A parked origin answers nothing, not even the response headers. An SSE
+    // caller would get a volunteered 200 with the marker at the grace mark;
+    // this caller does not ask for SSE, so the relay has no reason to open —
+    // it must stay pending on the origin, far past the grace.
+    let release;
+    const parked = new Promise((resolve) => (release = resolve));
+    const upstream = createServer((req, res) => {
+      req.resume();
+      void parked.then(() => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: late\n\n");
+        res.end();
+      });
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${upstream.address().port}`;
+      const fetched = mod.handle(sseRequest(base), earlyOpenEnv);
+      const outcome = await Promise.race([
+        fetched.then(() => "settled"),
+        sleep(4 * SSE_OPEN_MS).then(() => "pending"),
+      ]);
+      assert.equal(outcome, "pending", "the relay opened a response for a non-SSE caller");
+
+      release();
+      const res = await fetched;
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "text/event-stream");
+      const text = await res.text();
+      // The response opened only when the origin answered: no marker reached
+      // this caller (heartbeat comments may — they follow the RESPONSE's
+      // media type, which is the origin's, already established behavior).
+      assert.ok(
+        !text.includes(SSE_OPEN),
+        `a non-SSE caller saw the marker: ${JSON.stringify(text)}`,
+      );
+      assert.equal(text.replaceAll(SSE_PING, ""), "data: late\n\n");
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+
+  test(`${platform}: a settled non-SSE body past the grace rides the opened stream unchanged`, async () => {
+    // The opened response commits text/event-stream (the relay's own
+    // promise, made while the origin was silent). When the late origin
+    // answers with plain data, its bytes still feed through verbatim after
+    // the marker — the relay never rewrites what the origin wrote, it only
+    // ever added the marker and heartbeat comments.
+    let release;
+    const parked = new Promise((resolve) => (release = resolve));
+    await withStreamUpstream(
+      { "content-type": "text/plain" },
+      async function* () {
+        await parked;
+        yield "plain answer\n";
+      },
+      async (upstreamBase) => {
+        const res = await mod.handle(sseAcceptRequest(upstreamBase), earlyOpenEnv);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "text/event-stream");
+        const reader = res.body.getReader();
+        const first = await readUntil(
+          reader,
+          (text) => text.includes(SSE_OPEN),
+          "the early-open marker",
+        );
+        release();
+        const rest = await readUntil(reader, () => false, "the stream to end");
+        const body = first.text + rest.text;
+        assert.ok(
+          body.startsWith(SSE_OPEN),
+          `the marker is not at the head: ${JSON.stringify(body)}`,
+        );
+        assert.equal(
+          body.split(SSE_OPEN).length - 1,
+          1,
+          `marker repeated: ${JSON.stringify(body)}`,
+        );
+        assert.equal(
+          body.replace(SSE_OPEN, "").replaceAll(SSE_PING, ""),
+          "plain answer\n",
+          `origin bytes altered past the grace: ${JSON.stringify(body)}`,
+        );
+      },
+    );
+  });
+
+  test(`${platform}: a refusal inside the grace keeps the origin's status`, async () => {
+    // A fast 502: the origin refused before the grace ran out, so it is the
+    // origin's own status that relays — never a volunteered 200.
+    const dead = createServer();
+    await new Promise((resolve) => dead.listen(0, "127.0.0.1", resolve));
+    const deadPort = dead.address().port;
+    await new Promise((resolve) => dead.close(resolve));
+    const res = await mod.handle(sseAcceptRequest(`http://127.0.0.1:${deadPort}`), earlyOpenEnv);
+    assert.equal(res.status, 502);
+    assert.deepEqual(await res.json(), { error: "upstream fetch failed" });
+  });
+
+  test(`${platform}: an SSE origin that settles past the grace with a 204 closes cleanly`, async () => {
+    const upstream = createServer((req, res) => {
+      req.resume();
+      // Silent past the grace, then a real 204: the origin answered, but the
+      // caller already holds the opened 200 — the body-less answer just ends
+      // the stream, without a status the caller is waiting on.
+      setTimeout(() => {
+        res.writeHead(204, { "content-type": "text/event-stream" });
+        res.end();
+      }, 5 * SSE_OPEN_MS);
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${upstream.address().port}`;
+      const res = await mod.handle(sseAcceptRequest(base), earlyOpenEnv);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "text/event-stream");
+      const body = await res.text();
+      assert.ok(
+        body.startsWith(SSE_OPEN),
+        `no marker under the origin's silence: ${JSON.stringify(body)}`,
+      );
+      assert.equal(body.split(SSE_OPEN).length - 1, 1, `marker repeated: ${JSON.stringify(body)}`);
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+
+  test(`${platform}: an origin that breaks after the response opened errors the body, marker first`, async () => {
+    const upstream = createServer((req, res) => {
+      req.resume();
+      // The relay opened the response at the grace mark, then the origin
+      // breaks mid-body — a relayed stream that fails, never one that ends
+      // cleanly, so the gateway still records a mid-stream failure.
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: one\n\n");
+        if (typeof res.flush === "function") res.flush();
+        res.socket?.destroy();
+      }, 5 * SSE_OPEN_MS);
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${upstream.address().port}`;
+      const res = await mod.handle(sseAcceptRequest(base), earlyOpenEnv);
+      assert.equal(res.status, 200);
+      let failed = null;
+      try {
+        await res.text();
+      } catch (err) {
+        failed = err;
+      }
+      assert.ok(failed !== null, "the opened body ended cleanly after the origin broke mid-stream");
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
   });
 }

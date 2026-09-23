@@ -90,6 +90,20 @@ Authorization: Bearer $TARGET_TOKEN
   comment is SSE grammar, not data — no parser surfaces it as an event — it
   stops with the stream, an encoded body is never touched (the gateway never
   decodes relay traffic), and every other response is relayed byte for byte.
+- The worker can also open an SSE caller's response before the origin answers
+  — and that, like the heartbeat, is where the silence would kill the stream:
+  a caller whose `Accept` asks for `text/event-stream` and whose origin stays
+  silent gets its response opened at 20 s (the worker's
+  `SSE_OPEN_BEFORE_UPSTREAM_MS`, overridable through the worker env
+  `RELAY_SSE_OPEN_BEFORE_UPSTREAM_MS`, same hook rule). The opened response
+  is a deliberate `200` with `content-type: text/event-stream` and an SSE
+  comment line (`: relay-open`) first; the origin's body feeds through as it
+  settles, heartbeating in the meantime. Inside the grace nothing changes: a
+  fast answer — real status, `204` included, or a `502` on a refused
+  connection — relays exactly as it does today. Past the grace the response
+  is already open, so an origin failure ends the stream instead of being
+  reported as a status — and a non-SSE caller is never opened early at all.
+  The gateway forwards the response like any relayed byte.
 - Failover happens only while the failure is still a transport error
   (before any response byte). Once the relay answered, the response is
   never retried. A body that dies mid-stream is recorded against the relay
