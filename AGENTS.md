@@ -122,6 +122,16 @@ Read [`README.md`](README.md) before changing the wire contract.
 - Failover replays the buffered body on the next relay only while the
   failure is a transport error (before any response byte). Once the relay
   answered, the response streams through untouched — never retried.
+- The relay worker — not the gateway — keeps a silent stream alive: a
+  `text/event-stream` response that carries no `content-encoding` gets an
+  SSE comment line `: relay-ping` every 15s of upstream silence (the
+  worker's `SSE_PING_MS`; `RELAY_SSE_PING_MS` overrides it, which the
+  conformance suite uses — no deployer sets it), because a hop that
+  measures bytes would otherwise reap an origin that is thinking, not
+  writing. Comment lines are SSE grammar and surface as no event; a
+  bodyless response is never wrapped, the heartbeat stops with the stream,
+  an upstream read error errors the relayed body (still classified
+  `upstream_midstream`), and every other response relays byte for byte.
 - Body limits are per provider (vercel ~4.5MB, cloudflare ~100MB, deno
   ~100MB). The gateway buffers up to the largest limit and _skips_ to a
   provider that accepts the body; `413` only when no accepting provider
