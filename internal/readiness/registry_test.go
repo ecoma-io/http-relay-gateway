@@ -265,7 +265,9 @@ func TestScopeFlipDiscardsInFlightCompletions(t *testing.T) {
 // A pass whose credential resolution failed claims no scope, and Sync must
 // not read that as a flip: an unrelated credential hiccup may not evict
 // every pinned relay. The first resolved scope after unknown ones is a
-// baseline too, never a change.
+// baseline too, never a change — and that baseline is live: a later real
+// move against it flips, bumping the generation and (when the relay was
+// serving at the move) revoking admission and raising the drain marker.
 func TestSyncUnknownScopeNeverFlips(t *testing.T) {
 	c := newClock()
 	r := testRegistry(c)
@@ -310,9 +312,39 @@ func TestSyncUnknownScopeNeverFlips(t *testing.T) {
 	if r.IsReady(keyA) {
 		t.Fatal("the real flip must revoke admission")
 	}
-	// keyB never moved, so it stays on its first incarnation, still serving.
+	// keyB still has not moved, so it stays on its first incarnation.
 	if got := generationOf(t, r, keyB); got != 1 {
 		t.Fatalf("keyB generation = %d, want 1", got)
+	}
+
+	// The adopted baseline is live, not an armistice: keyB's first real move
+	// flips too. Without admission the flip only bumps the incarnation.
+	r.Sync(fleet(pinned(keyA, "team-b"), pinned(keyB, "org-b")))
+	if got := generationOf(t, r, keyB); got != 2 {
+		t.Fatalf("keyB generation = %d, want 2 (the adopted baseline still flips)", got)
+	}
+	if r.TakeScopeChanged(keyB, 2) {
+		t.Fatal("a flip without admission must not raise the drain marker")
+	}
+
+	// The serving variant: admitted at org-b, then moved to org-c — the flip
+	// revokes admission, labels the reason, and raises the barrier marker.
+	genB := admit(t, r, keyB, "https://beta.example", "rk")
+	if genB != 2 {
+		t.Fatalf("keyB admitted at generation %d, want 2", genB)
+	}
+	r.Sync(fleet(pinned(keyA, "team-b"), pinned(keyB, "org-c")))
+	if got := generationOf(t, r, keyB); got != genB+1 {
+		t.Fatalf("keyB generation = %d, want %d (a serving flip is a new incarnation)", got, genB+1)
+	}
+	if r.IsReady(keyB) || r.ReadyCount() != 0 {
+		t.Fatal("a serving flip must revoke admission")
+	}
+	if rec, _ := r.StateOf(keyB); rec.Reason != ReasonScopeChanged {
+		t.Fatalf("reason = %q, want %q", rec.Reason, ReasonScopeChanged)
+	}
+	if !r.TakeScopeChanged(keyB, genB+1) {
+		t.Fatal("a serving flip must raise the drain marker")
 	}
 }
 
@@ -362,6 +394,45 @@ func TestSyncReaddAdoptsScopeAsBaselineWithoutASecondBump(t *testing.T) {
 	r.Sync([]Member{pinned(keyA, "team-c")})
 	if got := generationOf(t, r, keyA); got != gen+3 {
 		t.Fatalf("generation = %d, want %d after the next real flip", got, gen+3)
+	}
+}
+
+// A scope flip raises the barrier marker for the rollout that follows. But a
+// flip whose next pass reuses a verified deployment never runs that rollout —
+// discovery finds the deployment, verification passes, Ready re-admits — and
+// the marker must clear with that re-admission, or a much later unrelated
+// rollout in the same incarnation reads it true and runs a needless
+// settle+drain. The rollout's own consumption path is unchanged: a fresh flip
+// raises a fresh marker, read-and-clear.
+func TestReadyClearsTheScopeChangedMarker(t *testing.T) {
+	c := newClock()
+	r := testRegistry(c)
+
+	r.Sync([]Member{pinned(keyA, "team-a")})
+	gen := admit(t, r, keyA, "https://alpha.example", "rk")
+
+	// The flip sets the marker; a Ready at the flip's generation clears it.
+	r.Sync([]Member{pinned(keyA, "team-b")})
+	flipped := generationOf(t, r, keyA)
+	if flipped != gen+1 {
+		t.Fatalf("generation after the flip = %d, want %d", flipped, gen+1)
+	}
+	r.Ready(keyA, flipped, "https://alpha.example", "rk", time.Millisecond)
+	if r.TakeScopeChanged(keyA, flipped) {
+		t.Fatal("a Ready at the flip's generation must clear the scope-changed marker")
+	}
+
+	// A fresh flip raises a fresh marker for the rollout to consume.
+	r.Sync([]Member{pinned(keyA, "team-c")})
+	again := generationOf(t, r, keyA)
+	if again != flipped+1 {
+		t.Fatalf("generation after the second flip = %d, want %d", again, flipped+1)
+	}
+	if !r.TakeScopeChanged(keyA, again) {
+		t.Fatal("the rollout must still find a fresh flip's marker")
+	}
+	if r.TakeScopeChanged(keyA, again) {
+		t.Fatal("the marker is read-and-clear: the second read must be false")
 	}
 }
 
@@ -987,6 +1058,28 @@ func TestConcurrencyKeepsCountersConsistent(t *testing.T) {
 					_ = r.Allow(k)
 					_ = r.IsReady(k)
 				}
+			}
+		}(i)
+	}
+	// Two more workers alternate the desired member set between two pinned
+	// scopes, so Sync itself races the completion APIs above: a generation a
+	// worker just captured can be bumped — and its admission revoked — by a
+	// flip mid-flight, which is exactly what the stale-completion guards
+	// exist for and what the loop above alone never exercised.
+	for i := 8; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := range 120 {
+				team := "team-a"
+				if (i+j)%2 == 1 {
+					team = "team-b"
+				}
+				ms := make([]Member, 0, len(keys))
+				for _, k := range keys {
+					ms = append(ms, Member{Key: k, Scope: deploy.Scope{Team: team}, ScopeKnown: true})
+				}
+				r.Sync(ms)
 			}
 		}(i)
 	}

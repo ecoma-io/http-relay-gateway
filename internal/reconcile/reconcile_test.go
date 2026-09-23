@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -410,6 +411,50 @@ func TestPassCredentialRejectionNeverDeploys(t *testing.T) {
 				t.Fatalf("reason = %q, want %q", rec.Reason, readiness.ReasonCredentials)
 			}
 		})
+	}
+}
+
+// A pinned relay whose credential cannot be resolved for a pass stays exactly
+// as it is: memoCredentials emits a member that claims no scope, Sync keeps
+// the last known scope as the baseline instead of comparing, and nothing
+// reincarnates. The mutation this pins — claiming ScopeKnown:true with the
+// zero scope on resolve failure — would read that zero scope against the
+// known baseline as a flip: generation bumped, admission revoked, a barrier
+// armed, all off a transient credential read failure.
+func TestPassUnresolvableCredentialDoesNotReincarnatePinnedRelays(t *testing.T) {
+	first := relay("edge-a", deploy.PlatformVercel, testToken)
+	first.Team = "team-a"
+	rig := newTestRig(t, first)
+	rig.sim.setVersion(deploy.RelayVersion)
+	rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	gen := generationOfRig(t, rig, key)
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before the credential failure")
+	}
+
+	// Break the token source: the credential becomes unreadable this pass.
+	broken := first
+	broken.Token = ""
+	broken.TokenFile = filepath.Join(t.TempDir(), "absent-token")
+	rig.desired.Relays = []config.Relay{broken}
+	rig.worker.pass()
+
+	if got := generationOfRig(t, rig, key); got != gen {
+		t.Fatalf("generation = %d, want %d (an unreadable credential never reincarnates)", got, gen)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("an unrelated credential hiccup must not revoke admission")
+	}
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (a credential read failure deploys nothing)", got)
+	}
+	if rig.settles != 0 {
+		t.Fatalf("settles = %d, want 0 (no barrier may fire on a credential hiccup)", rig.settles)
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.Reason != readiness.ReasonCredentials {
+		t.Fatalf("reason = %q, want %q (ensureRelay reports the credential problem)", rec.Reason, readiness.ReasonCredentials)
 	}
 }
 
@@ -1208,6 +1253,75 @@ func TestShutdownSettleBarrierAbandonsTheRollout(t *testing.T) {
 	}
 }
 
+// A rollout that abandons at an unsatisfiable settle barrier has already
+// spent the scope-flip marker (rollout consumes it up front), so it must
+// re-arm the deferred-drain marker before returning — the retry pass needs a
+// barrier to re-run, and without the re-arm a settle failure that is not a
+// shutdown would silently drop it and let the deploy fire under whatever
+// straggler the drain exists to protect. settle() fails only at shutdown
+// today; the rig's stub makes the case reachable anyway.
+func TestRolloutSettleFailureRearmsTheScopeFlipDrainMarker(t *testing.T) {
+	first := relay("edge-a", deploy.PlatformVercel, testToken)
+	first.Team = "team-a"
+	rig := newTestRig(t, first)
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before the scope change")
+	}
+
+	// Flip the pins into a scope with no project and make the settle barrier
+	// unsatisfiable: the rollout runs, consumes the flip's marker, and
+	// abandons at the barrier.
+	changed := first
+	changed.Team = "team-b"
+	*rig.desired = config.Config{Relays: []config.Relay{changed}, Settings: config.DefaultSettings()}
+	rig.factory.mu.Lock()
+	client.exists = false
+	rig.factory.mu.Unlock()
+	captured := rig.worker.settle
+	rig.worker.settle = func() bool { return false } // barrier unsatisfiable
+	rig.worker.pass()
+
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (the rollout abandoned at the barrier)", got)
+	}
+	rec, _ := rig.reg.StateOf(key)
+	if !rec.DrainPending {
+		t.Fatal("the settle failure must re-arm the deferred-drain marker")
+	}
+	if rig.reg.IsReady(key) {
+		t.Fatal("a relay with a pending replacement must not serve")
+	}
+
+	// The retry pass runs the full barrier before deploying — from the
+	// re-armed marker alone, exactly once.
+	rig.worker.settle = func() bool { captured(); return true }
+	rig.clock.Advance(2 * time.Minute)
+	rig.worker.pass()
+
+	want := []string{"settle", "drain:vercel/edge-a:serving=false:idle=true", "deploy"}
+	if got := rig.log.all(); len(got) != len(want) {
+		t.Fatalf("events = %v, want exactly %v (the re-armed barrier precedes the deploy)", got, want)
+	}
+	for i, ev := range want {
+		if got := rig.log.all()[i]; got != ev {
+			t.Fatalf("event[%d] = %q, want %q", i, got, ev)
+		}
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 on the completing pass", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not re-admitted after the fresh deploy in the new scope")
+	}
+	if rec, _ := rig.reg.StateOf(key); rec.DrainPending {
+		t.Fatal("the barrier completing must clear the re-armed marker")
+	}
+}
+
 // The same shutdown discipline for deletes: a relay left labeled removing
 // when the barrier goes unsatisfiable keeps its admission revoked, the delete
 // is retried from scratch by the next pass, and the entry purges on success.
@@ -1333,6 +1447,69 @@ func TestScopeChangeRunsTheBarrierThenDeploysInTheNewScope(t *testing.T) {
 	}
 	if settles := rig.settles; settles != 1 {
 		t.Fatalf("settles = %d, want 1 (the flip's barrier ran exactly once)", settles)
+	}
+}
+
+// The scope-flip barrier marker is consumed at rollout time, not pass time:
+// a flip whose discovery fails that pass leaves the marker armed, so the next
+// successful pass settles and drains BEFORE deploying into the new scope.
+// Spending the marker at pass time (the mutation this pins: hoisting the
+// TakeScopeChanged read above discovery) would let the failed pass consume it
+// and the retry deploy with no barrier at all.
+func TestScopeChangeMarkerSurvivesAFailedDiscoveryPass(t *testing.T) {
+	first := relay("edge-a", deploy.PlatformVercel, testToken)
+	first.Team = "team-a"
+	rig := newTestRig(t, first)
+	rig.sim.setVersion(deploy.RelayVersion)
+	client := rig.newPrimaryClient(true)
+	rig.worker.pass()
+	key := deploy.RelayKey{Provider: deploy.PlatformVercel, Name: "edge-a"}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not ready before the scope change")
+	}
+
+	// Flip the pins and fail the same pass's discovery: the flip itself ran
+	// (new incarnation, admission revoked), but no rollout may consume its
+	// marker.
+	changed := first
+	changed.Team = "team-b"
+	*rig.desired = config.Config{Relays: []config.Relay{changed}, Settings: config.DefaultSettings()}
+	rig.factory.mu.Lock()
+	client.discoverErr = errors.New("platform down")
+	rig.factory.mu.Unlock()
+	rig.worker.pass()
+
+	if got := rig.factory.deployCount(); got != 0 {
+		t.Fatalf("deploys = %d, want 0 (the discovery failed; nothing rolled out)", got)
+	}
+	if rig.reg.IsReady(key) {
+		t.Fatal("the flip must have revoked admission")
+	}
+
+	// The next pass: discovery succeeds and the new scope has no project, so
+	// the rollout runs — it must settle and drain (the survived marker)
+	// before the deploy.
+	rig.factory.mu.Lock()
+	client.discoverErr = nil
+	client.exists = false
+	rig.factory.mu.Unlock()
+	rig.clock.Advance(2 * time.Minute) // past the backoff gate the failed pass armed
+	rig.worker.pass()
+
+	want := []string{"settle", "drain:vercel/edge-a:serving=false:idle=true", "deploy"}
+	if got := rig.log.all(); len(got) != len(want) {
+		t.Fatalf("events = %v, want exactly %v (the barrier must precede the deploy)", got, want)
+	}
+	for i, ev := range want {
+		if got := rig.log.all()[i]; got != ev {
+			t.Fatalf("event[%d] = %q, want %q", i, got, ev)
+		}
+	}
+	if got := rig.factory.deployCount(); got != 1 {
+		t.Fatalf("deploys = %d, want 1 (the fresh deploy in the new scope)", got)
+	}
+	if !rig.reg.IsReady(key) {
+		t.Fatal("relay not re-admitted after the fresh deploy in the new scope")
 	}
 }
 
