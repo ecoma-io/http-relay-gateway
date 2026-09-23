@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/url"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -204,6 +206,107 @@ func TestPruneDropsPurgedRelays(t *testing.T) {
 // the list it indexed and the modulo keeps it in range — the rotation
 // continues rather than restarting or panicking when membership shrinks or
 // grows under it.
+// TestAttachCarriesASubThresholdStreak pins the part of endpoint runtime
+// health counters alone cannot show: an attached rebuild carries the
+// consecutive-failure streak while it is still below the threshold. A second
+// failure on the rebuilt pool must therefore trip the cooldown. The mutation
+// this kills rezeros consecFails in Attach: counters still survive and every
+// threshold-1 test still passes, but the relay remains healthy here.
+func TestAttachCarriesASubThresholdStreak(t *testing.T) {
+	rt := NewRuntimeState()
+	in := Input{
+		FailureThreshold: 2,
+		Cooldown:         24 * time.Hour,
+		Relays:           []RelayInput{relayInput(t, "alpha", "vercel")},
+	}
+	first := mustAttached(t, rt, in)
+	alpha := first.Pick(KeyAll)
+	first.RecordFailure(alpha, errors.New("first failure"))
+	if row := first.Stats()[0]; !row.Healthy || row.Failures != 1 {
+		t.Fatalf("first sub-threshold failure = %+v, want healthy with one failure", row)
+	}
+
+	second := mustAttached(t, rt, in) // the serving-generation rebuild
+	second.RecordFailure(second.Pick(KeyAll), errors.New("second failure"))
+	if row := second.Stats()[0]; row.Healthy || row.Failures != 2 {
+		t.Fatalf("second failure after attach = %+v, want cooldown from the carried sub-threshold streak", row)
+	}
+}
+
+// TestRuntimePickAttachPruneStress exposes the runtime state against the
+// race detector: request goroutines Pick from one attached pool while the
+// applier shape concurrently attaches same and other identities and prunes
+// changing desired sets. Production gives Attach/Prune one applier owner;
+// this deliberately violates that ownership to prove the locks that protect
+// Pick's shared cursors and endpoint mapping are complete. Assertions are
+// intentionally minimal — every non-nil Pick must be one of the relays in
+// the immutable serving pool — because `go test -race` is the point.
+func TestRuntimePickAttachPruneStress(t *testing.T) {
+	rt := NewRuntimeState()
+	in := Input{
+		FailureThreshold: 3,
+		Cooldown:         time.Second,
+		Relays: []RelayInput{
+			relayInput(t, "alpha", "vercel"),
+			relayInput(t, "bravo", "cloudflare"),
+		},
+	}
+	p := mustAttached(t, rt, in)
+	stop := make(chan struct{})
+	var bad atomic.Bool
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				r := p.Pick(KeyAll)
+				if r == nil || (r.Name != "alpha" && r.Name != "bravo") {
+					bad.Store(true)
+					return
+				}
+			}
+		}()
+	}
+
+	// Attach the same endpoint (the common serving-rebuild path), alternate
+	// another key under the same identity (replacement path), attach a
+	// distinct identity, and prune it again. All run alongside Pick above.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for i := 0; time.Now().Before(deadline); i++ {
+		alpha := in.Relays[0]
+		alpha.Runtime = RuntimeKey{
+			Provider: alpha.Provider, Name: alpha.Name,
+			URL: alpha.URL.String(), TokenFP: TokenFingerprint(alpha.Token),
+		}
+		rt.Attach(alpha.Runtime)
+		if i%2 == 0 {
+			rt.Attach(RuntimeKey{
+				Provider: "vercel", Name: "alpha", URL: "http://alpha-next.vercel.internal", TokenFP: "rotated",
+			})
+		}
+		bravo := in.Relays[1]
+		rt.Attach(RuntimeKey{
+			Provider: bravo.Provider, Name: bravo.Name,
+			URL: bravo.URL.String(), TokenFP: TokenFingerprint(bravo.Token),
+		})
+		rt.Prune(map[string]struct{}{
+			"vercel/alpha":     {},
+			"cloudflare/bravo": {},
+		})
+	}
+	close(stop)
+	wg.Wait()
+	if bad.Load() {
+		t.Fatal("Pick returned a relay outside the immutable attached pool")
+	}
+}
+
 func TestCursorForWrapsAcrossMembershipChanges(t *testing.T) {
 	rt := NewRuntimeState()
 	for range 5 {
