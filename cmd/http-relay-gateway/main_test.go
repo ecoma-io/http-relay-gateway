@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,10 +17,18 @@ import (
 
 	"http-relay-gateway/internal/config"
 	"http-relay-gateway/internal/deploy"
+	"http-relay-gateway/internal/gateway"
 	"http-relay-gateway/internal/logging"
 	"http-relay-gateway/internal/pool"
 	"http-relay-gateway/internal/readiness"
 )
+
+// freshState is buildState over throwaway runtime state and client cache —
+// the shape run() wires once per process. Tests that do not assert
+// cross-rebuild persistence use it so generations stay independent.
+func freshState(reg *readiness.Registry, settings config.Settings, log zerolog.Logger) *gateway.State {
+	return buildState(reg, settings, log, pool.NewRuntimeState(), gateway.NewClientCache())
+}
 
 // fixtureURL is the shared prefix of every test relay URL, so a leak in a
 // snapshot would be recognizable.
@@ -62,7 +71,7 @@ func TestBuildStateServesOnlyVerified(t *testing.T) {
 	reg.Sync([]readiness.Key{a, b, c})
 	admit(t, reg, a, b)
 
-	st := buildState(reg, config.DefaultSettings(), zerolog.Nop())
+	st := freshState(reg, config.DefaultSettings(), zerolog.Nop())
 	if st.Pool.ReadyCount() != 2 {
 		t.Fatalf("pool serving %d relays, want exactly the 2 verified", st.Pool.ReadyCount())
 	}
@@ -129,7 +138,7 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 	settings := config.DefaultSettings()
 	settings.MaxRetries = 4
 	settings.StreamThresholdBytes = 1024
-	st := buildState(reg, settings, zerolog.Nop())
+	st := freshState(reg, settings, zerolog.Nop())
 
 	// MaxBufferBytes is the largest serving provider limit: vercel's ~4.5MB
 	// loses to cloudflare's 100MB.
@@ -153,14 +162,14 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 			t.Fatal(err)
 		}
 		solo.Ready(k, gen, u, "key", time.Millisecond)
-		if got := buildState(solo, config.DefaultSettings(), zerolog.Nop()).MaxBufferBytes; got != pool.VercelMaxBody {
+		if got := freshState(solo, config.DefaultSettings(), zerolog.Nop()).MaxBufferBytes; got != pool.VercelMaxBody {
 			t.Fatalf("MaxBufferBytes = %d, want the vercel cap %d", got, pool.VercelMaxBody)
 		}
 	})
 
 	t.Run("zero serving leaves a live empty pool", func(t *testing.T) {
 		blank := readiness.New(readiness.Config{})
-		st := buildState(blank, config.DefaultSettings(), zerolog.Nop())
+		st := freshState(blank, config.DefaultSettings(), zerolog.Nop())
 		if st.Pool.ReadyCount() != 0 {
 			t.Fatalf("ReadyCount = %d, want 0", st.Pool.ReadyCount())
 		}
@@ -179,7 +188,7 @@ func TestBuildStateBodyLimitsAndSettings(t *testing.T) {
 		gen, _ := bad.GenerationOf(k)
 		bad.Ready(k, gen, "://not a url", "key", time.Millisecond)
 		var logs bytes.Buffer
-		st := buildState(bad, config.DefaultSettings(), zerolog.New(&logs))
+		st := freshState(bad, config.DefaultSettings(), zerolog.New(&logs))
 		if st.Pool == nil || st.Pool.ReadyCount() != 0 {
 			t.Fatalf("an unparseable verified URL must be skipped: %+v", st.Pool)
 		}
@@ -613,4 +622,151 @@ func TestHealthcheckMalformedListenAddr(t *testing.T) {
 	if strings.Contains(stderr.String(), "panic") {
 		t.Fatalf("healthcheck stderr = %q, want no panic trace", stderr.String())
 	}
+}
+
+// --- runtime health across rebuilds (issue #15) ---
+
+// shortFuseSettings make one transport failure a cooldown, so a test can
+// arm a relay's passive health without driving it through the hot path.
+func shortFuseSettings() config.Settings {
+	s := config.DefaultSettings()
+	s.FailureThreshold = 1
+	s.Cooldown = time.Hour
+	return s
+}
+
+// TestBuildStateReusesRuntimeHealthAcrossSwaps pins the applier contract:
+// two consecutive buildState calls over the same runtime state — the shape
+// of a registry notification for an unrelated relay — carry the counters,
+// the cooldown and the rotation position into the second pool, and reuse
+// the cached client instead of building a fresh transport.
+func TestBuildStateReusesRuntimeHealthAcrossSwaps(t *testing.T) {
+	reg := readiness.New(readiness.Config{})
+	a := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "alpha"}
+	b := readiness.Key{Provider: deploy.PlatformVercel, Name: "bravo"}
+	reg.Sync([]readiness.Key{a, b})
+	admit(t, reg, a, b)
+
+	settings := shortFuseSettings()
+	rt := pool.NewRuntimeState()
+	cc := gateway.NewClientCache()
+	first := buildState(reg, settings, zerolog.Nop(), rt, cc)
+
+	// Three picks pin the sorted order and leave the shared cursor at 3
+	// (alpha, bravo, alpha — the cooled alpha is still the best-effort
+	// answer); then a failure cools alpha down and bumps its counters.
+	alpha := first.Pool.Pick(pool.KeyAll)
+	first.Pool.Pick(pool.KeyAll)
+	first.Pool.Pick(pool.KeyAll)
+	if alpha.Name != "alpha" || alpha.Provider != deploy.PlatformCloudflare {
+		t.Fatalf("first pick = %s/%s, want cloudflare/alpha (sorted order)", alpha.Provider, alpha.Name)
+	}
+	alpha.Requests.Add(3)
+	boom := errors.New("dial relay: connection refused")
+	first.Pool.RecordFailure(alpha, boom)
+
+	// The unrelated change: a third relay joins and verifies. Nothing about
+	// alpha or bravo changed — the rebuild must not touch their runtime
+	// state.
+	c := readiness.Key{Provider: deploy.PlatformDeno, Name: "charlie"}
+	reg.Sync([]readiness.Key{a, b, c})
+	admit(t, reg, c)
+
+	second := buildState(reg, settings, zerolog.Nop(), rt, cc)
+
+	rows := map[string]pool.StatsRow{}
+	for _, row := range second.Pool.Stats() {
+		rows[row.Name] = row
+	}
+	if row := rows["alpha"]; row.Healthy || row.Failures != 1 || row.Requests != 3 || row.LastError != boom.Error() {
+		t.Fatalf("alpha's runtime state did not survive the rebuild: %+v", row)
+	}
+	if row := rows["charlie"]; !row.Healthy || row.Failures != 0 || row.Requests != 0 {
+		t.Fatalf("the newly admitted relay must start clean: %+v", row)
+	}
+
+	// Rotation continues where the previous generation left it. Sorted pool
+	// order is [alpha, charlie, bravo]; alpha is cooled, so the healthy
+	// pair is [charlie, bravo] and the carried cursor (3, from alpha,
+	// bravo, alpha) wraps to index 3 mod 2 = 1 — bravo. A rotation
+	// restarted by the rebuild would have served charlie instead.
+	if got := second.Pool.Pick(pool.KeyAll); got == nil || got.Name != "bravo" {
+		t.Fatalf("first pick after the rebuild = %v, want bravo (rotation carried, cooldown respected)", got)
+	}
+
+	// And the outbound client is the cached one, keep-alive conns included.
+	if second.Client != first.Client {
+		t.Fatal("an unrelated rebuild must reuse the cached client")
+	}
+}
+
+// TestBuildStatePrunesRemovedRelays: a relay that left the desired
+// configuration loses its runtime state — a re-added identity starts clean
+// — while a relay that stayed desired keeps its cooldown through the same
+// rebuild. Prune is the applier's call, so the test drives the exact
+// Prune-then-buildState interplay run() performs.
+func TestBuildStatePrunesRemovedRelays(t *testing.T) {
+	if got := desiredIdentities(nil); len(got) != 0 {
+		t.Fatalf("desiredIdentities(nil) = %v, want an empty set (the empty-fleet boot)", got)
+	}
+
+	reg := readiness.New(readiness.Config{})
+	a := readiness.Key{Provider: deploy.PlatformVercel, Name: "alpha"}
+	b := readiness.Key{Provider: deploy.PlatformCloudflare, Name: "bravo"}
+	reg.Sync([]readiness.Key{a, b})
+	admit(t, reg, a, b)
+
+	settings := shortFuseSettings()
+	rt := pool.NewRuntimeState()
+	cc := gateway.NewClientCache()
+	first := buildState(reg, settings, zerolog.Nop(), rt, cc)
+	if got := first.Pool.Pick(pool.KeyAll); got.Name != "bravo" {
+		t.Fatalf("first pick = %s, want bravo (sorted order)", got.Name)
+	}
+	alpha := first.Pool.Pick(pool.KeyAll)
+	if alpha.Name != "alpha" {
+		t.Fatalf("second pick = %s, want alpha (sorted order)", alpha.Name)
+	}
+	first.Pool.RecordFailure(alpha, errors.New("dial relay: connection refused"))
+
+	// bravo leaves the desired state: the registry revokes its admission,
+	// the applier prunes the identities the last-known-good file no longer
+	// names, and the rebuild serves only alpha.
+	reg.Sync([]readiness.Key{a})
+	rt.Prune(desiredIdentities(&config.Config{Relays: []config.Relay{
+		{Name: "alpha", Provider: deploy.PlatformVercel},
+	}}))
+	second := buildState(reg, settings, zerolog.Nop(), rt, cc)
+	if second.Pool.ReadyCount() != 1 {
+		t.Fatalf("pool serves %d relays after the removal, want 1", second.Pool.ReadyCount())
+	}
+
+	// alpha is still desired: its cooldown survived the removal rebuild.
+	row, ok := relayStatsRow(second.Pool, "alpha")
+	if !ok || row.Healthy || row.Failures != 1 {
+		t.Fatalf("alpha after the prune = %+v (ok=%v), want its cooldown intact", row, ok)
+	}
+
+	// bravo comes back as a new incarnation: its pruned state must not
+	// resurface — the re-added relay starts clean while alpha stays cooled.
+	reg.Sync([]readiness.Key{a, b})
+	admit(t, reg, b)
+	third := buildState(reg, settings, zerolog.Nop(), rt, cc)
+	row, ok = relayStatsRow(third.Pool, "bravo")
+	if !ok || !row.Healthy || row.Failures != 0 {
+		t.Fatalf("re-added bravo = %+v (ok=%v), want a clean slate after the prune", row, ok)
+	}
+	if row, _ := relayStatsRow(third.Pool, "alpha"); row.Healthy || row.Failures != 1 {
+		t.Fatalf("alpha drifted while bravo cycled: %+v", row)
+	}
+}
+
+// relayStatsRow fetches one relay's row from a pool snapshot.
+func relayStatsRow(p *pool.Pool, name string) (pool.StatsRow, bool) {
+	for _, row := range p.Stats() {
+		if row.Name == name {
+			return row, true
+		}
+	}
+	return pool.StatsRow{}, false
 }

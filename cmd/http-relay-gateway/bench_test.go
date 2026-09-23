@@ -9,11 +9,15 @@ import (
 
 	"http-relay-gateway/internal/config"
 	"http-relay-gateway/internal/deploy"
+	"http-relay-gateway/internal/gateway"
+	"http-relay-gateway/internal/pool"
 	"http-relay-gateway/internal/readiness"
 )
 
 // BenchmarkBuildState measures the per-generation cost: verified snapshot
-// scan, URL parse, body-limit resolution and the lifecycle projection.
+// scan, URL parse, body-limit resolution, the runtime attach and the
+// lifecycle projection. rt and cc are the one-per-process pair run() wires,
+// so the measurement is the real rebuild path, not the first build.
 func BenchmarkBuildState(b *testing.B) {
 	const n = 10
 	providers := []string{deploy.PlatformVercel, deploy.PlatformCloudflare, deploy.PlatformDeno}
@@ -35,10 +39,12 @@ func BenchmarkBuildState(b *testing.B) {
 	}
 
 	settings := config.DefaultSettings()
+	rt := pool.NewRuntimeState()
+	cc := gateway.NewClientCache()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if st := buildState(reg, settings, zerolog.Nop()); st.Pool.ReadyCount() != n {
+		if st := buildState(reg, settings, zerolog.Nop(), rt, cc); st.Pool.ReadyCount() != n {
 			b.Fatalf("pool serves %d relays, want the %d verified", st.Pool.ReadyCount(), n)
 		}
 	}
