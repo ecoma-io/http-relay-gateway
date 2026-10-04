@@ -2,7 +2,7 @@
 # plus the CA bundle used to verify HTTPS relay and platform-API URLs. No
 # shell — the Docker HEALTHCHECK works because `http-relay-gateway
 # healthcheck` is a binary subcommand of the entrypoint itself.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 # Dependencies resolve before source lands: only go.mod / go.sum bust this
 # layer, so a source edit re-downloads nothing — that layer cache is what
